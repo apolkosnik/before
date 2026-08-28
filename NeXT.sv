@@ -139,7 +139,17 @@ wire  [3:0] ram_be;
 wire [23:0] ram_addr;
 wire [31:0] ram_din, ram_dout;
 
-next_system #(.CLK_HZ(32000000)) system
+// CLK_HZ sets the machine's microsecond tick at 50 clocks: with the
+// 32 MHz system clock this is a virtual microsecond (the machine runs
+// at 64 percent of real time, uniformly), which satisfies the boot
+// ROM's CPU-speed calibration invariant (see CPU_PACE_* in
+// next_system.sv).  Pacing is off: 32 MHz is already below the
+// calibrated speed.
+next_system #(
+	.CLK_HZ(50000000),
+	.CPU_PACE_NUM(2),
+	.CPU_PACE_DEN(2)
+) system
 (
 	.clk(clk_sys),
 	.clk_vid(clk_vid),

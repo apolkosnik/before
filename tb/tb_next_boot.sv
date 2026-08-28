@@ -42,8 +42,13 @@ wire [31:0] dbg_pc;
 wire        dbg_halted;
 wire  [2:0] dbg_ipl;
 
+// exactly the FPGA parameterization: virtual microsecond of 50 clocks,
+// no pacing (the physical simulation clock rate is immaterial, the
+// clock ratios are what the ROM's calibration checks measure)
 next_system #(
-	.CLK_HZ(100000000),
+	.CLK_HZ(50000000),
+	.CPU_PACE_NUM(2),
+	.CPU_PACE_DEN(2),
 	.ROM_INIT_EN(1),
 	.ROM_INIT("build/rom.hex")
 ) dut

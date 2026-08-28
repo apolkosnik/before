@@ -26,13 +26,20 @@
 
 module next_system #(
 	parameter CLK_HZ      = 100000000,
-	// Internal (cached) CPU cycles advance NUM of every DEN clocks.
-	// The boot ROM's delay() is a calibrated DBF loop (~160 ns per
-	// iteration on a real 25 MHz 68040, self-checked by the POST event
-	// counter test against a 899..1100 us window for delay(1000)); the
-	// raw loop runs delay(1000) in ~503 us at 32 MHz (measured in the
-	// full-POST simulation); 1/2 duty lands it at ~1005 us, inside the
-	// window.  Bus cycles are not gated.
+	// Internal (cached) CPU cycles advance NUM of every DEN clocks
+	// (bus cycles are never gated).  The boot ROM's delay() is a
+	// calibrated DBF loop, self-checked by the POST event counter test
+	// against a 899..1100 us window for delay(1000): 6.25 loop
+	// iterations per microsecond TICK of this module.  The core runs a
+	// cached DBF-taken in ~8 clocks (measured in full-POST simulation),
+	// so the calibration invariant is
+	//     (CLK_HZ / 1e6) * (CPU_PACE_NUM / CPU_PACE_DEN) = 50
+	// clocks per microsecond tick.  CLK_HZ defines the microsecond of
+	// every timer in this system, so it may be a VIRTUAL microsecond:
+	// the FPGA build runs the 32 MHz clock with CLK_HZ = 50 MHz and
+	// pacing off, making the machine uniformly 64 percent of real time
+	// but internally consistent with the calibration.  The defaults
+	// below (100 MHz, 1/2) satisfy the same invariant.
 	parameter CPU_PACE_NUM = 1,
 	parameter CPU_PACE_DEN = 2,
 	parameter ROM_INIT_EN = 0,
