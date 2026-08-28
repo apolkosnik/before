@@ -31,7 +31,8 @@ Rev 2.5 v66 (`reference/previous/src/Rev_2.5_v66.BIN`).
 | `src/dma.c`                | `rtl/next/next_dma_stub.sv`| remaining channels: pointer registers are plain storage, CSRs read 0, plus the frame interrupt (video channel limit 0xEA raises INT_VIDEO at VBL, CSR write releases). The ethernet, disk and sound out channels have real engines in their device modules |
 | `src/scc.c` serial (8530)  | `rtl/next/next_scc.sv`     | register-level model: shared register pointer, WR9 reset commands, RR0 status, one-byte local loopback (the scc.c model the boot ROM test passes against). No baud timing, interrupts, or DMA |
 | `src/esp.c` SCSI (53C90)   | `rtl/next/next_esp.sv`     | FIFO with flags, transfer counter with load-on-DMA-command, NOP/FLUSH/RESET commands, DMA control register reset. No SCSI bus or disk yet |
-| `src/ethernet.c` (MB8795)  | `rtl/next/next_enet_dma.sv`| registers, both DMA channels with chaining, and the local loopback transmit/receive path (TXMODE_DIS_LOOP clear) with EN_EOP packet framing, minimum-size padding and place-holder CRC. No real network |
+| `src/ethernet.c` (MB8795)  | `rtl/next/next_enet_dma.sv`| registers, both DMA channels with chaining, the local loopback path (TXMODE_DIS_LOOP clear) with EN_EOP framing, minimum-size padding and place-holder CRC, the receive address filter, and the frame streaming interface to the bridge |
+| real network               | `rtl/next/next_enet_bridge.sv`, `next_ddram_arb.sv` | when the guest disables loopback, frames cross a DDR3 shared-memory mailbox (rings at 0x1FF00000, the A2065 window) to an ARM daemon in Main_MiSTer (`support/next/next_enet.cpp`, branch `next-ethernet` of the Main fork) that bridges to eth0 (BPF filtered), eth1, a macvlan child, or tap0 -- the architecture of the Minimig A2065 support, with the NIC kept in the fabric and only frames crossing. The OSD "Network" option (status bits [54:52]) selects the interface |
 | `src/mo.c` optical drive   | `rtl/next/next_mo.sv`      | OSP registers, disk DMA channel, ECC buffer engine in the standalone MOCSR2_ECC_DIS mode (fill from and drain to memory). Reed-Solomon parity and disk operations are TODO |
 | `src/kms.c`, `src/snd.c`   | `rtl/next/next_kms_snd.sv` | KMS status/control bytes, command/data pairs, sound out enable/disable, and the sound out DMA channel engine with completion interrupt and underrun status. Keyboard/mouse input and a real audio path are TODO |
 | `src/floppy.c` (82077AA)   | -                          | TODO (reads return 0) |
@@ -124,12 +125,13 @@ passed path, about 5 minutes):
 
 ## Roadmap to a booting system
 
-1. KMS (keyboard/mouse/sound box): register interface from
-   `src/kms.c`, keyboard from `ps2_key`, needed for the ROM monitor.
+1. KMS keyboard/mouse input: the ROM monitor and netboot prompts
+   need key events through the KMS data path (`ps2_key` is already
+   wired to the emu top).  Register side exists in next_kms_snd.
 2. DMA engine (`src/dma.c`): real channel state machines, starting
    with SCSI.
 3. SCSI: ESP (53C90) + DMA + disk image from the MiSTer SD card
    (hps_io block access), to boot NeXTSTEP.
-4. SCC, sound, ethernet, DSP as stretch goals.
+4. SCC serial data path, sound output path, DSP as stretch goals.
 5. CPU caches on (cacheable windows for RAM/ROM/VRAM), snoop from DMA
    writes.

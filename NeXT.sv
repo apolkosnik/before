@@ -66,6 +66,7 @@ localparam CONF_STR = {
 	"F1,BINROM,Boot ROM;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -139,6 +140,14 @@ wire  [3:0] ram_be;
 wire [23:0] ram_addr;
 wire [31:0] ram_din, ram_dout;
 
+wire        btx_req, btx_rd, btx_ack, btx_done;
+wire [10:0] btx_len, btx_addr;
+wire  [7:0] btx_q;
+wire        brx_start, brx_valid, brx_ready;
+wire [10:0] brx_len;
+wire  [7:0] brx_data;
+wire [47:0] enet_mac;
+
 // CLK_HZ sets the machine's microsecond tick at 50 clocks: with the
 // 32 MHz system clock this is a virtual microsecond (the machine runs
 // at 64 percent of real time, uniformly), which satisfies the boot
@@ -175,6 +184,20 @@ next_system #(
 
 	.led(led),
 
+	.btx_req(btx_req),
+	.btx_len(btx_len),
+	.btx_addr(btx_addr),
+	.btx_rd(btx_rd),
+	.btx_q(btx_q),
+	.btx_ack(btx_ack),
+	.btx_done(btx_done),
+	.brx_start(brx_start),
+	.brx_len(brx_len),
+	.brx_valid(brx_valid),
+	.brx_data(brx_data),
+	.brx_ready(brx_ready),
+	.enet_mac(enet_mac),
+
 	.dbg_pc(),
 	.dbg_halted(),
 	.dbg_ipl()
@@ -185,6 +208,16 @@ assign LED_USER = led;
 ///////////////////////   DDR3 RAM   /////////////////////////////
 
 assign DDRAM_CLK = clk_sys;
+
+// guest RAM and the ethernet bridge mailbox share the DDRAM port
+wire        ga_rd, ga_we, ga_busy, ga_dout_ready;
+wire [28:0] ga_addr;
+wire [63:0] ga_din, ga_dout;
+wire  [7:0] ga_be, ga_burst;
+
+wire        eb_req, eb_we, eb_ack;
+wire [28:0] eb_addr;
+wire [63:0] eb_wdata, eb_rdata;
 
 next_ddram ddram
 (
@@ -199,6 +232,39 @@ next_ddram ddram
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
 
+	.DDRAM_BUSY(ga_busy),
+	.DDRAM_BURSTCNT(ga_burst),
+	.DDRAM_ADDR(ga_addr),
+	.DDRAM_DOUT(ga_dout),
+	.DDRAM_DOUT_READY(ga_dout_ready),
+	.DDRAM_RD(ga_rd),
+	.DDRAM_DIN(ga_din),
+	.DDRAM_BE(ga_be),
+	.DDRAM_WE(ga_we)
+);
+
+next_ddram_arb ddram_arb
+(
+	.clk(clk_sys),
+	.reset(reset),
+
+	.a_rd(ga_rd),
+	.a_we(ga_we),
+	.a_addr(ga_addr),
+	.a_din(ga_din),
+	.a_be(ga_be),
+	.a_burst(ga_burst),
+	.a_busy(ga_busy),
+	.a_dout(ga_dout),
+	.a_dout_ready(ga_dout_ready),
+
+	.b_req(eb_req),
+	.b_we(eb_we),
+	.b_addr(eb_addr),
+	.b_wdata(eb_wdata),
+	.b_rdata(eb_rdata),
+	.b_ack(eb_ack),
+
 	.DDRAM_BUSY(DDRAM_BUSY),
 	.DDRAM_BURSTCNT(DDRAM_BURSTCNT),
 	.DDRAM_ADDR(DDRAM_ADDR),
@@ -208,6 +274,35 @@ next_ddram ddram
 	.DDRAM_DIN(DDRAM_DIN),
 	.DDRAM_BE(DDRAM_BE),
 	.DDRAM_WE(DDRAM_WE)
+);
+
+next_enet_bridge #(.CLK_HZ(32000000)) enet_bridge
+(
+	.clk(clk_sys),
+	.reset(reset),
+
+	.btx_req(btx_req),
+	.btx_len(btx_len),
+	.btx_addr(btx_addr),
+	.btx_rd(btx_rd),
+	.btx_q(btx_q),
+	.btx_ack(btx_ack),
+	.btx_done(btx_done),
+
+	.brx_start(brx_start),
+	.brx_len(brx_len),
+	.brx_valid(brx_valid),
+	.brx_data(brx_data),
+	.brx_ready(brx_ready),
+
+	.guest_mac(enet_mac),
+
+	.m_req(eb_req),
+	.m_we(eb_we),
+	.m_addr(eb_addr),
+	.m_wdata(eb_wdata),
+	.m_rdata(eb_rdata),
+	.m_ack(eb_ack)
 );
 
 ///////////////////////   VIDEO    ///////////////////////////////

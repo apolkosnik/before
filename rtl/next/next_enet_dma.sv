@@ -50,6 +50,24 @@ module next_enet_dma #(parameter CLK_HZ = 100000000)
 	// enet_state() in ethernet.c)
 	input         tpe_select,
 
+	// frame bridge (next_enet_bridge): when the guest runs with the
+	// loopback disabled, transmitted frames stream out here and
+	// received frames stream in, taking the place of the wire
+	output reg        btx_req,       // a transmitted frame is ready
+	output reg [10:0] btx_len,
+	input      [10:0] btx_addr,      // byte fetch within the frame
+	input             btx_rd,
+	output reg  [7:0] btx_q,
+	output reg        btx_ack,
+	input             btx_done,      // bridge finished with the frame
+
+	input             brx_start,     // bridge starts delivering a frame
+	input      [10:0] brx_len,
+	input             brx_valid,     // one byte per cycle while high
+	input       [7:0] brx_data,
+	output            brx_ready,     // engine can accept the stream
+	output     [47:0] enet_mac,      // station address (NodeID registers)
+
 	// interrupt levels
 	output        int_en_tx,     // MB8795 transmitter
 	output        int_en_rx,     // MB8795 receiver
@@ -72,6 +90,8 @@ reg [7:0] tx_status, tx_mask, rx_status, rx_mask;
 reg [7:0] tx_mode, rx_mode;
 reg       en_stopped;
 reg [7:0] mac0, mac1, mac2, mac3, mac4, mac5;
+
+assign enet_mac = {mac0, mac1, mac2, mac3, mac4, mac5};
 
 assign int_en_tx = |(tx_status & tx_mask & 8'h2F);
 assign int_en_rx = |(rx_status & rx_mask & 8'h8F);
@@ -185,15 +205,20 @@ localparam US_TICK = CLK_HZ / 1000000 * 500;   // 500 us
 reg [$clog2(US_TICK)-1:0] tickcnt;
 wire tick = (tickcnt == US_TICK-1);
 
-localparam E_IDLE   = 3'd0,
-           E_TX_RD  = 3'd1,     // issue memory read for one byte
-           E_TX_ACK = 3'd2,
-           E_TX_END = 3'd3,
-           E_RX_WR  = 3'd4,
-           E_RX_ACK = 3'd5,
-           E_RX_END = 3'd6;
+localparam E_IDLE   = 4'd0,
+           E_TX_RD  = 4'd1,     // issue memory read for one byte
+           E_TX_ACK = 4'd2,
+           E_TX_END = 4'd3,
+           E_RX_WR  = 4'd4,
+           E_RX_ACK = 4'd5,
+           E_RX_END = 4'd6,
+           E_BTX    = 4'd7,     // frame parked for the bridge to fetch
+           E_BRX    = 4'd8;     // frame streaming in from the bridge
 
-reg [2:0] est;
+reg [3:0] est;
+reg [10:0] brx_pos;
+
+assign brx_ready = (est == E_IDLE) && (rx_len == 0) && !en_stopped;
 
 wire loopback = !tpe_select && !(tx_mode & TXMODE_DIS_LOOP);
 
@@ -309,6 +334,8 @@ always @(posedge clk) begin
 		rx_next <= 0; rx_limit <= 0; rx_start <= 0; rx_stop <= 0;
 		rx_snext <= 0; rx_slimit <= 0; rx_sstart <= 0; rx_sstop <= 0;
 		tx_len <= 0; rx_len <= 0; rx_pos <= 0;
+		brx_pos <= 0;
+		btx_req <= 0; btx_len <= 0; btx_q <= 0; btx_ack <= 0;
 		est <= E_IDLE;
 		m_req <= 0;
 		tickcnt <= 0;
@@ -366,7 +393,11 @@ always @(posedge clk) begin
 		// transfer engine
 		//------------------------------------------------------------
 		case (est)
-		E_IDLE: if (tick && !en_stopped) begin
+		E_IDLE: if (brx_start && brx_ready) begin
+			brx_pos <= 0;
+			est <= E_BRX;
+		end
+		else if (tick && !en_stopped) begin
 			if (rx_len != 0) begin
 				// deliver the pending packet, enet_io receive path
 				if (!rx_csr[CSR_ENABLE]) begin
@@ -380,8 +411,9 @@ always @(posedge clk) begin
 					est <= E_RX_WR;
 				end
 			end
-			else if (tx_status[7] && tx_csr[CSR_ENABLE] && loopback) begin
-				// transmit: gather bytes from memory
+			else if (tx_status[7] && tx_csr[CSR_ENABLE]) begin
+				// transmit: gather bytes from memory (the frame goes to
+				// the loopback path or to the bridge at E_TX_END)
 				est <= E_TX_RD;
 			end
 		end
@@ -431,15 +463,64 @@ always @(posedge clk) begin
 				// place-holder CRC.
 				eff_len = (tx_len > 12'd15) ? tx_len - 12'd15 : tx_len;
 				tx_status <= tx_status & ~TXSTAT_TX_RECVD;
+				if (loopback) begin
+					if (pkt_for_me) begin
+						// enet_receive(): the address filter accepts it
+						tx_status <= (tx_status | TXSTAT_NET_BUSY) & ~TXSTAT_TX_RECVD;
+						rx_len <= ((eff_len < 12'd60) ? 12'd60 : eff_len) + 12'd4;
+						rx_pos <= 0;
+					end
+					tx_len <= 0;
+					est <= E_IDLE;
+				end
+				else begin
+					// hand the frame to the bridge (the wire side)
+					btx_req <= 1;
+					btx_len <= eff_len[10:0];
+					est <= E_BTX;
+				end
+			end
+			else est <= E_IDLE;
+		end
+
+		E_BTX: begin
+			// serve the bridge's byte fetches out of the packet buffer
+			btx_ack <= 0;
+			if (btx_rd) begin
+				btx_q <= pkt[btx_addr];
+				btx_ack <= 1;
+			end
+			if (btx_done) begin
+				btx_req <= 0;
+				tx_len <= 0;
+				est <= E_IDLE;
+			end
+		end
+
+		E_BRX: begin
+			// frame streaming in from the bridge into the packet buffer
+			if (brx_valid && brx_pos < 11'd2047) begin
+				pkt[brx_pos] <= brx_data;
+				case (brx_pos)
+					11'd0: dst0 <= brx_data;
+					11'd1: dst1 <= brx_data;
+					11'd2: dst2 <= brx_data;
+					11'd3: dst3 <= brx_data;
+					11'd4: dst4 <= brx_data;
+					11'd5: dst5 <= brx_data;
+					default: ;
+				endcase
+				brx_pos <= brx_pos + 1'd1;
+			end
+			if (brx_pos >= brx_len) begin
+				// enet_receive(): filter and queue for RX DMA delivery
 				if (pkt_for_me) begin
-					// enet_receive(): the address filter accepts it
-					tx_status <= (tx_status | TXSTAT_NET_BUSY) & ~TXSTAT_TX_RECVD;
-					rx_len <= ((eff_len < 12'd60) ? 12'd60 : eff_len) + 12'd4;
+					tx_status <= tx_status | TXSTAT_NET_BUSY;
+					rx_len <= (({1'b0, brx_pos} < 12'd60) ? 12'd60 : {1'b0, brx_pos}) + 12'd4;
 					rx_pos <= 0;
 				end
-				tx_len <= 0;
+				est <= E_IDLE;
 			end
-			est <= E_IDLE;
 		end
 
 		E_RX_WR: begin

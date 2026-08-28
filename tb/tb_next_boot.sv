@@ -74,6 +74,11 @@ next_system #(
 
 	.led(led),
 
+	.btx_req(), .btx_len(), .btx_addr(11'd0), .btx_rd(1'b0),
+	.btx_q(), .btx_ack(), .btx_done(1'b0),
+	.brx_start(1'b0), .brx_len(11'd0), .brx_valid(1'b0),
+	.brx_data(8'd0), .brx_ready(), .enet_mac(),
+
 	.dbg_pc(dbg_pc),
 	.dbg_halted(dbg_halted),
 	.dbg_ipl(dbg_ipl)

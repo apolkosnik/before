@@ -24,6 +24,15 @@ quartus_sh --flow compile NeXT     # Quartus 17.0.x, DE10-Nano / MiSTer
 
 Output: `output_files/NeXT.rbf`.
 
+## Network
+
+The OSD "Network" option bridges the machine's onboard ethernet to a
+host interface (eth0 shared with MiSTer, eth1, a macvlan child, or
+tap0), using the DDR3 mailbox architecture of the Minimig A2065
+support.  It needs the matching Main_MiSTer build from the
+`next-ethernet` branch (releases/MiSTer_20260828 there); with stock
+Main the machine sees an empty network.
+
 ## Boot ROM
 
 Copy `reference/previous/src/Rev_2.5_v66.BIN` to the MiSTer as

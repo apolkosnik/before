@@ -41,6 +41,10 @@ next_enet_dma #(.CLK_HZ(1000000)) dut
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
 	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
 	.tpe_select(1'b0),
+	.btx_req(), .btx_len(), .btx_addr(11'd0), .btx_rd(1'b0),
+	.btx_q(), .btx_ack(), .btx_done(1'b0),
+	.brx_start(1'b0), .brx_len(11'd0), .brx_valid(1'b0),
+	.brx_data(8'd0), .brx_ready(), .enet_mac(),
 	.int_en_tx(int_en_tx), .int_en_rx(int_en_rx),
 	.int_en_tx_dma(int_en_tx_dma), .int_en_rx_dma(int_en_rx_dma)
 );
