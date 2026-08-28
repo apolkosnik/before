@@ -18,7 +18,11 @@ module next_bmap
 	input         we,
 	input   [1:0] be,
 	input  [15:0] wdata,
-	output [15:0] rdata
+	output [15:0] rdata,
+
+	// bmap_tpe_select in bmap.c: set when both TPE bits (31 and 28) of
+	// register 0xD are written set, cleared when both are written clear
+	output reg    tpe_select
 );
 
 reg [31:0] regs [0:15];
@@ -35,11 +39,17 @@ integer i;
 always @(posedge clk) begin
 	if (reset) begin
 		for (i = 0; i < 16; i = i + 1) regs[i] <= 32'd0;
+		tpe_select <= 0;
 	end
 	else if (sel & we) begin
 		if (!addr[1]) begin
 			if (be[1]) regs[ridx][31:24] <= wdata[15:8];
 			if (be[0]) regs[ridx][23:16] <= wdata[7:0];
+			// TPE bits live in the top byte of register 0xD
+			if (be[1] && ridx == 4'hD) begin
+				if ((wdata[15:8] & 8'h90) == 8'h90) tpe_select <= 1;
+				else if ((wdata[15:8] & 8'h90) == 8'h00) tpe_select <= 0;
+			end
 		end
 		else begin
 			if (be[1]) regs[ridx][15:8] <= wdata[15:8];

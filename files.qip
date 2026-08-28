@@ -9,6 +9,12 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_vram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_rom.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_bmap.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_dma_stub.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_scc.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_esp.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_enet_dma.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_mo.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_rs.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_kms_snd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_ddram.sv
 set_global_assignment -name QIP_FILE rtl/pll.qip
 set_global_assignment -name SDC_FILE NeXT.sdc

@@ -26,6 +26,15 @@
 
 module next_system #(
 	parameter CLK_HZ      = 100000000,
+	// Internal (cached) CPU cycles advance NUM of every DEN clocks.
+	// The boot ROM's delay() is a calibrated DBF loop (~160 ns per
+	// iteration on a real 25 MHz 68040, self-checked by the POST event
+	// counter test against a 899..1100 us window for delay(1000)); the
+	// raw loop runs delay(1000) in ~503 us at 32 MHz (measured in the
+	// full-POST simulation); 1/2 duty lands it at ~1005 us, inside the
+	// window.  Bus cycles are not gated.
+	parameter CPU_PACE_NUM = 1,
+	parameter CPU_PACE_DEN = 2,
 	parameter ROM_INIT_EN = 0,
 	parameter ROM_INIT    = "rom.hex"
 )
@@ -87,9 +96,43 @@ reg         walker_berr;
 reg         mem_ready;
 reg         berr_hold;
 
+// snoop pulse for DMA writes into main RAM (one per acknowledged write)
+reg        dma_snoop_stb;
+reg [31:0] dma_snoop_addr;
+
+// ethernet DMA master port (driven by next_enet_dma below)
+wire        en_m_req, en_m_we;
+wire [23:0] en_m_addr;
+wire  [3:0] en_m_be;
+wire [31:0] en_m_din;
+wire        en_m_ack;
+wire        int_en_tx, int_en_rx, int_en_tx_dma, int_en_rx_dma;
+
+// MO/ECC DMA master port (driven by next_mo below)
+wire        mo_m_req, mo_m_we;
+wire [23:0] mo_m_addr;
+wire  [3:0] mo_m_be;
+wire [31:0] mo_m_din;
+wire        mo_m_ack;
+wire        int_disk, int_disk_dma;
+
+// KMS/sound DMA master port (driven by next_kms_snd below)
+wire        sn_m_req, sn_m_we;
+wire [23:0] sn_m_addr;
+wire  [3:0] sn_m_be;
+wire [31:0] sn_m_din;
+wire        sn_m_ack;
+wire        int_snd_ovrun, int_snd_out_dma;
+
 wire  [2:0] ipl_level;
 
-wire clkena = (busstate == 2'b01) | mem_ready | berr_hold;
+// fractional pacing of internal cycles (see CPU_PACE_* above)
+reg [$clog2(CPU_PACE_DEN)-1:0] pace_acc = 0;
+wire pace = pace_acc < CPU_PACE_NUM;
+always @(posedge clk)
+	pace_acc <= (pace_acc == CPU_PACE_DEN-1) ? 1'd0 : pace_acc + 1'd1;
+
+wire clkena = ((busstate == 2'b01) & pace) | mem_ready | berr_hold;
 
 wire [255:0] debug_status;
 assign dbg_pc  = debug_status[31:0];
@@ -105,10 +148,15 @@ ap040_tg68k_compat #(
 	.nreset(~reset),
 	.clkena_in(clkena),
 
-	// no cacheable windows declared yet: the core runs uncached
-	.cache_allow_all(1'b0),
-	.cache_snoop_stb(1'b0),
-	.cache_snoop_addr(32'd0),
+	// Cacheability follows the real 68040 model: everything is a cache
+	// candidate, gated by the CACR enables and the MMU cache-inhibit
+	// attributes (the boot ROM runs with the instruction cache only;
+	// the OS marks device pages noncacheable through the MMU).  The
+	// Amiga-specific window inputs stay off.  DMA writes to main RAM
+	// are snooped so the data cache never holds stale lines.
+	.cache_allow_all(1'b1),
+	.cache_snoop_stb(dma_snoop_stb),
+	.cache_snoop_addr(dma_snoop_addr),
 	.cache_z2_ena(1'b0),
 	.cache_z3_base0(5'd0),
 	.cache_z3_ena0(1'b0),
@@ -184,9 +232,11 @@ wire d_any  = d_rom | d_io | d_bmap | d_ram | d_vram;
 // bus cycle state machine
 //----------------------------------------------------------------------------
 
-localparam S_IDLE = 2'd0, S_INT = 2'd1, S_RAM = 2'd2;
+localparam S_IDLE = 2'd0, S_INT = 2'd1, S_RAM = 2'd2, S_RAM_E = 2'd3;
 
 reg  [1:0] state;
+localparam G_ENET = 2'd0, G_MO = 2'd1, G_SND = 2'd2;
+reg  [1:0] dma_grant;
 reg        sel_rom, sel_vram, sel_io, sel_bmap;
 reg [15:0] cyc_rdata;
 
@@ -200,14 +250,20 @@ reg  walker_busy;
 
 // internal read data mux (valid in cycle S_INT)
 wire [15:0] rom_q, vram_q, io_rdata, bmap_rdata;
+wire        bmap_tpe_select;
 
 assign cpu_din = cyc_rdata;
+
+assign en_m_ack = (state == S_RAM_E) && (dma_grant == G_ENET) && ram_ack;
+assign mo_m_ack = (state == S_RAM_E) && (dma_grant == G_MO) && ram_ack;
+assign sn_m_ack = (state == S_RAM_E) && (dma_grant == G_SND) && ram_ack;
 
 always @(posedge clk) begin
 	mem_ready  <= 0;
 	walker_ack <= 0;
 	walker_berr<= 0;
 
+	dma_snoop_stb <= 0;
 	if (reset) begin
 		state <= S_IDLE;
 		berr_hold <= 0;
@@ -235,6 +291,33 @@ always @(posedge clk) begin
 					ram_din  <= walker_wdat;
 					state    <= S_RAM;
 				end
+			end
+			else if (en_m_req && !cpu_req && !berr_hold) begin
+				ram_req  <= 1;
+				ram_we   <= en_m_we;
+				ram_be   <= en_m_be;
+				ram_addr <= en_m_addr;
+				ram_din  <= en_m_din;
+				dma_grant <= G_ENET;
+				state    <= S_RAM_E;
+			end
+			else if (mo_m_req && !cpu_req && !berr_hold) begin
+				ram_req  <= 1;
+				ram_we   <= mo_m_we;
+				ram_be   <= mo_m_be;
+				ram_addr <= mo_m_addr;
+				ram_din  <= mo_m_din;
+				dma_grant <= G_MO;
+				state    <= S_RAM_E;
+			end
+			else if (sn_m_req && !cpu_req && !berr_hold) begin
+				ram_req  <= 1;
+				ram_we   <= sn_m_we;
+				ram_be   <= sn_m_be;
+				ram_addr <= sn_m_addr;
+				ram_din  <= sn_m_din;
+				dma_grant <= G_SND;
+				state    <= S_RAM_E;
 			end
 			else if (cpu_req && !berr_hold) begin
 				if (!d_any) berr_hold <= 1;
@@ -278,6 +361,17 @@ always @(posedge clk) begin
 					mem_ready <= 1;
 				end
 				state <= S_IDLE;
+			end
+		end
+
+		S_RAM_E: begin
+			if (ram_ack) begin
+				ram_req <= 0;
+				state <= S_IDLE;
+				if (ram_we) begin
+					dma_snoop_stb <= 1;
+					dma_snoop_addr <= {6'b000001, ram_addr, 2'b00};
+				end
 			end
 		end
 
@@ -344,16 +438,37 @@ wire vbl = vblank_sync[1] & ~vblank_sync[2];
 
 wire [16:0] io_off = cpu_addr[16:0];
 
-wire io_dma   = sel_io && (io_off[16:12] < 5'h05);              // 0x00000-0x04FFF
+wire io_enet  = sel_io && !io_off[16] && (
+                (io_off[15:4]  == 12'h600)  ||                  // 0x6000-0x600f MB8795
+                (io_off[15:2]  == 14'h044)  ||                  // 0x0110 EN_TX CSR
+                (io_off[15:2]  == 14'h054)  ||                  // 0x0150 EN_RX CSR
+                (io_off[15:5]  == 11'h208)  ||                  // 0x4100-0x411f
+                (io_off[15:5]  == 11'h20A)  ||                  // 0x4140-0x415f
+                (io_off[15:2]  == 14'h10C4) ||                  // 0x4310
+                (io_off[15:2]  == 14'h10D4));                   // 0x4350
+wire io_mo_osp = sel_io && (io_off[16:5] == 12'h900);           // 0x12000-0x1201f
+wire io_mo_csr = sel_io && (io_off[16:2] == 15'h0014);          // 0x00050-0x00053
+wire io_mo_ptr = sel_io && (io_off[16:4] == 13'h405);           // 0x04050-0x0405f
+wire io_mo_ini = sel_io && (io_off[16:2] == 15'h1094);          // 0x04250-0x04253
+wire io_mo     = io_mo_osp | io_mo_csr | io_mo_ptr | io_mo_ini;
+wire io_kms    = sel_io && (io_off[16:4] == 13'hE00);           // 0x0e000-0x0e00f
+wire io_sn_csr = sel_io && (io_off[16:2] == 15'h0010);          // 0x00040-0x00043
+wire io_sn_sptr= sel_io && (io_off[16:4] == 13'h403);           // 0x04030-0x0403f
+wire io_sn_ptr = sel_io && (io_off[16:4] == 13'h404);           // 0x04040-0x0404f
+wire io_sn_ini = sel_io && (io_off[16:2] == 15'h1090);          // 0x04240-0x04243
+wire io_snd    = io_kms | io_sn_csr | io_sn_sptr | io_sn_ptr | io_sn_ini;
+wire io_dma   = sel_io && (io_off[16:12] < 5'h05) && !io_enet && !io_mo && !io_snd; // 0x00000-0x04FFF
 wire io_intc  = sel_io && (io_off[16:12] == 5'h07);             // 0x07000-0x07FFF
 wire io_scr1  = sel_io && (io_off[16:11] == 6'h18);             // 0x0c000-0x0c7ff
 wire io_sid   = sel_io && (io_off[16:11] == 6'h19);             // 0x0c800-0x0cfff
 wire io_scr2  = sel_io && (io_off[16:11] == 6'h1A);             // 0x0d000-0x0d7ff
 wire io_timer = sel_io && (io_off[16:12] == 5'h16);             // 0x16000-0x16fff
+wire io_scc   = sel_io && (io_off[16:3]  == 14'h3000);          // 0x18000-0x18007
+wire io_esp   = sel_io && (io_off[16:6]  == 11'h500);           // 0x14000-0x1403f
 wire io_evt   = sel_io && (io_off[16:12] == 5'h1a);             // 0x1a000-0x1afff
 wire io_scr   = io_scr1 | io_sid | io_scr2;
 
-wire [15:0] scr_rdata, intc_rdata, timer_rdata, dma_rdata;
+wire [15:0] scr_rdata, intc_rdata, timer_rdata, dma_rdata, scc_rdata, esp_rdata, enet_rdata, mo_rdata, snd_rdata;
 
 // event counter: 20-bit microsecond counter, latched when its first byte
 // is read, reset by a write (System_Timer_Read/Write in Previous
@@ -380,10 +495,15 @@ end
 
 wire [15:0] evt_rdata = cpu_addr[1] ? evt_latch[15:0] : {12'd0, us_counter[19:16]};
 
-assign io_rdata = io_dma   ? dma_rdata :
+assign io_rdata = io_enet  ? enet_rdata :
+                  io_mo    ? mo_rdata :
+                  io_snd   ? snd_rdata :
+                  io_dma   ? dma_rdata :
                   io_intc  ? intc_rdata :
                   io_scr   ? scr_rdata :
                   io_timer ? timer_rdata :
+                  io_scc   ? scc_rdata :
+                  io_esp   ? esp_rdata :
                   io_evt   ? evt_rdata : 16'h0000;
 
 // system control registers and RTC
@@ -444,6 +564,110 @@ next_dma_stub dma
 	.vid_int_clr(vid_int_clr)
 );
 
+next_enet_dma #(.CLK_HZ(CLK_HZ)) enet
+(
+	.clk(clk),
+	.reset(dev_reset),
+	.sel(io_enet),
+	.addr(io_off[14:0]),
+	.we(is_write),
+	.be(lanes),
+	.wdata(cpu_dout),
+	.rdata(enet_rdata),
+	.m_req(en_m_req),
+	.m_we(en_m_we),
+	.m_addr(en_m_addr),
+	.m_be(en_m_be),
+	.m_din(en_m_din),
+	.m_dout(ram_dout),
+	.m_ack(en_m_ack),
+	.tpe_select(bmap_tpe_select),
+	.int_en_tx(int_en_tx),
+	.int_en_rx(int_en_rx),
+	.int_en_tx_dma(int_en_tx_dma),
+	.int_en_rx_dma(int_en_rx_dma)
+);
+
+// MO drive controller with the ECC buffer engine (a RAM bus master)
+next_mo #(.CLK_HZ(CLK_HZ)) mo
+(
+	.clk(clk),
+	.reset(dev_reset),
+	.sel_osp(io_mo_osp),
+	.sel_csr(io_mo_csr),
+	.sel_ptr(io_mo_ptr),
+	.sel_ini(io_mo_ini),
+	.addr(io_off[4:0]),
+	.we(is_write),
+	.be(lanes),
+	.wdata(cpu_dout),
+	.rdata(mo_rdata),
+	.m_req(mo_m_req),
+	.m_we(mo_m_we),
+	.m_addr(mo_m_addr),
+	.m_be(mo_m_be),
+	.m_din(mo_m_din),
+	.m_dout(ram_dout),
+	.m_ack(mo_m_ack),
+	.int_disk(int_disk),
+	.int_disk_dma(int_disk_dma)
+);
+
+// KMS and sound out DMA (a RAM bus master)
+next_kms_snd #(.CLK_HZ(CLK_HZ)) kms_snd
+(
+	.clk(clk),
+	.reset(dev_reset),
+	.sel_kms(io_kms),
+	.sel_csr(io_sn_csr),
+	.sel_sptr(io_sn_sptr),
+	.sel_ptr(io_sn_ptr),
+	.sel_ini(io_sn_ini),
+	.addr(io_off[3:0]),
+	.we(is_write),
+	.be(lanes),
+	.wdata(cpu_dout),
+	.rdata(snd_rdata),
+	.m_req(sn_m_req),
+	.m_we(sn_m_we),
+	.m_addr(sn_m_addr),
+	.m_be(sn_m_be),
+	.m_din(sn_m_din),
+	.m_dout(ram_dout),
+	.m_ack(sn_m_ack),
+	.int_snd_ovrun(int_snd_ovrun),
+	.int_snd_out_dma(int_snd_out_dma)
+);
+
+// SCSI controller
+wire esp_int_scsi;
+
+next_esp esp
+(
+	.clk(clk),
+	.reset(dev_reset),
+	.sel(io_esp),
+	.addr(io_off[5:0]),
+	.we(is_write),
+	.be(lanes),
+	.wdata(cpu_dout),
+	.rdata(esp_rdata),
+	.int_scsi(esp_int_scsi)
+);
+
+// SCC serial controller
+next_scc scc_dev
+(
+	.clk(clk),
+	.reset(dev_reset),
+	.sel(io_scc),
+	.addr1(cpu_addr[1]),
+	.we(is_write),
+	.be(lanes),
+	.wdata(cpu_dout),
+	.rdata(scc_rdata)
+);
+
 // BMAP
 next_bmap bmap
 (
@@ -454,26 +678,55 @@ next_bmap bmap
 	.we(is_write),
 	.be(lanes),
 	.wdata(cpu_dout),
-	.rdata(bmap_rdata)
+	.rdata(bmap_rdata),
+	.tpe_select(bmap_tpe_select)
 );
 
 // interrupt controller
-reg soft1_d, soft2_d;
+reg soft1_d, soft2_d, scsi_d;
+reg entx_d, enrx_d, entxd_d, enrxd_d, disk_d, diskd_d, sndo_d, sndd_d;
 always @(posedge clk) begin
 	soft1_d <= softint1;
 	soft2_d <= softint2;
+	scsi_d  <= esp_int_scsi;
+	entx_d  <= int_en_tx;
+	enrx_d  <= int_en_rx;
+	entxd_d <= int_en_tx_dma;
+	enrxd_d <= int_en_rx_dma;
+	disk_d  <= int_disk;
+	diskd_d <= int_disk_dma;
+	sndo_d  <= int_snd_ovrun;
+	sndd_d  <= int_snd_out_dma;
 end
 
 wire [31:0] int_set =
 	(32'd1  & {31'd0,  softint1 & ~soft1_d}) |
 	({31'd0, softint2 & ~soft2_d} << 1) |
 	({31'd0, vid_int_set} << 5) |
+	({31'd0, int_snd_ovrun & ~sndo_d} << 8) |
+	({31'd0, int_en_rx & ~enrx_d} << 9) |
+	({31'd0, int_en_tx & ~entx_d} << 10) |
+	({31'd0, esp_int_scsi & ~scsi_d} << 12) |
+	({31'd0, int_disk & ~disk_d} << 13) |
+	({31'd0, int_snd_out_dma & ~sndd_d} << 23) |
+	({31'd0, int_disk_dma & ~diskd_d} << 25) |
+	({31'd0, int_en_rx_dma & ~enrxd_d} << 27) |
+	({31'd0, int_en_tx_dma & ~entxd_d} << 28) |
 	({31'd0, timer_set} << 29);
 
 wire [31:0] int_clr =
 	({31'd0, ~softint1 & soft1_d}) |
 	({31'd0, ~softint2 & soft2_d} << 1) |
 	({31'd0, vid_int_clr} << 5) |
+	({31'd0, ~int_snd_ovrun & sndo_d} << 8) |
+	({31'd0, ~int_en_rx & enrx_d} << 9) |
+	({31'd0, ~int_en_tx & entx_d} << 10) |
+	({31'd0, ~esp_int_scsi & scsi_d} << 12) |
+	({31'd0, ~int_disk & disk_d} << 13) |
+	({31'd0, ~int_snd_out_dma & sndd_d} << 23) |
+	({31'd0, ~int_disk_dma & diskd_d} << 25) |
+	({31'd0, ~int_en_rx_dma & enrxd_d} << 27) |
+	({31'd0, ~int_en_tx_dma & entxd_d} << 28) |
 	({31'd0, timer_clr} << 29);
 
 next_intc intc

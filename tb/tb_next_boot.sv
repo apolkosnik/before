@@ -75,10 +75,22 @@ next_system #(
 );
 
 //----------------------------------------------------------------------------
-// 64 MB main RAM model with the level req / level ack protocol
+// Main RAM model with the level req / level ack protocol.
+//
+// A 4 MB SIMM set in bank 0, banks 1-3 empty: a machine configuration a
+// real cube supports, and small enough that the ROM's full-memory clear
+// pass stays fast in simulation.  A 4 MB bank aliases through its 16 MB
+// decode window (address lines above the SIMM size are not connected),
+// which is what the ROM's sizing probe detects.  Reads from the empty
+// banks return the address (open bus), writes are dropped, matching
+// mem_ram_empty_*() in Previous src/cpu/memory.c.
 //----------------------------------------------------------------------------
 
-reg [31:0] ram_mem [0:16777215];
+reg [31:0] ram_mem [0:1048575];   // 4 MB
+
+wire        bank0     = (ram_addr[23:22] == 2'b00);
+wire [19:0] ram_index = ram_addr[19:0];              // alias within the bank
+wire [31:0] open_bus  = {6'b000001, ram_addr, 2'b00};
 
 reg [1:0] ram_wait;
 always @(posedge clk) begin
@@ -94,12 +106,14 @@ always @(posedge clk) begin
 		// a few wait states, like the DDR3 on hardware
 		if (ram_wait == 2'd3) begin
 			if (ram_we) begin
-				if (ram_be[3]) ram_mem[ram_addr][31:24] <= ram_din[31:24];
-				if (ram_be[2]) ram_mem[ram_addr][23:16] <= ram_din[23:16];
-				if (ram_be[1]) ram_mem[ram_addr][15:8]  <= ram_din[15:8];
-				if (ram_be[0]) ram_mem[ram_addr][7:0]   <= ram_din[7:0];
+				if (bank0) begin
+					if (ram_be[3]) ram_mem[ram_index][31:24] <= ram_din[31:24];
+					if (ram_be[2]) ram_mem[ram_index][23:16] <= ram_din[23:16];
+					if (ram_be[1]) ram_mem[ram_index][15:8]  <= ram_din[15:8];
+					if (ram_be[0]) ram_mem[ram_index][7:0]   <= ram_din[7:0];
+				end
 			end
-			else ram_dout <= ram_mem[ram_addr];
+			else ram_dout <= bank0 ? ram_mem[ram_index] : open_bus;
 			ram_ack <= 1;
 		end
 		else ram_wait <= ram_wait + 1'd1;
@@ -157,8 +171,8 @@ always @(posedge clk) begin
 			if ((cpu_addr[31:24] == 8'h02) &&
 			    (cpu_addr[16:12] == 5'h0d) && is_write) seen_scr2_wr <= 1;
 
-			if (is_io_cyc && iolog_n < 1024) begin
-				iolog[iolog_n] <= {is_write, cpu_addr[30:0], is_write ? cpu_dout : cpu_din, dbg_pc[15:0]};
+			if (is_io_cyc) begin
+				iolog[iolog_n % 1024] <= {is_write, cpu_addr[30:0], is_write ? cpu_dout : cpu_din, dbg_pc[15:0]};
 				iolog_n = iolog_n + 1;
 			end
 		end
@@ -182,6 +196,95 @@ always @(posedge clk) begin
 	end
 end
 
+time delay_t0 = 0;
+
+// POST sub-test tracing: entry PCs and the return-value check PCs of
+// the system test master at 0x469c (see ROMV66 listing), logging D0
+wire [31:0] dbg_d0 = dut.cpu.core.regfile.dbg_d0;
+task post_trace;
+	input [31:0] pc;
+	begin
+		case (pc)
+			32'h010031b4: $display("[%0t] POST: FPU test entry", $time);
+			32'h010031fa: $display("[%0t] POST: SCC test entry", $time);
+			32'h0100337e: $display("[%0t] POST: SCSI test entry", $time);
+			32'h01003548: $display("[%0t] POST: Enet test entry", $time);
+			32'h0100381a: $display("[%0t] POST: ECC test entry", $time);
+			32'h01003b1a: $display("[%0t] POST: RTC test entry", $time);
+			32'h01003b98: $display("[%0t] POST: Timer test entry", $time);
+			32'h01003c7e: $display("[%0t] POST: Event counter test entry", $time);
+			32'h01003f74: $display("[%0t] POST: Sound out test entry", $time);
+			32'h01003430: $display("[%0t] POST: Extended SCSI test entry", $time);
+			32'h010046f2: $display("[%0t] POST: FPU test returned d0=%08x", $time, dbg_d0);
+			32'h0100471c: $display("[%0t] POST: SCC test returned d0=%08x", $time, dbg_d0);
+			32'h01004746: $display("[%0t] POST: SCSI test returned d0=%08x", $time, dbg_d0);
+			32'h01004764: $display("[%0t] POST: Enet test returned d0=%08x", $time, dbg_d0);
+			32'h0100479c: $display("[%0t] POST: ECC test returned d0=%08x", $time, dbg_d0);
+			32'h010047c6: $display("[%0t] POST: RTC test returned d0=%08x", $time, dbg_d0);
+			32'h010047f0: $display("[%0t] POST: Timer test returned d0=%08x", $time, dbg_d0);
+			32'h0100481a: $display("[%0t] POST: Event counter test returned d0=%08x", $time, dbg_d0);
+			32'h01004852: $display("[%0t] POST: Sound out test returned d0=%08x", $time, dbg_d0);
+			32'h01004884: $display("[%0t] POST: Extended SCSI test returned d0=%08x", $time, dbg_d0);
+			32'h01001308: begin
+				$display("[%0t] POST: SYSTEM TEST FAILED, error code %02x", $time, dbg_d0[7:0]);
+				$display("  enet: est=%0d stopped=%b tx_mode=%02x tx_status=%02x rx_status=%02x",
+				         dut.enet.est, dut.enet.en_stopped, dut.enet.tx_mode,
+				         dut.enet.tx_status, dut.enet.rx_status);
+				$display("  enet: tx_csr=%02x tx_next=%08x tx_limit=%08x tx_len=%0d",
+				         dut.enet.tx_csr, dut.enet.tx_next, dut.enet.tx_limit, dut.enet.tx_len);
+				$display("  enet: rx_csr=%02x rx_next=%08x rx_limit=%08x rx_len=%0d rx_slimit=%08x",
+				         dut.enet.rx_csr, dut.enet.rx_next, dut.enet.rx_limit, dut.enet.rx_len,
+				         dut.enet.rx_slimit);
+				dump_state;
+			end
+			32'h01001330: $display("[%0t] POST: system test passed path", $time);
+			32'h01003d78: $display("[%0t] POST: event counter measured delay(1000) = %0d us", $time, dbg_d0);
+			32'h010024d2: delay_t0 = $time;   // delay() body entry (past the arg<=3 early out)
+			32'h010024fc: if (delay_t0 != 0) begin
+				$display("[%0t] POST: delay() took %0d ns", $time, ($time - delay_t0) / 1000);
+				delay_t0 = 0;
+			end
+			default: ;
+		endcase
+	end
+endtask
+
+// heartbeat for long runs
+integer hb_cycles = 0;
+always @(posedge clk) begin
+	hb_cycles = hb_cycles + 1;
+	if (hb_cycles % 10000000 == 0)
+		$display("[%0t] heartbeat: pc=%08x", $time, dbg_pc);
+end
+
+// dedicated ethernet trace: every access to the enet register ranges,
+// and the engine state transitions
+wire [16:0] en_off = cpu_addr[16:0];
+wire is_enet_cyc = (cpu_addr[31:24] == 8'h02) &&
+	((en_off[15:4]  == 12'h600)  ||
+	 (en_off[15:2]  == 14'h044)  ||
+	 (en_off[15:2]  == 14'h054)  ||
+	 (en_off[15:5]  == 11'h208)  ||
+	 (en_off[15:5]  == 11'h20A)  ||
+	 (en_off[15:2]  == 14'h10C4) ||
+	 (en_off[15:2]  == 14'h10D4));
+
+always @(posedge clk) begin
+	if (!reset && mem_ready && is_enet_cyc && $test$plusargs("entrace"))
+		$display("[%0t] EN %s %08x data=%04x pc=%08x",
+		         $time, is_write ? "WR" : "RD", cpu_addr,
+		         is_write ? cpu_dout : cpu_din, dbg_pc);
+end
+
+reg [2:0] en_est_prev;
+always @(posedge clk) begin
+	en_est_prev <= dut.enet.est;
+	if (!reset && dut.enet.est != en_est_prev && $test$plusargs("entrace"))
+		$display("[%0t] EN est %0d -> %0d (tx_len=%0d rx_len=%0d rx_pos=%0d tx_next=%08x rx_next=%08x)",
+		         $time, en_est_prev, dut.enet.est, dut.enet.tx_len,
+		         dut.enet.rx_len, dut.enet.rx_pos, dut.enet.tx_next, dut.enet.rx_next);
+end
+
 // PC trace ring buffer
 reg [31:0] pc_ring [0:63];
 integer pc_ring_n = 0;
@@ -191,6 +294,7 @@ always @(posedge clk) begin
 		pc_prev <= dbg_pc;
 		pc_ring[pc_ring_n % 64] <= dbg_pc;
 		pc_ring_n = pc_ring_n + 1;
+		post_trace(dbg_pc);
 	end
 end
 
@@ -206,11 +310,14 @@ task dump_state;
 		$display("bus errors:");
 		for (i = 0; i < berr_count && i < 64; i = i + 1)
 			$display("  addr=%08x pc=%08x", berr_log[i], berr_pc[i]);
-		$display("IO accesses (%0d):", iolog_n);
-		for (i = 0; i < iolog_n && i < 1024; i = i + 1)
+		$display("IO accesses (last %0d of %0d):", (iolog_n > 1024) ? 1024 : iolog_n, iolog_n);
+		k = (iolog_n > 1024) ? 1024 : iolog_n;
+		for (i = 0; i < k; i = i + 1)
 			$display("  %s %08x data=%04x pc=xxxx%04x",
-			         iolog[i][63] ? "WR" : "RD",
-			         {1'b0, iolog[i][62:32]}, iolog[i][31:16], iolog[i][15:0]);
+			         iolog[(iolog_n - k + i) % 1024][63] ? "WR" : "RD",
+			         {1'b0, iolog[(iolog_n - k + i) % 1024][62:32]},
+			         iolog[(iolog_n - k + i) % 1024][31:16],
+			         iolog[(iolog_n - k + i) % 1024][15:0]);
 	end
 endtask
 
