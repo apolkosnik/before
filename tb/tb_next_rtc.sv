@@ -1,0 +1,178 @@
+//============================================================================
+//  NeXT RTC/NVRAM serial interface test
+//
+//  Bit-bangs the MC68HC68T1 serial protocol through SCR2 byte 2 of the
+//  real next_scr module, the way the boot ROM does: RTCE high, address
+//  byte then data byte(s) MSB first, data sampled by the chip on the
+//  falling edge of RTCLK.
+//
+//  Checks against the nvram_default[] content from Previous rtcnvram.c:
+//    - NVRAM byte 0 reads 0x94, byte 1 reads 0x0F
+//    - checksum bytes 30/31 read 0x0F 0x13
+//    - burst read auto-increments the address
+//    - a write to NVRAM byte 5 reads back
+//    - SCR1 reads the machine id
+//============================================================================
+
+`timescale 1ns/1ps
+
+module tb_next_rtc;
+
+reg clk = 0;
+always #5 clk = ~clk;
+
+reg reset = 1;
+
+reg         sel = 0;
+reg   [1:0] reg_id = 0;
+reg         addr1 = 0;
+reg         we = 0;
+reg   [1:0] be = 0;
+reg  [15:0] wdata = 0;
+wire [15:0] rdata;
+
+next_scr #(.CLK_HZ(100000000)) dut
+(
+	.clk(clk), .reset(reset),
+	.sel(sel), .reg_id(reg_id), .addr1(addr1), .we(we), .be(be),
+	.wdata(wdata), .rdata(rdata),
+	.scr1(32'h00012052),
+	.timer_ipl7(), .led(), .rom_overlay(),
+	.softint1(), .softint2()
+);
+
+// one bus write to SCR2 byte 2
+task scr2_byte2_write;
+	input [7:0] val;
+	begin
+		@(posedge clk);
+		sel <= 1; reg_id <= 2'd2; addr1 <= 1; we <= 1; be <= 2'b10;
+		wdata <= {val, 8'h00};
+		@(posedge clk);
+		sel <= 0; we <= 0;
+	end
+endtask
+
+// one bus read of SCR2 word 1 (bytes 2 and 3)
+task scr2_word1_read;
+	output [15:0] val;
+	begin
+		@(posedge clk);
+		sel <= 1; reg_id <= 2'd2; addr1 <= 1; we <= 0; be <= 2'b11;
+		@(posedge clk);
+		val = rdata;
+		sel <= 0;
+	end
+endtask
+
+localparam RTCE = 8'h01, RTCLK = 8'h02, RTDATA = 8'h04;
+
+// clock one bit into the interface, return the interface data bit
+task rtc_bit;
+	input  b_in;
+	output b_out;
+	reg [15:0] r;
+	begin
+		scr2_byte2_write(RTCE | RTCLK | (b_in ? RTDATA : 8'h00));
+		scr2_byte2_write(RTCE |         (b_in ? RTDATA : 8'h00));
+		scr2_word1_read(r);
+		b_out = r[10];   // byte 2 bit 2 (RTDATA)
+	end
+endtask
+
+task rtc_send_byte;
+	input [7:0] v;
+	integer i;
+	reg dummy;
+	begin
+		for (i = 7; i >= 0; i = i - 1) rtc_bit(v[i], dummy);
+	end
+endtask
+
+task rtc_recv_byte;
+	output [7:0] v;
+	integer i;
+	reg b;
+	begin
+		for (i = 7; i >= 0; i = i - 1) begin
+			rtc_bit(1'b0, b);
+			v[i] = b;
+		end
+	end
+endtask
+
+task rtc_stop;
+	begin
+		scr2_byte2_write(8'h00);   // RTCE low resets the interface
+	end
+endtask
+
+integer errors = 0;
+
+task check;
+	input cond;
+	input [255:0] name;
+	begin
+		if (cond) $display("PASS: %0s", name);
+		else begin $display("FAIL: %0s", name); errors = errors + 1; end
+	end
+endtask
+
+reg [7:0] b0, b1, b30, b31, wb;
+reg [15:0] w;
+
+initial begin
+	if ($test$plusargs("dump")) begin
+		$dumpfile("build/tb_next_rtc.vcd");
+		$dumpvars(0, tb_next_rtc);
+	end
+
+	repeat (10) @(posedge clk);
+	reset = 0;
+	repeat (10) @(posedge clk);
+
+	// SCR1 through the register interface
+	@(posedge clk);
+	sel <= 1; reg_id <= 2'd0; addr1 <= 0; we <= 0; be <= 2'b11;
+	@(posedge clk);
+	w[15:0] = rdata; sel <= 0;
+	check(w == 16'h0001, "SCR1 high word is 0x0001");
+	@(posedge clk);
+	sel <= 1; reg_id <= 2'd0; addr1 <= 1; we <= 0;
+	@(posedge clk);
+	w[15:0] = rdata; sel <= 0;
+	check(w == 16'h2052, "SCR1 low word is 0x2052");
+
+	// burst read NVRAM bytes 0 and 1 (address auto-increment)
+	rtc_send_byte(8'h00);
+	rtc_recv_byte(b0);
+	rtc_recv_byte(b1);
+	rtc_stop;
+	$display("nvram[0]=%02x nvram[1]=%02x", b0, b1);
+	check(b0 == 8'h94, "NVRAM byte 0 is 0x94");
+	check(b1 == 8'h0F, "NVRAM byte 1 is 0x0F (auto-increment works)");
+
+	// checksum bytes
+	rtc_send_byte(8'h1E);
+	rtc_recv_byte(b30);
+	rtc_recv_byte(b31);
+	rtc_stop;
+	$display("nvram[30]=%02x nvram[31]=%02x", b30, b31);
+	check(b30 == 8'h0F && b31 == 8'h13, "NVRAM checksum bytes are 0x0F 0x13");
+
+	// write NVRAM byte 5 and read it back
+	rtc_send_byte(8'h85);          // write, address 5
+	rtc_send_byte(8'h5A);
+	rtc_stop;
+	rtc_send_byte(8'h05);
+	rtc_recv_byte(wb);
+	rtc_stop;
+	$display("nvram[5]=%02x after write", wb);
+	check(wb == 8'h5A, "NVRAM write/readback");
+
+	if (errors == 0) $display("ALL PASS");
+	else             $display("%0d FAILURES", errors);
+	$finish;
+end
+
+endmodule

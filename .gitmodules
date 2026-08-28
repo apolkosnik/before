@@ -1,0 +1,6 @@
+[submodule "rtl/AP68040"]
+	path = rtl/AP68040
+	url = https://github.com/apolkosnik/AP68040
+[submodule "reference/previous"]
+	path = reference/previous
+	url = https://github.com/probonopd/previous
