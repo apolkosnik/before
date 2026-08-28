@@ -33,9 +33,13 @@ The machine is held in reset until a ROM is loaded.
 ## Tests
 
 ```
-cd tb && ./run_tests.sh            # needs iverilog and python3
+cd tb && ./run_tests.sh            # needs verilator 5.x and python3
+cd tb && ./run_tests.sh post       # additionally runs the full
+                                   # power-on system test (about 5 min)
 ```
 
 Runs the real RTL only - the real AP68040 submodule sources, the real
 next_* modules, and the real boot ROM image from the Previous
-submodule.  See the test list in docs/PORTING.md.
+submodule.  The `post` mode boots the ROM through its complete
+power-on system test to the "System test passed" path.  See the test
+list in docs/PORTING.md.

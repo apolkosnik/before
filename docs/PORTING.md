@@ -58,7 +58,9 @@ Two system-level behaviors were required beyond the device models:
   speed; the POST event counter test measures delay(1000) against a
   899..1100 us window and gets ~1004 us.
 
-`tb/run_tests.sh` (iverilog) runs the real RTL, no mocks:
+`tb/run_tests.sh` (Verilator) runs the real RTL, no mocks
+(`./run_tests.sh post` also runs the full power-on system test to the
+passed path, about 5 minutes):
 
 - `tb_next_boot`: the real Rev 2.5 v66 boot ROM executes from reset on
   the real AP68040 through the real decode/devices.  Verified: reset
