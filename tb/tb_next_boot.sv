@@ -61,7 +61,7 @@ next_system #(
 	.hps_rtc(hps_rtc),
 	.img_mounted(img_mounted),
 	.img_readonly(1'b0),
-	.img_size(64'd1048576),
+	.img_size(img_bytes),
 	.sd_lba(sd_lba),
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
@@ -396,6 +396,28 @@ reg         sd_buff_wr = 0;
 
 reg  [7:0] disk [0:2048*512-1];
 
+// +img=<path>: a raw disk image file backs the SD model instead of
+// the built-in pattern (copy the image first, writes go back to it)
+string     img_path;
+integer    img_fd = 0;
+reg [63:0] img_bytes = 64'd1048576;
+reg  [7:0] fbuf [0:511];
+integer    fr;
+
+initial begin
+	if ($value$plusargs("img=%s", img_path)) begin
+		img_fd = $fopen(img_path, "rb+");
+		if (img_fd == 0) begin
+			$display("cannot open %0s", img_path);
+			$finish;
+		end
+		fr = $fseek(img_fd, 0, 2);
+		img_bytes = $ftell(img_fd);
+		fr = $fseek(img_fd, 0, 0);
+		$display("BOOT: disk image %0s, %0d bytes", img_path, img_bytes);
+	end
+end
+
 function [7:0] dpat;
 	input [31:0] blk;
 	input [31:0] off;
@@ -408,7 +430,7 @@ integer sdi;
 initial for (sdi = 0; sdi < 2048*512; sdi = sdi + 1)
 	disk[sdi] = dpat(sdi / 512, sdi % 512);
 
-reg sd_rd_act = 0, sd_wr_act = 0, sd_rphase = 0;
+reg sd_rd_act = 0, sd_wr_act = 0, sd_rphase = 0, img_flush = 0;
 integer sd_reads = 0;
 reg sd_lba0 = 0;
 
@@ -420,11 +442,18 @@ always @(posedge clk) begin
 		sd_buff_wr <= 0;
 		sd_reads = sd_reads + 1;
 		if (sd_lba == 0) sd_lba0 <= 1;
-		$display("[%0t] BOOT: SD read lba %0d", $time, sd_lba);
+		if (img_fd != 0) begin
+			fr = $fseek(img_fd, {sd_lba, 9'd0}, 0);
+			fr = $fread(fbuf, img_fd);
+		end
+		if (sd_reads < 200 || (sd_reads % 256) == 0)
+			$display("[%0t] BOOT: SD read lba %0d", $time, sd_lba);
 	end
 	else if (sd_ack && sd_rd_act) begin
 		if (!sd_buff_wr) begin
-			sd_buff_dout <= disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}];
+			sd_buff_dout <= (img_fd != 0)
+			              ? fbuf[sd_buff_addr]
+			              : disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}];
 			sd_buff_wr <= 1;
 		end
 		else begin
@@ -445,15 +474,24 @@ always @(posedge clk) begin
 	end
 	else if (sd_ack && sd_wr_act) begin
 		if (sd_rphase) begin
-			disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
+			if (img_fd != 0) fbuf[sd_buff_addr] <= sd_buff_din;
+			else disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
 			sd_rphase <= 0;
 			if (sd_buff_addr == 9'd511) begin
 				sd_ack <= 0;
 				sd_wr_act <= 0;
+				if (img_fd != 0) img_flush <= 1;
 			end
 			else sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
 		else sd_rphase <= 1;
+	end
+	if (img_flush) begin : wrback
+		integer k;
+		img_flush <= 0;
+		fr = $fseek(img_fd, {sd_lba, 9'd0}, 0);
+		for (k = 0; k < 512; k = k + 1) $fwrite(img_fd, "%c", fbuf[k]);
+		$fflush(img_fd);
 	end
 end
 
@@ -475,6 +513,29 @@ always @(posedge clk) if (!reset && bootsd) begin
 	if (dut.sc_m_req && dut.sc_m_we && dut.sc_m_ack)
 		scsi_dma_writes = scsi_dma_writes + 1;
 end
+
+// 1120x832 2bpp NeXT gray to PGM: 0 = white, 3 = black, line pitch
+// 288 bytes (1120/4 active plus 8 pad), even address byte in mem_hi
+task fb_dump;
+	integer fd, y, xb, p;
+	reg [7:0] b;
+	begin
+		fd = $fopen("build/fb.pgm", "wb");
+		$fwrite(fd, "P5\n1120 832\n255\n");
+		for (y = 0; y < 832; y = y + 1) begin
+			for (xb = 0; xb < 280; xb = xb + 1) begin : row
+				integer ba;
+				ba = y * 288 + xb;
+				b = ba[0] ? dut.vram.mem_lo.mem[ba >> 1]
+				          : dut.vram.mem_hi.mem[ba >> 1];
+				for (p = 3; p >= 0; p = p - 1)
+					$fwrite(fd, "%c", 8'd255 - {6'd0, b[2*p +: 2]} * 8'd85);
+			end
+		end
+		$fclose(fd);
+		$display("BOOT: framebuffer written to build/fb.pgm");
+	end
+endtask
 
 initial begin
 	if ($test$plusargs("dump")) begin
@@ -531,6 +592,7 @@ initial begin
 		check(saw_esp_sel, "boot: ROM selected the SCSI disk");
 		check(sd_lba0, "boot: sector 0 fetched from the SD image");
 		check(scsi_dma_writes >= 128, "boot: a full sector reached memory by DMA");
+		fb_dump;
 	end
 
 	if (errors != 0 || $test$plusargs("iotrace")) dump_state;
