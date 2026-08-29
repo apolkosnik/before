@@ -231,6 +231,20 @@ initial begin
 	check(v[2] == 1'b0, "a drive is reported as connected");
 	check(v[1:0] == 2'd2, "a 1.44 MB medium reports media id 2");
 
+	// The control register is a command on write and status on read:
+	// selecting the DMA channel must not erase the published medium.
+	wr8(4'h8, 8'h40);            // CTRL_82077, the channel select
+	rd8(4'h8, v);
+	check(v[1:0] == 2'd2, "a channel select does not erase the media id");
+	check(flp_select, "the channel is selected");
+
+	// a drive that does not exist reports no drive and no medium
+	wr8(4'h2, 8'h1D);            // select drive 1, motor on
+	rd8(4'h8, v);
+	check(v[2] == 1'b1, "an absent drive reports no drive");
+	check(v[1:0] == 2'd0, "an absent drive reports no medium");
+	wr8(4'h2, 8'h1C);            // back to drive 0
+
 	wr8(4'h2, 8'h0C);            // motor off
 	rd8(4'h8, v);
 	check(v[1:0] == 2'd0, "no media id while the motor is stopped");

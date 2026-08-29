@@ -83,7 +83,14 @@ localparam ST2_WC      = 8'h10;
 reg  [7:0] dor;              // digital output
 reg  [7:0] msr;              // main status
 reg  [7:0] ccr;              // configuration control (data rate)
-reg  [7:0] ctrl;             // external control
+// The external control register is not one register.  Writing it is a
+// command - select the DMA channel, eject - and FLP_Select_Write never
+// stores the value.  Reading it returns status that floppy_dor_write
+// maintains: whether a drive is connected, and what medium is in it.
+// Keeping one register for both let a channel-select write erase the
+// media ID and leave the ROM seeing an empty drive.
+reg        sel_82077;        // written at +8, selects the DMA channel
+reg  [7:0] ctrl_st;          // read at +8: drive and media status
 reg  [7:0] st0, st1, st2;
 reg  [7:0] pcn;              // present cylinder
 reg        eis;              // implied seek enabled
@@ -98,7 +105,7 @@ reg [31:0] img_bytes;
 reg  [7:0] spt;              // sectors per track, from the image size
 
 assign int_floppy = int_pend;
-assign flp_select = ctrl[6] | mo_gpo;      // CTRL_82077 or the MO's GPO
+assign flp_select = sel_82077 | mo_gpo;    // CTRL_82077 or the MO's GPO
 
 wire [7:0] sra = (int_pend ? SRA_INT : 8'h00) |
                  SRA_DRV1_N |                       // only drive 0 exists
@@ -174,7 +181,7 @@ wire [3:0] a_odd  = {addr[3:1], 1'b1};
 	((a) == 4'h4) ? msr : \
 	((a) == 4'h5) ? res[0] : \
 	((a) == 4'h7) ? dir : \
-	((a) == 4'h8) ? ctrl : 8'h00 )
+	((a) == 4'h8) ? ctrl_st : 8'h00 )
 
 assign rdata = {`FLP_READ(a_even), `FLP_READ(a_odd)};
 
@@ -264,7 +271,8 @@ always @(posedge clk) begin
 		dor <= 8'h00;
 		msr <= STAT_RQM;
 		ccr <= 8'h00;
-		ctrl <= 8'h00;
+		sel_82077 <= 1'b0;
+		ctrl_st <= 8'h04;        // no drive selected yet
 		st0 <= 0; st1 <= 0; st2 <= 0;
 		pcn <= 0;
 		eis <= 0;
@@ -287,13 +295,16 @@ always @(posedge clk) begin
 		// medium
 		//------------------------------------------------------------
 		if (img_mounted) begin
-			present    <= (img_size != 0);
-			readonly   <= img_readonly;
-			img_bytes  <= img_size[31:0];
-			// sectors per track = size / 512 / 2 / 80, for the three
-			// formats the drive accepts
+			// Only the three formats the drive takes are a medium at
+			// all; anything else has no geometry to report, and the
+			// reference calls that an empty drive rather than guessing
+			// at 1.44 MB.
+			present  <= (img_size == 32'd737280) ||
+			            (img_size == 32'd1474560) ||
+			            (img_size == 32'd2949120);
+			readonly <= img_readonly;
+			img_bytes <= img_size[31:0];
 			spt <= (img_size == 32'd737280)  ? 8'd9  :
-			       (img_size == 32'd1474560) ? 8'd18 :
 			       (img_size == 32'd2949120) ? 8'd36 : 8'd18;
 		end
 
@@ -405,16 +416,25 @@ always @(posedge clk) begin
 					case (a)
 					4'h2: begin
 						dor <= v;
-						// floppy_dor_write(): a connected drive clears
-						// the drive id bit, and spinning the motor up
-						// publishes what medium is in it
-						ctrl[2] <= 1'b0;
-						ctrl[1:0] <= v[4] ? media_id : MEDIA_NONE;
+						// floppy_dor_write(): the status published is
+						// that of the drive the write selects, and only
+						// drive 0 exists here, so selecting any other
+						// reports no drive at all.  The medium appears
+						// when that drive's motor is running.
+						if (v[1:0] == 2'd0) begin
+							ctrl_st[2]   <= 1'b0;
+							ctrl_st[1:0] <= v[4] ? media_id : MEDIA_NONE;
+						end
+						else begin
+							ctrl_st[2]   <= 1'b1;   // no such drive
+							ctrl_st[1:0] <= MEDIA_NONE;
+						end
 					end
 					4'h4: ccr <= v;          // data rate select
 					4'h7: ccr <= v;          // configuration control
 					4'h8: begin
-						ctrl <= v;
+						// a command, not a stored value
+						sel_82077 <= v[6];
 						if (v[7]) present <= 0;   // eject
 					end
 					4'h5: begin : fifo_wr

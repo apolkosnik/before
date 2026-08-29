@@ -250,10 +250,34 @@ initial begin
 	fimg_mounted = 0;
 	repeat (20) @(posedge clk);
 
-	// hand the DMA channel to the floppy, motor on
-	fwr(4'h8, 8'h40);            // CTRL_82077
-	fwr(4'h2, 8'h1C);            // motor 0 on
+	// Ask for a sector BEFORE handing the channel over.  The drive will
+	// hold its request up while it waits; if the channel only watches
+	// for an edge, that request is consumed here and never seen again.
+	fwr(4'h2, 8'h1C);            // motor 0 on, channel still on the ESP
+	fwr(4'h5, 8'h46);
+	fwr(4'h5, 8'h00); fwr(4'h5, 8'h00); fwr(4'h5, 8'h00);
+	fwr(4'h5, 8'h01); fwr(4'h5, 8'h02); fwr(4'h5, 8'h01);
+	fwr(4'h5, 8'h1B); fwr(4'h5, 8'hFF);
+	repeat (3000) @(posedge clk);          // let the request go up and sit
+
+	ptr_wr32(6'h10, BUF);
+	ptr_wr32(6'h14, BUF + 32'd512);
+	csr_cmd(8'h11);
+	fwr(4'h8, 8'h40);            // only now switch the channel over
+	@(posedge clk);
 	check(flp_select, "the channel is switched to the floppy");
+
+	waited = 0;
+	while (!int_floppy && waited < 2000000) begin
+		@(posedge clk);
+		waited = waited + 1;
+	end
+	check(int_floppy, "a request raised before selection is still served");
+	bad = 0;
+	for (i = 0; i < 512; i = i + 1)
+		if (ram_byte(BUF + i) !== pat(0, i)) bad = bad + 1;
+	check(bad == 0, "that deferred sector arrives intact");
+	for (i = 0; i < 7; i = i + 1) frd(4'h5, v);   // drain the result
 
 	// program the channel over a whole track, the way a driver does
 	ptr_wr32(6'h10, BUF);

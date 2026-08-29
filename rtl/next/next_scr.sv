@@ -23,7 +23,15 @@
 //  which carries a valid checksum in bytes 30/31.
 //============================================================================
 
-module next_scr #(parameter CLK_HZ = 100000000)
+module next_scr #(
+	parameter CLK_HZ = 100000000,
+	// The physical clock.  CLK_HZ is the virtual rate the CPU
+	// calibration is built on, and the machine runs at 56 percent of
+	// real time against it; a crystal driven battery clock does not,
+	// so the time of day counts real seconds or it loses 26 minutes an
+	// hour.  This sets the rate only - nothing seeds it.
+	parameter CLK_REAL_HZ = CLK_HZ
+)
 (
 	input         clk,
 	input         reset,
@@ -82,7 +90,7 @@ reg  [7:0] t_sec = 8'h00, t_min = 8'h00, t_hour = 8'h00;
 reg  [7:0] t_wday = 8'h01, t_mday = 8'h01, t_month = 8'h01, t_year = 8'h00;
 
 // one second tick
-localparam integer SEC_DIV = CLK_HZ;
+localparam integer SEC_DIV = CLK_REAL_HZ;
 reg [$clog2(SEC_DIV)-1:0] sec_presc = 0;
 wire sec_tick = (sec_presc == SEC_DIV-1);
 

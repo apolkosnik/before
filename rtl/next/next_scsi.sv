@@ -199,6 +199,7 @@ reg  [2:0] do_rem;               // bytes left to unpack from a DMA word
 
 reg        flp_active;         // a floppy sector is in flight
 reg        flp_req_d;          // for the rising edge of a sector request
+reg        flp_pend;           // a request seen but not yet taken
 reg [24:0] dly_us;               // interrupt delay countdown
 localparam ESP_DELAY_US = 25'd100;
 
@@ -744,6 +745,7 @@ always @(posedge clk) begin
 		gap_us <= 0;
 		flp_active <= 0;
 		flp_req_d <= 0;
+		flp_pend <= 0;
 		flp_done <= 0;
 		word_cnt <= 0; word_buf <= 0; do_rem <= 0;
 		dly_us <= 0;
@@ -759,13 +761,19 @@ always @(posedge clk) begin
 		flp_done <= 0;
 		if (tick && gap_us != 0) gap_us <= gap_us - 1'd1;
 
-		// The floppy asks for the channel while the ESP is idle.  It must
-		// be a fresh request: the drive holds dma_req up until it sees
-		// the sector completed, so a level test restarts the channel on
-		// the buffer it has just handed over, before the next sector has
-		// been loaded into it.
+		// The floppy holds its request up until it sees the sector
+		// completed, so a level test would restart the channel on the
+		// buffer it has just handed over.  An edge test is worse: an
+		// edge arriving before the channel is switched over, or while
+		// the ESP has it, is consumed and never comes again, and the
+		// drive waits for a completion that cannot happen.  Latch the
+		// request instead and clear it when the sector is taken.
+		if (flp_req && !flp_req_d) flp_pend <= 1;
 		flp_req_d <= flp_req;
-		if (flp_select && flp_req && !flp_req_d && !flp_active && (xst == X_IDLE)) begin
+		if (!flp_req) flp_pend <= 0;
+
+		if (flp_select && flp_pend && !flp_active && (xst == X_IDLE)) begin
+			flp_pend <= 0;
 			flp_active <= 1;
 			buf_pos    <= 0;
 			buf_limit  <= flp_len[9:0];

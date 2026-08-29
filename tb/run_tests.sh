@@ -107,7 +107,11 @@ run tb_boot      "$WORK/vl_tb_next_boot/tb_next_boot"
 
 if [ "${1:-}" = "post" ]; then
 	echo "--- full power-on system test (about 5 minutes) ---"
-	if ! "$WORK/vl_tb_next_boot/tb_next_boot" +cycles=500000000 \
+	# The memory model is the machine's full 64 MB, and the ROM clears
+	# all of it before the tests: the success marker lands near 900
+	# million cycles, so a 500 million budget times out on a POST that
+	# is running perfectly well.
+	if ! "$WORK/vl_tb_next_boot/tb_next_boot" +mcycles=1400 \
 		| tee "$WORK/tb_post.log" | grep -q "system test passed path"; then
 		echo "*** full POST FAILED (see tb/$WORK/tb_post.log)"
 		fail=1
@@ -118,7 +122,7 @@ fi
 
 if [ "${1:-}" = "bootsd" ]; then
 	echo "--- SCSI boot path: POST plus disk boot (about 7 minutes) ---"
-	if ! "$WORK/vl_tb_next_boot/tb_next_boot" +bootsd +cycles=600000000 \
+	if ! "$WORK/vl_tb_next_boot/tb_next_boot" +bootsd +mcycles=1600 \
 		| tee "$WORK/tb_bootsd.log" | grep -q "boot: ROM selected the SCSI disk"; then
 		echo "*** SCSI boot path FAILED (see tb/$WORK/tb_bootsd.log)"
 		fail=1
