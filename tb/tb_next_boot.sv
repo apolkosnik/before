@@ -495,6 +495,22 @@ always @(posedge clk) begin
 	end
 end
 
+// +walktrace: every MMU table-walker transaction, and every access
+// error the walker reports.  With a real disk image this is what turns
+// a kernel "MMU invalid descriptor" panic into the exact descriptor
+// address and value that produced it.
+reg wtrace = 0;
+initial wtrace = $test$plusargs("walktrace");
+always @(posedge clk) if (wtrace && !reset) begin
+	if (dut.walker_req && dut.walker_ack)
+		$display("[%0t] WALK %s %08x %s %08x", $time,
+		         dut.walker_we ? "wr" : "rd", dut.walker_addr,
+		         dut.walker_we ? "=" : "->",
+		         dut.walker_we ? dut.walker_wdat : dut.walker_data);
+	if (dut.walker_req && dut.walker_berr)
+		$display("[%0t] WALK BERR %08x", $time, dut.walker_addr);
+end
+
 // ESP activity trace: selection commands and DMA writes to memory
 reg saw_esp_sel = 0;
 integer scsi_dma_writes = 0;
