@@ -182,6 +182,7 @@ wire       rtc_bit_out = rtc_is_write ? rtc_bit_in : rtc_val_cur[rtc_bit_idx[2:0
 wire [7:0] rtc_wr_byte = {rtc_val_cur[6:0], rtc_bit_in};
 
 integer i;
+reg [2:0] bootdev_d = 3'd7;   // no real selection: forces the first load
 
 // effective boot device: 1 = SCSI disk ("sd"), 2 = ethernet ("en"),
 // 3 = empty boot command (the ROM walks its device table, network
@@ -224,6 +225,18 @@ function automatic [7:0] nv_init;
 endfunction
 
 always @(posedge clk) begin
+	//------------------------------------------------------------
+	// The NVRAM is battery backed on the real machine: it survives a
+	// reset, and dev_reset here carries the CPU's RESET instruction,
+	// which both the ROM and the system software execute during
+	// start-up.  Re-initialising it there threw away everything the
+	// guest had written.  Load it at power-on and whenever the boot
+	// device selection changes, and let guest writes below stand.
+	//------------------------------------------------------------
+	bootdev_d <= bootdev;
+	if (bootdev != bootdev_d)
+		for (i = 0; i < 32; i = i + 1) nvram[i] <= nv_init(i[4:0], bootdev);
+
 	//------------------------------------------------------------
 	// Time of day, ahead of the reset branch: the clock is battery
 	// backed on the real machine, and the host update arrives once at
@@ -279,7 +292,6 @@ always @(posedge clk) begin
 	end
 
 	if (reset) begin
-		for (i = 0; i < 32; i = i + 1) nvram[i] <= nv_init(i[4:0], bootdev);
 		scr2_0 <= 8'h00;
 		scr2_1 <= 8'h00;
 		scr2_2 <= 8'h00;   // non-turbo reset values, SCR_Reset() in sysReg.c

@@ -258,6 +258,19 @@ initial begin
 	$display("nvram[5]=%02x after write", wb);
 	check(wb == 8'h5A, "NVRAM write/readback");
 
+	// The chip is battery backed, and the reset that reaches it carries
+	// the CPU's RESET instruction, which the ROM and the system software
+	// both execute while starting up.  A guest's byte must still be
+	// there afterwards.
+	reset = 1;
+	repeat (5) @(posedge clk);
+	reset = 0;
+	repeat (5) @(posedge clk);
+	rtc_send_byte(8'h05);
+	rtc_recv_byte(wb);
+	rtc_stop;
+	check(wb == 8'h5A, "an NVRAM byte survives a reset");
+
 	// host time of day: 2026-08-28 21:47:30, a Friday
 	hps_time(8'h30, 8'h47, 8'h21, 8'h28, 8'h08, 8'h26, 4'd5);
 	read_clock;
