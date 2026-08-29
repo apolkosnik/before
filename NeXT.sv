@@ -81,7 +81,6 @@ wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
 wire  [10:0] ps2_key;
-wire  [64:0] hps_rtc;
 
 wire        ioctl_download;
 wire [15:0] ioctl_index;
@@ -135,8 +134,6 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(2)) hps_io
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din('{sd_buff_din, fsd_buff_din}),
 	.sd_buff_wr(sd_buff_wr),
-
-	.RTC(hps_rtc),
 
 	.ps2_key(ps2_key)
 );
@@ -200,7 +197,6 @@ next_system #(
 
 	.ps2_key(ps2_key),
 	.boot_sel(status[57:55]),
-	.hps_rtc(hps_rtc),
 
 	.fimg_mounted(fimg_mounted),
 	.fimg_readonly(img_readonly),

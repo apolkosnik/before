@@ -23,13 +23,7 @@
 //  which carries a valid checksum in bytes 30/31.
 //============================================================================
 
-module next_scr #(
-	parameter CLK_HZ = 100000000,
-	// physical clock rate: the time of day counts real seconds, not the
-	// machine's stretched virtual time (see the calibration note in
-	// next_system.sv)
-	parameter CLK_REAL_HZ = CLK_HZ
-)
+module next_scr #(parameter CLK_HZ = 100000000)
 (
 	input         clk,
 	input         reset,
@@ -46,9 +40,6 @@ module next_scr #(
 	// SCR1 value (machine id), default 25MHz Cube 040
 	input  [31:0] scr1,
 
-	// host time of day from hps_io (MSM6242B layout, bit 64 toggles on
-	// each update); seeds the RTC until the guest sets its own time
-	input  [64:0] hps_rtc,
 
 	// boot device menu: 0 = Auto (disk when an image is mounted, else
 	// the ROM default order), 1 = Disk, 2 = Network, 3 = ROM Default.
@@ -86,45 +77,14 @@ reg  [7:0] rtc_val;
 reg  [7:0] clkctrl;              // reg 0x31
 reg  [7:0] intctrl;              // reg 0x32
 
-// Time of day in the packed decimal layout of the MC68HC68T1 clock
-// registers.  Like the battery backed clock of the real machine it
-// survives reset and keeps counting.
-//
-// The year register holds toBCDyr(years since 1900) as in rtcnvram.c:
-// the decade nibble is allowed to run past 9 (2026 reads 0xC6), which
-// is how the system software recovers a year beyond 1999.  yr_bin
-// carries the same value in binary for the leap year rule.
-reg  [7:0] t_sec = 8'h00, t_min = 8'h00, t_hour = 8'h00;
-reg  [7:0] t_wday = 8'h01, t_mday = 8'h01, t_month = 8'h01;
-reg  [3:0] yr_tens = 4'd0, yr_ones = 4'd0;
-reg  [7:0] yr_bin = 8'd0;
-wire [7:0] t_year = {yr_tens, yr_ones};
-
-// the guest has set the clock itself: stop taking host updates
-reg        guest_set = 0;
+// time of day, BCD (date part is static, see docs/PORTING.md)
+reg  [7:0] t_sec, t_min, t_hour;
+reg  [7:0] t_wday, t_mday, t_month, t_year;
 
 // one second tick
-localparam integer SEC_DIV = CLK_REAL_HZ;
-reg [$clog2(SEC_DIV)-1:0] sec_presc = 0;
+localparam integer SEC_DIV = CLK_HZ;
+reg [$clog2(SEC_DIV)-1:0] sec_presc;
 wire sec_tick = (sec_presc == SEC_DIV-1);
-
-// calendar rollover: the leap rule that holds for every year this
-// clock can reach (1901-2099)
-wire       leap = (yr_bin[1:0] == 2'b00);
-wire [7:0] month_days = (t_month == 8'h02) ? (leap ? 8'h29 : 8'h28) :
-                        (t_month == 8'h04 || t_month == 8'h06 ||
-                         t_month == 8'h09 || t_month == 8'h11) ? 8'h30 : 8'h31;
-
-// host update, converted to the clock's own encodings: day of week
-// counts from 1 on Sunday, and the year is rebased on 1900 assuming
-// the host is in this century
-reg        rtc_tog_d = 0;
-wire [3:0] h_yr_t = hps_rtc[47:44];
-wire [3:0] h_yr_o = hps_rtc[43:40];
-wire [7:0] h_yr_bin = 8'd100 + {4'd0, h_yr_t} * 8'd10 + {4'd0, h_yr_o};
-wire [4:0] h_yr_tens = {1'b0, h_yr_t} + 5'd10;
-wire       hps_valid = (hps_rtc[39:32] != 8'h00) && (hps_rtc[31:24] != 8'h00);
-wire       hps_load = (hps_rtc[64] != rtc_tog_d) && hps_valid && !guest_set;
 
 function [7:0] bcd_inc;
 	input [7:0] v;
@@ -237,60 +197,6 @@ always @(posedge clk) begin
 	if (bootdev != bootdev_d)
 		for (i = 0; i < 32; i = i + 1) nvram[i] <= nv_init(i[4:0], bootdev);
 
-	//------------------------------------------------------------
-	// Time of day, ahead of the reset branch: the clock is battery
-	// backed on the real machine, and the host update arrives once at
-	// core start and then every minute, neither of which may be lost
-	// to a guest reset.  A guest write later in this block overrides
-	// what this loads, which is what makes the guest own the clock.
-	//------------------------------------------------------------
-
-	sec_presc <= sec_tick ? 1'd0 : sec_presc + 1'd1;
-
-	if (sec_tick) begin
-		if (t_sec != 8'h59) t_sec <= bcd_inc(t_sec);
-		else begin
-			t_sec <= 8'h00;
-			if (t_min != 8'h59) t_min <= bcd_inc(t_min);
-			else begin
-				t_min <= 8'h00;
-				if (t_hour != 8'h23) t_hour <= bcd_inc(t_hour);
-				else begin
-					t_hour <= 8'h00;
-					t_wday <= (t_wday == 8'h07) ? 8'h01 : bcd_inc(t_wday);
-					if (t_mday != month_days) t_mday <= bcd_inc(t_mday);
-					else begin
-						t_mday <= 8'h01;
-						if (t_month != 8'h12) t_month <= bcd_inc(t_month);
-						else begin
-							t_month <= 8'h01;
-							yr_bin <= yr_bin + 1'd1;
-							if (yr_ones == 4'd9) begin
-								yr_ones <= 4'd0;
-								yr_tens <= yr_tens + 1'd1;
-							end
-							else yr_ones <= yr_ones + 1'd1;
-						end
-					end
-				end
-			end
-		end
-	end
-
-	rtc_tog_d <= hps_rtc[64];
-	if (hps_load) begin
-		t_sec   <= hps_rtc[7:0];
-		t_min   <= hps_rtc[15:8];
-		t_hour  <= hps_rtc[23:16];
-		t_mday  <= hps_rtc[31:24];
-		t_month <= hps_rtc[39:32];
-		t_wday  <= {4'd0, hps_rtc[51:48]} + 8'd1;
-		yr_tens <= h_yr_tens[3:0];
-		yr_ones <= h_yr_o;
-		yr_bin  <= h_yr_bin;
-		sec_presc <= 0;
-	end
-
 	if (reset) begin
 		scr2_0 <= 8'h00;
 		scr2_1 <= 8'h00;
@@ -301,6 +207,9 @@ always @(posedge clk) begin
 		rtc_val <= 0;
 		clkctrl <= 8'h00;
 		intctrl <= 8'h00;
+		t_sec <= 8'h00; t_min <= 8'h00; t_hour <= 8'h00;
+		t_wday <= 8'h01; t_mday <= 8'h01; t_month <= 8'h01; t_year <= 8'h00;
+		sec_presc <= 0;
 	end
 	else begin
 
@@ -338,19 +247,12 @@ always @(posedge clk) begin
 					if (rtc_is_write) begin
 						if (rtc_is_clock) begin
 							case (rtc_addr[6:0])
-								7'h20: begin t_sec  <= rtc_wr_byte; guest_set <= 1; sec_presc <= 0; end
-								7'h21: begin t_min  <= rtc_wr_byte; guest_set <= 1; end
-								7'h22: begin t_hour <= rtc_wr_byte; guest_set <= 1; end
-								7'h23: begin t_wday <= rtc_wr_byte; guest_set <= 1; end
-								7'h24: begin t_mday <= rtc_wr_byte; guest_set <= 1; end
-								7'h25: begin t_month<= rtc_wr_byte; guest_set <= 1; end
-								7'h26: begin
-									yr_tens <= rtc_wr_byte[7:4];
-									yr_ones <= rtc_wr_byte[3:0];
-									yr_bin  <= {4'd0, rtc_wr_byte[7:4]} * 8'd10
-									         + {4'd0, rtc_wr_byte[3:0]};
-									guest_set <= 1;
-								end
+								7'h20: t_sec  <= rtc_wr_byte;
+								7'h21: t_min  <= rtc_wr_byte;
+								7'h22: t_hour <= rtc_wr_byte;
+								7'h24: t_mday <= rtc_wr_byte;
+								7'h25: t_month<= rtc_wr_byte;
+								7'h26: t_year <= rtc_wr_byte;
 								7'h31: clkctrl<= rtc_wr_byte;
 								7'h32: intctrl<= rtc_wr_byte;
 								default: ;

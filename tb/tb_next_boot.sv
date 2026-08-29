@@ -58,7 +58,6 @@ next_system #(
 	.reset(reset),
 	.ps2_key(11'd0),
 	.boot_sel(bootsd ? 3'd1 : 3'd0),
-	.hps_rtc(hps_rtc),
 	.fimg_mounted(1'b0), .fimg_readonly(1'b0), .fimg_size(64'd0),
 	.fsd_lba(), .fsd_rd(), .fsd_wr(), .fsd_ack(1'b0),
 	.fsd_buff_addr(9'd0), .fsd_buff_dout(8'd0), .fsd_buff_din(),
@@ -381,21 +380,6 @@ endtask
 // reads and the DMA channel lands them in memory.
 //----------------------------------------------------------------------------
 
-// host time of day, delivered the way hps_io does it: the data words
-// land first and the toggle flips at the end of the transfer
-reg [64:0] hps_rtc = 0;
-
-task host_time;
-	input [7:0] sec, min, hour, mday, month, year;
-	input [3:0] wday;
-	begin
-		@(posedge clk);
-		hps_rtc[63:0] <= {8'h40, {4'd0, wday}, year, month, mday, hour, min, sec};
-		@(posedge clk);
-		hps_rtc[64] <= ~hps_rtc[64];
-		repeat (4) @(posedge clk);
-	end
-endtask
 
 reg        bootsd = 0;
 reg        img_mounted = 0;
@@ -653,9 +637,6 @@ initial begin
 		img_mounted <= 0;
 	end
 
-	// the host clock arrives before the machine leaves reset, exactly
-	// as Main sends it at core load
-	host_time(8'h30, 8'h47, 8'h21, 8'h28, 8'h08, 8'h26, 4'd5);
 
 	repeat (20) @(posedge clk);
 	reset = 0;
@@ -687,22 +668,6 @@ initial begin
 	check(seen_scr2_wr, "ROM wrote SCR2");
 	check(!dbg_halted,  "CPU not halted");
 
-	// The host time of day reached the clock through the system wiring
-	// and survived the machine coming out of reset.  Only meaningful
-	// before a guest takes the clock over: NeXTSTEP sets its own time
-	// during startup (and writing year 0xB2 for 2012 is how the kernel
-	// confirmed the decade-overflow encoding we use).
-	$display("clock: %02x:%02x %02x/%02x/%02x guest_set=%b",
-	         dut.scr.t_hour, dut.scr.t_min,
-	         dut.scr.t_month, dut.scr.t_mday, dut.scr.t_year,
-	         dut.scr.guest_set);
-	if (!dut.scr.guest_set) begin
-		check(dut.scr.t_hour == 8'h21 && dut.scr.t_min == 8'h47,
-		      "host time of day reached the RTC");
-		check(dut.scr.t_mday == 8'h28 && dut.scr.t_month == 8'h08 &&
-		      dut.scr.t_year == 8'hC6,
-		      "host date reached the RTC (2026 as 0xC6)");
-	end
 
 	if (bootsd) begin
 		$display("SD reads: %0d, SCSI DMA words to memory: %0d",

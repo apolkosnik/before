@@ -34,16 +34,6 @@ whenever an image is mounted in the "SCSI Disk" slot, otherwise the
 ROM default order, which tries the network first), Disk, Network, or
 ROM Default.  Mount the image first, then reset the machine.
 
-## Clock
-
-The machine's battery backed clock is set from the MiSTer host clock,
-so NeXTSTEP boots with the right date.  The core takes the time at
-core load and, with the Main build from the `next-ethernet` branch,
-once a minute after that; a clock set from inside NeXTSTEP takes over
-and is no longer overridden.  A guest that reads a clock which was
-never set (a date in 1900) reports "preposterous time in Real Time
-Clock" and falls back to the filesystem timestamp.
-
 ## Network
 
 The OSD "Network" option bridges the machine's onboard ethernet to a

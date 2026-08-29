@@ -42,9 +42,6 @@ module next_system #(
 	// below (100 MHz, 1/2) satisfy the same invariant.
 	parameter CPU_PACE_NUM = 1,
 	parameter CPU_PACE_DEN = 2,
-	// physical clock rate, for the battery backed time of day (CLK_HZ
-	// is the virtual rate the CPU calibration is built on)
-	parameter CLK_REAL_HZ = CLK_HZ,
 	parameter ROM_INIT_EN = 0,
 	parameter ROM_INIT    = "rom.hex"
 )
@@ -55,8 +52,6 @@ module next_system #(
 	// boot device menu (to the NVRAM boot command, see next_scr)
 	input   [2:0] boot_sel,
 
-	// host time of day (hps_io RTC port)
-	input  [64:0] hps_rtc,
 
 	// floppy image (MiSTer SD block interface, slot 1)
 	input         fimg_mounted,
@@ -601,7 +596,7 @@ always @(posedge clk) if (img_mounted) disk_mounted <= (img_size != 0);
 reg floppy_mounted = 0;
 always @(posedge clk) if (fimg_mounted) floppy_mounted <= (fimg_size != 0);
 
-next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
+next_scr #(.CLK_HZ(CLK_HZ)) scr
 (
 	.clk(clk),
 	.reset(dev_reset),
@@ -616,7 +611,6 @@ next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 	.boot_sel(boot_sel),
 	.disk_mounted(disk_mounted),
 	.floppy_mounted(floppy_mounted),
-	.hps_rtc(hps_rtc),
 	.timer_ipl7(timer_ipl7),
 	.led(led),
 	.rom_overlay(),
