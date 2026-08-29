@@ -80,6 +80,7 @@ wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
 wire  [10:0] ps2_key;
+wire  [64:0] hps_rtc;
 
 wire        ioctl_download;
 wire [15:0] ioctl_index;
@@ -127,6 +128,8 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.sd_buff_din('{sd_buff_din}),
 	.sd_buff_wr(sd_buff_wr),
 
+	.RTC(hps_rtc),
+
 	.ps2_key(ps2_key)
 );
 
@@ -134,8 +137,8 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 // The AP68040 closes timing around 30 MHz on this device (the proven
 // Minimig-AGA integration runs it at 28.7 MHz), so the system runs at
-// 32 MHz and the 1600x912 pixel timing gets its own 100 MHz clock.
-wire clk_sys;   // 32 MHz: CPU, devices, DDR3
+// 28 MHz and the 1600x912 pixel timing gets its own 100 MHz clock.
+wire clk_sys;   // 28 MHz: CPU, devices, DDR3
 wire clk_vid;   // 100 MHz: pixel clock
 pll pll
 (
@@ -189,6 +192,7 @@ next_system #(
 
 	.ps2_key(ps2_key),
 	.boot_sel(status[56:55]),
+	.hps_rtc(hps_rtc),
 
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),

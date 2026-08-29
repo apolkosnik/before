@@ -9,6 +9,10 @@
 //  Checks against the nvram_default[] content from Previous rtcnvram.c:
 //    - NVRAM byte 0 reads 0x94, byte 1 reads 0x0F
 //    - checksum bytes 30/31 carry the one's-complement sum
+//    - the host time of day (hps_io RTC) seeds the clock, the clock
+//      keeps counting across reset, rolls the calendar over correctly
+//      including the leap day, and stops taking host updates once the
+//      guest has set the time itself
 //    - the boot device menu loads the NVRAM boot command on reset
 //      ("sd"/"en"/empty per selection, Auto follows the mounted disk)
 //      with the matching checksum
@@ -26,6 +30,7 @@ always #5 clk = ~clk;
 
 reg reset = 1;
 
+reg  [64:0] hps_rtc = 0;
 reg   [1:0] boot_sel = 0;
 reg         disk_mounted = 0;
 reg         sel = 0;
@@ -36,13 +41,16 @@ reg   [1:0] be = 0;
 reg  [15:0] wdata = 0;
 wire [15:0] rdata;
 
-next_scr #(.CLK_HZ(100000000)) dut
+// CLK_REAL_HZ of 1000 makes a clock second 1000 cycles, so the
+// calendar rollovers are reachable in simulation
+next_scr #(.CLK_HZ(100000000), .CLK_REAL_HZ(1000)) dut
 (
 	.clk(clk), .reset(reset),
 	.sel(sel), .reg_id(reg_id), .addr1(addr1), .we(we), .be(be),
 	.wdata(wdata), .rdata(rdata),
 	.scr1(32'h00012052),
 	.boot_sel(boot_sel), .disk_mounted(disk_mounted),
+	.hps_rtc(hps_rtc),
 	.timer_ipl7(), .led(), .rom_overlay(),
 	.softint1(), .softint2()
 );
@@ -126,7 +134,56 @@ endtask
 
 reg [7:0] b0, b1, b30, b31, wb;
 reg [7:0] c18, c19;
+reg [7:0] r_sec, r_min, r_hour, r_wday, r_mday, r_month, r_year;
 reg [15:0] w;
+
+// deliver a host time update: MSM6242B layout, BCD, wday 0 = Sunday,
+// year is the BCD of (year mod 100)
+task hps_time;
+	input [7:0] sec, min, hour, mday, month, year;
+	input [3:0] wday;
+	begin
+		@(posedge clk);
+		hps_rtc[7:0]   = sec;
+		hps_rtc[15:8]  = min;
+		hps_rtc[23:16] = hour;
+		hps_rtc[31:24] = mday;
+		hps_rtc[39:32] = month;
+		hps_rtc[47:40] = year;
+		hps_rtc[55:48] = {4'd0, wday};
+		hps_rtc[63:56] = 8'h40;
+		hps_rtc[64]    = ~hps_rtc[64];
+		repeat (4) @(posedge clk);
+	end
+endtask
+
+// read the whole clock through the serial interface
+task read_clock;
+	begin
+		rtc_send_byte(8'h20);
+		rtc_recv_byte(r_sec);
+		rtc_recv_byte(r_min);
+		rtc_recv_byte(r_hour);
+		rtc_recv_byte(r_wday);
+		rtc_recv_byte(r_mday);
+		rtc_recv_byte(r_month);
+		rtc_recv_byte(r_year);
+		rtc_stop;
+	end
+endtask
+
+// write the whole clock the way the guest does
+task write_clock;
+	input [7:0] sec, min, hour, mday, month, year;
+	begin
+		rtc_send_byte(8'ha0); rtc_send_byte(sec);   rtc_stop;
+		rtc_send_byte(8'ha1); rtc_send_byte(min);   rtc_stop;
+		rtc_send_byte(8'ha2); rtc_send_byte(hour);  rtc_stop;
+		rtc_send_byte(8'ha4); rtc_send_byte(mday);  rtc_stop;
+		rtc_send_byte(8'ha5); rtc_send_byte(month); rtc_stop;
+		rtc_send_byte(8'ha6); rtc_send_byte(year);  rtc_stop;
+	end
+endtask
 
 // reset with a menu selection, then read boot command and checksum
 task boot_variant;
@@ -198,6 +255,63 @@ initial begin
 	rtc_stop;
 	$display("nvram[5]=%02x after write", wb);
 	check(wb == 8'h5A, "NVRAM write/readback");
+
+	// host time of day: 2026-08-28 21:47:30, a Friday
+	hps_time(8'h30, 8'h47, 8'h21, 8'h28, 8'h08, 8'h26, 4'd5);
+	read_clock;
+	$display("clock = %02x:%02x:%02x wday %02x %02x/%02x/%02x",
+	         r_hour, r_min, r_sec, r_wday, r_month, r_mday, r_year);
+	check(r_sec == 8'h30 && r_min == 8'h47 && r_hour == 8'h21,
+	      "host update seeds the time of day");
+	check(r_mday == 8'h28 && r_month == 8'h08,
+	      "host update seeds the date");
+	check(r_year == 8'hC6,
+	      "year 2026 reads 0xC6 (decade overflow, as in rtcnvram.c)");
+	check(r_wday == 8'h06, "day of week rebased to 1 = Sunday");
+
+	// the clock keeps running and survives a reset
+	repeat (2500) @(posedge clk);      // two clock seconds
+	reset = 1;
+	repeat (10) @(posedge clk);
+	reset = 0;
+	repeat (10) @(posedge clk);
+	read_clock;
+	check(r_sec == 8'h32 && r_min == 8'h47 && r_hour == 8'h21,
+	      "clock counts seconds and survives reset");
+
+	// end of a leap year day: 2028-02-28 23:59:59 rolls into 02-29
+	hps_time(8'h59, 8'h59, 8'h23, 8'h28, 8'h02, 8'h28, 4'd1);
+	repeat (1100) @(posedge clk);
+	read_clock;
+	check(r_mday == 8'h29 && r_month == 8'h02, "leap day 2028-02-29 exists");
+	check(r_hour == 8'h00 && r_min == 8'h00 && r_sec == 8'h00,
+	      "midnight rollover clears the time");
+	check(r_wday == 8'h03, "day of week advances with the date");
+
+	// the same date in a common year rolls into March
+	hps_time(8'h59, 8'h59, 8'h23, 8'h28, 8'h02, 8'h26, 4'd1);
+	repeat (1100) @(posedge clk);
+	read_clock;
+	check(r_mday == 8'h01 && r_month == 8'h03,
+	      "2026-02-28 rolls over to March 1");
+
+	// year end
+	hps_time(8'h59, 8'h59, 8'h23, 8'h31, 8'h12, 8'h29, 4'd1);
+	repeat (1100) @(posedge clk);
+	read_clock;
+	check(r_mday == 8'h01 && r_month == 8'h01,
+	      "new year rolls to January 1");
+	check(r_year == 8'hD0, "2029 rolls into 2030 (0xD0)");
+
+	// once the guest sets the clock, host updates stop overriding it
+	write_clock(8'h00, 8'h30, 8'h12, 8'h04, 8'h07, 8'h5A);
+	read_clock;
+	check(r_hour == 8'h12 && r_min == 8'h30 && r_mday == 8'h04 &&
+	      r_month == 8'h07 && r_year == 8'h5A, "guest can set the clock");
+	hps_time(8'h30, 8'h47, 8'h21, 8'h28, 8'h08, 8'h26, 4'd5);
+	read_clock;
+	check(r_hour == 8'h12 && r_month == 8'h07,
+	      "host updates no longer override a guest set clock");
 
 	// boot device menu variants
 	boot_variant(2'd0, 1'b0);    // Auto, no disk: empty command

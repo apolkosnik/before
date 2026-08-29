@@ -34,6 +34,7 @@ Rev 2.5 v66 (`reference/previous/src/Rev_2.5_v66.BIN`).
 | `src/ethernet.c` (MB8795)  | `rtl/next/next_enet_dma.sv`| registers, both DMA channels with chaining, the local loopback path (TXMODE_DIS_LOOP clear) with EN_EOP framing, minimum-size padding and place-holder CRC, the receive address filter, and the frame streaming interface to the bridge |
 | real network               | `rtl/next/next_enet_bridge.sv`, `next_ddram_arb.sv` | when the guest disables loopback, frames cross a DDR3 shared-memory mailbox (rings at 0x1FF00000, the A2065 window) to an ARM daemon in Main_MiSTer (`support/next/next_enet.cpp`, branch `next-ethernet` of the Main fork) that bridges to eth0 (BPF filtered), eth1, a macvlan child, or tap0 -- the architecture of the Minimig A2065 support, with the NIC kept in the fabric and only frames crossing. The OSD "Network" option (status bits [54:52]) selects the interface |
 | `src/mo.c` optical drive   | `rtl/next/next_mo.sv`      | OSP registers, disk DMA channel, ECC buffer engine in the standalone MOCSR2_ECC_DIS mode (fill from and drain to memory). Reed-Solomon parity and disk operations are TODO |
+| `src/rtcnvram.c` clock      | `rtl/next/next_scr.sv`     | MC68HC68T1 time of day seeded from the MiSTer host clock (hps_io RTC port), counting real seconds across reset with full calendar rollover; a guest write takes ownership and stops host updates |
 | `src/kms.c`, `src/snd.c`   | `rtl/next/next_kms_snd.sv` | KMS status/control bytes, command/data pairs, keyboard input (PS/2 to NeXT keycodes, modifiers, device poll mask, set-address protocol, overrun), sound out enable/disable, and the sound out DMA channel engine with completion interrupt and underrun status. Mouse input and a real audio path are TODO |
 | `src/floppy.c` (82077AA)   | -                          | TODO (reads return 0) |
 | `src/dsp/` DSP56001        | -                          | TODO (reads return 0) |
@@ -92,7 +93,7 @@ passed path, about 5 minutes):
 
 ## Design notes
 
-- Two clock domains: `clk_sys` 32 MHz for CPU, devices and DDR3 (the
+- Two clock domains: `clk_sys` 28 MHz for CPU, devices and DDR3 (the
   AP68040 closes timing around 30 MHz on this device; the proven
   Minimig-AGA integration runs it at 28.7 MHz), and `clk_vid` 100 MHz
   for the pixel pipeline (CE_PIXEL = 1).  1600x912 total at 100 MHz

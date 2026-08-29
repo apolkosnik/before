@@ -58,6 +58,7 @@ next_system #(
 	.reset(reset),
 	.ps2_key(11'd0),
 	.boot_sel(bootsd ? 2'd1 : 2'd0),
+	.hps_rtc(65'd0),
 	.img_mounted(img_mounted),
 	.img_readonly(1'b0),
 	.img_size(64'd1048576),

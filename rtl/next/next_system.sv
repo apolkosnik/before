@@ -42,6 +42,9 @@ module next_system #(
 	// below (100 MHz, 1/2) satisfy the same invariant.
 	parameter CPU_PACE_NUM = 1,
 	parameter CPU_PACE_DEN = 2,
+	// physical clock rate, for the battery backed time of day (CLK_HZ
+	// is the virtual rate the CPU calibration is built on)
+	parameter CLK_REAL_HZ = CLK_HZ,
 	parameter ROM_INIT_EN = 0,
 	parameter ROM_INIT    = "rom.hex"
 )
@@ -51,6 +54,9 @@ module next_system #(
 
 	// boot device menu (to the NVRAM boot command, see next_scr)
 	input   [1:0] boot_sel,
+
+	// host time of day (hps_io RTC port)
+	input  [64:0] hps_rtc,
 
 	// SCSI disk image (MiSTer SD block interface)
 	input         img_mounted,
@@ -575,7 +581,7 @@ wire timer_ipl7, softint1, softint2;
 reg disk_mounted = 0;
 always @(posedge clk) if (img_mounted) disk_mounted <= (img_size != 0);
 
-next_scr #(.CLK_HZ(CLK_HZ)) scr
+next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 (
 	.clk(clk),
 	.reset(dev_reset),
@@ -589,6 +595,7 @@ next_scr #(.CLK_HZ(CLK_HZ)) scr
 	.scr1(32'h00012052),         // 25MHz NeXTcube 68040, 100ns memory
 	.boot_sel(boot_sel),
 	.disk_mounted(disk_mounted),
+	.hps_rtc(hps_rtc),
 	.timer_ipl7(timer_ipl7),
 	.led(led),
 	.rom_overlay(),
