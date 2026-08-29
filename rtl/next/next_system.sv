@@ -53,7 +53,7 @@ module next_system #(
 	input  [10:0] ps2_key,       // MiSTer keyboard events (to the KMS)
 
 	// boot device menu (to the NVRAM boot command, see next_scr)
-	input   [1:0] boot_sel,
+	input   [2:0] boot_sel,
 
 	// host time of day (hps_io RTC port)
 	input  [64:0] hps_rtc,
@@ -598,6 +598,9 @@ wire timer_ipl7, softint1, softint2;
 reg disk_mounted = 0;
 always @(posedge clk) if (img_mounted) disk_mounted <= (img_size != 0);
 
+reg floppy_mounted = 0;
+always @(posedge clk) if (fimg_mounted) floppy_mounted <= (fimg_size != 0);
+
 next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 (
 	.clk(clk),
@@ -612,6 +615,7 @@ next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 	.scr1(32'h00012052),         // 25MHz NeXTcube 68040, 100ns memory
 	.boot_sel(boot_sel),
 	.disk_mounted(disk_mounted),
+	.floppy_mounted(floppy_mounted),
 	.hps_rtc(hps_rtc),
 	.timer_ipl7(timer_ipl7),
 	.led(led),

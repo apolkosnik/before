@@ -69,7 +69,7 @@ localparam CONF_STR = {
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
-	"O[56:55],Boot device,Auto,Disk,Network,ROM Default;",
+	"O[57:55],Boot device,Auto,Disk,Floppy,Network,ROM Default;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -100,7 +100,7 @@ wire  [7:0] fsd_buff_din;
 wire        img_readonly;
 wire [63:0] img_size;
 wire [31:0] sd_lba;
-wire        sd_rd, sd_wr, sd_ack;
+wire        sd_rd, sd_wr;
 wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_dout, sd_buff_din;
 wire        sd_buff_wr;
@@ -199,7 +199,7 @@ next_system #(
 	.reset(reset),
 
 	.ps2_key(ps2_key),
-	.boot_sel(status[56:55]),
+	.boot_sel(status[57:55]),
 	.hps_rtc(hps_rtc),
 
 	.fimg_mounted(fimg_mounted),

@@ -31,8 +31,9 @@ always #5 clk = ~clk;
 reg reset = 1;
 
 reg  [64:0] hps_rtc = 0;
-reg   [1:0] boot_sel = 0;
+reg   [2:0] boot_sel = 0;
 reg         disk_mounted = 0;
+reg         floppy_mounted = 0;
 reg         sel = 0;
 reg   [1:0] reg_id = 0;
 reg         addr1 = 0;
@@ -50,6 +51,7 @@ next_scr #(.CLK_HZ(100000000), .CLK_REAL_HZ(1000)) dut
 	.wdata(wdata), .rdata(rdata),
 	.scr1(32'h00012052),
 	.boot_sel(boot_sel), .disk_mounted(disk_mounted),
+	.floppy_mounted(floppy_mounted),
 	.hps_rtc(hps_rtc),
 	.timer_ipl7(), .led(), .rom_overlay(),
 	.softint1(), .softint2()
@@ -187,7 +189,7 @@ endtask
 
 // reset with a menu selection, then read boot command and checksum
 task boot_variant;
-	input [1:0] bsel;
+	input [2:0] bsel;
 	input mounted;
 	begin
 		boot_sel = bsel;
@@ -314,23 +316,32 @@ initial begin
 	      "host updates no longer override a guest set clock");
 
 	// boot device menu variants
-	boot_variant(2'd0, 1'b0);    // Auto, no disk: empty command
+	boot_variant(3'd0, 1'b0);    // Auto, no disk: empty command
 	check(c18 == 8'h00 && c19 == 8'h00, "Auto without disk: empty boot command");
 	check(b30 == 8'hE0 && b31 == 8'hEF, "Auto without disk: checksum");
 
-	boot_variant(2'd0, 1'b1);    // Auto with a disk: "sd"
+	boot_variant(3'd0, 1'b1);    // Auto with a disk: "sd"
 	check(c18 == "s" && c19 == "d", "Auto with disk: boot command sd");
 	check(b30 == 8'h6D && b31 == 8'h8B, "Auto with disk: checksum");
 
-	boot_variant(2'd2, 1'b1);    // Network: "en"
+	boot_variant(3'd3, 1'b1);    // Network: "en"
 	check(c18 == "e" && c19 == "n", "Network: boot command en");
 	check(b30 == 8'h7B && b31 == 8'h81, "Network: checksum");
 
-	boot_variant(2'd3, 1'b1);    // ROM Default: empty even with a disk
+	boot_variant(3'd4, 1'b1);    // ROM Default: empty even with a disk
 	check(c18 == 8'h00 && c19 == 8'h00, "ROM Default: empty boot command");
 
-	boot_variant(2'd1, 1'b0);    // Disk forced, even without an image
+	boot_variant(3'd1, 1'b0);    // Disk forced, even without an image
 	check(c18 == "s" && c19 == "d", "Disk: boot command sd");
+
+	// Floppy, and Auto falling through to a mounted floppy
+	boot_variant(3'd2, 1'b0);
+	check(c18 == "f" && c19 == "d", "Floppy: boot command fd");
+	check(b30 == 8'h7A && b31 == 8'h8B, "Floppy: checksum");
+	floppy_mounted = 1;
+	boot_variant(3'd0, 1'b0);    // Auto: no disk, but a floppy
+	check(c18 == "f" && c19 == "d", "Auto with only a floppy: boot command fd");
+	floppy_mounted = 0;
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

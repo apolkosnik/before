@@ -57,7 +57,7 @@ next_system #(
 	.clk_vid(clk),   // both domains on one clock in simulation
 	.reset(reset),
 	.ps2_key(11'd0),
-	.boot_sel(bootsd ? 2'd1 : 2'd0),
+	.boot_sel(bootsd ? 3'd1 : 3'd0),
 	.hps_rtc(hps_rtc),
 	.fimg_mounted(1'b0), .fimg_readonly(1'b0), .fimg_size(64'd0),
 	.fsd_lba(), .fsd_rd(), .fsd_wr(), .fsd_ack(1'b0),

@@ -53,8 +53,9 @@ module next_scr #(
 	// boot device menu: 0 = Auto (disk when an image is mounted, else
 	// the ROM default order), 1 = Disk, 2 = Network, 3 = ROM Default.
 	// Loaded into the NVRAM boot command on reset.
-	input   [1:0] boot_sel,
+	input   [2:0] boot_sel,
 	input         disk_mounted,
+	input         floppy_mounted,
 
 	output        timer_ipl7,    // SCR2 byte 2 bit 7
 	output        led,           // SCR2 byte 3 bit 0
@@ -185,29 +186,38 @@ integer i;
 // effective boot device: 1 = SCSI disk ("sd"), 2 = ethernet ("en"),
 // 3 = empty boot command (the ROM walks its device table, network
 // first).  Auto picks the disk exactly when an image is mounted.
-wire [1:0] bootdev = (boot_sel == 2'd0) ? (disk_mounted ? 2'd1 : 2'd3)
-                                        : boot_sel;
+// 0 = Auto, 1 = Disk, 2 = Floppy, 3 = Network, 4 = ROM Default.  Auto
+// prefers a mounted SCSI disk, then a mounted floppy, and otherwise
+// leaves the command empty for the ROM's own device order.
+wire [2:0] bootdev = (boot_sel == 3'd0)
+                     ? (disk_mounted   ? 3'd1 :
+                        floppy_mounted ? 3'd2 : 3'd4)
+                     : boot_sel;
 
 // nvram_default[] from Previous rtcnvram.c with the boot command from
 // the OSD (nvram_init() semantics) and the matching checksum: 16-bit
 // one's-complement sum over bytes 0-29, complemented, at bytes 30/31
 function automatic [7:0] nv_init;
 	input [4:0] i;
-	input [1:0] dev;
+	input [2:0] dev;
 	begin
 		case (i)
 			5'd0:  nv_init = 8'h94;
 			5'd1:  nv_init = 8'h0F;
 			5'd2:  nv_init = 8'h40;
 			5'd14: nv_init = 8'h4B;
-			5'd18: nv_init = (dev == 2'd1) ? "s" :
-			                 (dev == 2'd2) ? "e" : 8'h00;
-			5'd19: nv_init = (dev == 2'd1) ? "d" :
-			                 (dev == 2'd2) ? "n" : 8'h00;
-			5'd30: nv_init = (dev == 2'd1) ? 8'h6D :
-			                 (dev == 2'd2) ? 8'h7B : 8'hE0;
-			5'd31: nv_init = (dev == 2'd1) ? 8'h8B :
-			                 (dev == 2'd2) ? 8'h81 : 8'hEF;
+			5'd18: nv_init = (dev == 3'd1) ? "s" :
+			                 (dev == 3'd2) ? "f" :
+			                 (dev == 3'd3) ? "e" : 8'h00;
+			5'd19: nv_init = (dev == 3'd1) ? "d" :
+			                 (dev == 3'd2) ? "d" :
+			                 (dev == 3'd3) ? "n" : 8'h00;
+			5'd30: nv_init = (dev == 3'd1) ? 8'h6D :
+			                 (dev == 3'd2) ? 8'h7A :
+			                 (dev == 3'd3) ? 8'h7B : 8'hE0;
+			5'd31: nv_init = (dev == 3'd1) ? 8'h8B :
+			                 (dev == 3'd2) ? 8'h8B :
+			                 (dev == 3'd3) ? 8'h81 : 8'hEF;
 			default: nv_init = 8'h00;
 		endcase
 	end

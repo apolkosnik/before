@@ -64,6 +64,19 @@ vbuild tb_next_hardclock tb_next_hardclock.sv $RTL/next_timer.sv $RTL/next_intc.
 vbuild tb_next_video     tb_next_video.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/dpram.v
 vbuild tb_next_boot      -I"$CPU" tb_next_boot.sv $NEXTSRC $CPUSRC
 
+# The emu top is only ever compiled by Quartus, so a duplicate
+# declaration or a mistyped port there costs a forty minute build to
+# discover.  Lint it here: module resolution is not the point, the
+# file's own declarations are, so MODMISSING is filtered out.
+echo "== linting the emu top =="
+if verilator --lint-only -Wno-fatal -I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC 2>&1 \
+     | grep -E "^%Error" | grep -vE "MODMISSING|Exiting due to" | grep -q .; then
+	echo "*** NeXT.sv lint FAILED"
+	verilator --lint-only -Wno-fatal -I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC 2>&1 \
+		| grep -E "^%Error" | grep -vE "MODMISSING|Exiting due to" | head -5
+	fail=1
+fi
+
 echo "== running =="
 fail=0
 run() {
