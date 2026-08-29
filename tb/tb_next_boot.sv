@@ -408,6 +408,7 @@ reg  [7:0] disk [0:2048*512-1];
 // the built-in pattern (copy the image first, writes go back to it)
 string     img_path;
 integer    img_fd = 0;
+integer    img_blk = 0;
 reg [63:0] img_bytes = 64'd1048576;
 reg  [7:0] fbuf [0:511];
 integer    fr;
@@ -419,10 +420,21 @@ initial begin
 			$display("cannot open %0s", img_path);
 			$finish;
 		end
-		fr = $fseek(img_fd, 0, 2);
-		img_bytes = $ftell(img_fd);
+		// size: +imgblk=<512-byte blocks> is authoritative (robust across
+		// simulators); fall back to seek/tell
+		if ($value$plusargs("imgblk=%d", img_blk))
+			img_bytes = {32'd0, img_blk} * 64'd512;
+		else begin
+			fr = $fseek(img_fd, 0, 2);
+			img_bytes = $ftell(img_fd);
+		end
 		fr = $fseek(img_fd, 0, 0);
-		$display("BOOT: disk image %0s, %0d bytes", img_path, img_bytes);
+		// confirm the data path: read sector 0 and show the disklabel
+		fr = $fread(fbuf, img_fd);
+		$display("BOOT: disk image %0s, %0d bytes; label %02x %02x %02x %02x '%c%c%c%c'",
+		         img_path, img_bytes,
+		         fbuf[0], fbuf[1], fbuf[2], fbuf[3],
+		         fbuf[0], fbuf[1], fbuf[2], fbuf[3]);
 	end
 end
 
