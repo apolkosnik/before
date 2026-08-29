@@ -48,6 +48,19 @@ module next_system #(
 (
 	input         clk,            // system clock: CPU, devices, RAM
 	input  [10:0] ps2_key,       // MiSTer keyboard events (to the KMS)
+
+	// SCSI disk image (MiSTer SD block interface)
+	input         img_mounted,
+	input         img_readonly,
+	input  [63:0] img_size,
+	output [31:0] sd_lba,
+	output        sd_rd,
+	output        sd_wr,
+	input         sd_ack,
+	input   [8:0] sd_buff_addr,
+	input   [7:0] sd_buff_dout,
+	output  [7:0] sd_buff_din,
+	input         sd_buff_wr,
 	input         clk_vid,        // video clock: scan-out (100 MHz for
 	                              // the 1600x912 pixel timing)
 	input         reset,          // active high, synchronous
@@ -138,6 +151,13 @@ wire  [3:0] mo_m_be;
 wire [31:0] mo_m_din;
 wire        mo_m_ack;
 wire        int_disk, int_disk_dma;
+
+// SCSI DMA master port (driven by next_scsi below)
+wire        sc_m_req, sc_m_we;
+wire [23:0] sc_m_addr;
+wire  [3:0] sc_m_be;
+wire [31:0] sc_m_din;
+wire        sc_m_ack;
 
 // KMS/sound DMA master port (driven by next_kms_snd below)
 wire        sn_m_req, sn_m_we;
@@ -258,7 +278,7 @@ wire d_any  = d_rom | d_io | d_bmap | d_ram | d_vram;
 localparam S_IDLE = 2'd0, S_INT = 2'd1, S_RAM = 2'd2, S_RAM_E = 2'd3;
 
 reg  [1:0] state;
-localparam G_ENET = 2'd0, G_MO = 2'd1, G_SND = 2'd2;
+localparam G_ENET = 2'd0, G_MO = 2'd1, G_SND = 2'd2, G_SCSI = 2'd3;
 reg  [1:0] dma_grant;
 reg        sel_rom, sel_vram, sel_io, sel_bmap;
 reg [15:0] cyc_rdata;
@@ -280,6 +300,7 @@ assign cpu_din = cyc_rdata;
 assign en_m_ack = (state == S_RAM_E) && (dma_grant == G_ENET) && ram_ack;
 assign mo_m_ack = (state == S_RAM_E) && (dma_grant == G_MO) && ram_ack;
 assign sn_m_ack = (state == S_RAM_E) && (dma_grant == G_SND) && ram_ack;
+assign sc_m_ack = (state == S_RAM_E) && (dma_grant == G_SCSI) && ram_ack;
 
 always @(posedge clk) begin
 	mem_ready  <= 0;
@@ -340,6 +361,15 @@ always @(posedge clk) begin
 				ram_addr <= sn_m_addr;
 				ram_din  <= sn_m_din;
 				dma_grant <= G_SND;
+				state    <= S_RAM_E;
+			end
+			else if (sc_m_req && !cpu_req && !berr_hold) begin
+				ram_req  <= 1;
+				ram_we   <= sc_m_we;
+				ram_be   <= sc_m_be;
+				ram_addr <= sc_m_addr;
+				ram_din  <= sc_m_din;
+				dma_grant <= G_SCSI;
 				state    <= S_RAM_E;
 			end
 			else if (cpu_req && !berr_hold) begin
@@ -480,7 +510,11 @@ wire io_sn_sptr= sel_io && (io_off[16:4] == 13'h403);           // 0x04030-0x040
 wire io_sn_ptr = sel_io && (io_off[16:4] == 13'h404);           // 0x04040-0x0404f
 wire io_sn_ini = sel_io && (io_off[16:2] == 15'h1090);          // 0x04240-0x04243
 wire io_snd    = io_kms | io_sn_csr | io_sn_sptr | io_sn_ptr | io_sn_ini;
-wire io_dma   = sel_io && (io_off[16:12] < 5'h05) && !io_enet && !io_mo && !io_snd; // 0x00000-0x04FFF
+wire io_sc_csr = sel_io && (io_off[16:2] == 15'h0004);          // 0x00010-0x00013
+wire io_sc_ptr = sel_io && (io_off[16:4] == 13'h401);           // 0x04010-0x0401f
+wire io_sc_ini = sel_io && (io_off[16:2] == 15'h1084);          // 0x04210-0x04213
+wire io_scsi   = io_sc_csr | io_sc_ptr | io_sc_ini;
+wire io_dma   = sel_io && (io_off[16:12] < 5'h05) && !io_enet && !io_mo && !io_snd && !io_scsi; // 0x00000-0x04FFF
 wire io_intc  = sel_io && (io_off[16:12] == 5'h07);             // 0x07000-0x07FFF
 wire io_scr1  = sel_io && (io_off[16:11] == 6'h18);             // 0x0c000-0x0c7ff
 wire io_sid   = sel_io && (io_off[16:11] == 6'h19);             // 0x0c800-0x0cfff
@@ -521,6 +555,7 @@ wire [15:0] evt_rdata = cpu_addr[1] ? evt_latch[15:0] : {12'd0, us_counter[19:16
 assign io_rdata = io_enet  ? enet_rdata :
                   io_mo    ? mo_rdata :
                   io_snd   ? snd_rdata :
+                  io_scsi  ? esp_rdata :
                   io_dma   ? dma_rdata :
                   io_intc  ? intc_rdata :
                   io_scr   ? scr_rdata :
@@ -677,20 +712,42 @@ next_kms_snd #(.CLK_HZ(CLK_HZ)) kms_snd
 	.int_keymouse(int_keymouse)
 );
 
-// SCSI controller
-wire esp_int_scsi;
+// SCSI controller, disk target and DMA channel
+wire esp_int_scsi, int_scsi_dma;
 
-next_esp esp
+next_scsi #(.CLK_HZ(CLK_HZ)) scsi
 (
 	.clk(clk),
 	.reset(dev_reset),
-	.sel(io_esp),
+	.sel_esp(io_esp),
+	.sel_csr(io_sc_csr),
+	.sel_ptr(io_sc_ptr),
+	.sel_ini(io_sc_ini),
 	.addr(io_off[5:0]),
 	.we(is_write),
 	.be(lanes),
 	.wdata(cpu_dout),
 	.rdata(esp_rdata),
-	.int_scsi(esp_int_scsi)
+	.m_req(sc_m_req),
+	.m_we(sc_m_we),
+	.m_addr(sc_m_addr),
+	.m_be(sc_m_be),
+	.m_din(sc_m_din),
+	.m_dout(ram_dout),
+	.m_ack(sc_m_ack),
+	.int_scsi(esp_int_scsi),
+	.int_scsi_dma(int_scsi_dma),
+	.img_mounted(img_mounted),
+	.img_readonly(img_readonly),
+	.img_size(img_size),
+	.sd_lba(sd_lba),
+	.sd_rd(sd_rd),
+	.sd_wr(sd_wr),
+	.sd_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din(sd_buff_din),
+	.sd_buff_wr(sd_buff_wr)
 );
 
 // SCC serial controller
@@ -723,10 +780,12 @@ next_bmap bmap
 // interrupt controller
 reg soft1_d, soft2_d, scsi_d;
 reg entx_d, enrx_d, entxd_d, enrxd_d, disk_d, diskd_d, sndo_d, sndd_d, km_d;
+reg scsid_d;
 always @(posedge clk) begin
 	soft1_d <= softint1;
 	soft2_d <= softint2;
 	scsi_d  <= esp_int_scsi;
+	scsid_d <= int_scsi_dma;
 	entx_d  <= int_en_tx;
 	enrx_d  <= int_en_rx;
 	entxd_d <= int_en_tx_dma;
@@ -750,6 +809,7 @@ wire [31:0] int_set =
 	({31'd0, int_disk & ~disk_d} << 13) |
 	({31'd0, int_snd_out_dma & ~sndd_d} << 23) |
 	({31'd0, int_disk_dma & ~diskd_d} << 25) |
+	({31'd0, int_scsi_dma & ~scsid_d} << 26) |
 	({31'd0, int_en_rx_dma & ~enrxd_d} << 27) |
 	({31'd0, int_en_tx_dma & ~entxd_d} << 28) |
 	({31'd0, timer_set} << 29);
@@ -766,6 +826,7 @@ wire [31:0] int_clr =
 	({31'd0, ~int_disk & disk_d} << 13) |
 	({31'd0, ~int_snd_out_dma & sndd_d} << 23) |
 	({31'd0, ~int_disk_dma & diskd_d} << 25) |
+	({31'd0, ~int_scsi_dma & scsid_d} << 26) |
 	({31'd0, ~int_en_rx_dma & enrxd_d} << 27) |
 	({31'd0, ~int_en_tx_dma & entxd_d} << 28) |
 	({31'd0, timer_clr} << 29);

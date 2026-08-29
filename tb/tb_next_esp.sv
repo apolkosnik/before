@@ -28,12 +28,20 @@ reg   [1:0] be = 0;
 reg  [15:0] wdata = 0;
 wire [15:0] rdata;
 
-next_esp dut
+next_scsi #(.CLK_HZ(1000000)) dut
 (
 	.clk(clk), .reset(reset),
-	.sel(sel), .addr(addr), .we(we), .be(be),
+	.sel_esp(sel), .sel_csr(1'b0), .sel_ptr(1'b0), .sel_ini(1'b0),
+	.addr(addr), .we(we), .be(be),
 	.wdata(wdata), .rdata(rdata),
-	.int_scsi()
+	.m_req(), .m_we(), .m_addr(), .m_be(), .m_din(),
+	.m_dout(32'd0), .m_ack(1'b0),
+	.int_scsi(),
+	.int_scsi_dma(),
+	.img_mounted(1'b0), .img_readonly(1'b0), .img_size(64'd0),
+	.sd_lba(), .sd_rd(), .sd_wr(), .sd_ack(1'b0),
+	.sd_buff_addr(9'd0), .sd_buff_dout(8'd0), .sd_buff_din(),
+	.sd_buff_wr(1'b0)
 );
 
 task wr8;

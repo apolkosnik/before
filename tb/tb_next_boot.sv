@@ -57,6 +57,17 @@ next_system #(
 	.clk_vid(clk),   // both domains on one clock in simulation
 	.reset(reset),
 	.ps2_key(11'd0),
+	.img_mounted(1'b0),
+	.img_readonly(1'b0),
+	.img_size(64'd0),
+	.sd_lba(),
+	.sd_rd(),
+	.sd_wr(),
+	.sd_ack(1'b0),
+	.sd_buff_addr(9'd0),
+	.sd_buff_dout(8'd0),
+	.sd_buff_din(),
+	.sd_buff_wr(1'b0),
 
 	.rom_wr(1'b0),
 	.rom_waddr(17'd0),

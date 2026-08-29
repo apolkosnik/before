@@ -64,6 +64,7 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 localparam CONF_STR = {
 	"NeXT;;",
 	"F1,BINROM,Boot ROM;",
+	"S0,VHDIMG,SCSI Disk;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
@@ -85,6 +86,15 @@ wire        ioctl_wr;
 wire [26:0] ioctl_addr;
 wire  [7:0] ioctl_dout;
 
+wire        img_mounted;
+wire        img_readonly;
+wire [63:0] img_size;
+wire [31:0] sd_lba;
+wire        sd_rd, sd_wr, sd_ack;
+wire [13:0] sd_buff_addr;
+wire  [7:0] sd_buff_dout, sd_buff_din;
+wire        sd_buff_wr;
+
 hps_io #(.CONF_STR(CONF_STR)) hps_io
 (
 	.clk_sys(clk_sys),
@@ -103,6 +113,18 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr),
 	.ioctl_dout(ioctl_dout),
+
+	.img_mounted(img_mounted),
+	.img_readonly(img_readonly),
+	.img_size(img_size),
+	.sd_lba('{sd_lba}),
+	.sd_rd(sd_rd),
+	.sd_wr(sd_wr),
+	.sd_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din('{sd_buff_din}),
+	.sd_buff_wr(sd_buff_wr),
 
 	.ps2_key(ps2_key)
 );
@@ -165,6 +187,18 @@ next_system #(
 	.reset(reset),
 
 	.ps2_key(ps2_key),
+
+	.img_mounted(img_mounted),
+	.img_readonly(img_readonly),
+	.img_size(img_size),
+	.sd_lba(sd_lba),
+	.sd_rd(sd_rd),
+	.sd_wr(sd_wr),
+	.sd_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr[8:0]),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din(sd_buff_din),
+	.sd_buff_wr(sd_buff_wr),
 
 	.rom_wr(ioctl_wr & rom_download),
 	.rom_waddr(ioctl_addr[16:0]),
