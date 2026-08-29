@@ -110,10 +110,17 @@ next_system #(
 // mem_ram_empty_*() in Previous src/cpu/memory.c.
 //----------------------------------------------------------------------------
 
-reg [31:0] ram_mem [0:1048575];   // 4 MB
+// Full 64 MB, so a real kernel's page tables and code above 4 MB are
+// stored faithfully instead of aliasing onto low memory (which would
+// corrupt the kernel and produce spurious MMU faults).  ram_addr is the
+// word index within the 64 MB bank region (next_system passes [25:2]).
+reg [31:0] ram_mem [0:16777215];   // 64 MB
+integer    ram_init_i;
+initial for (ram_init_i = 0; ram_init_i < 16777216; ram_init_i = ram_init_i + 1)
+	ram_mem[ram_init_i] = 32'h00000000;
 
-wire        bank0     = (ram_addr[23:22] == 2'b00);
-wire [19:0] ram_index = ram_addr[19:0];              // alias within the bank
+wire        bank0     = 1'b1;                        // all four banks populated
+wire [23:0] ram_index = ram_addr[23:0];             // 16M words = 64 MB
 wire [31:0] open_bus  = {6'b000001, ram_addr, 2'b00};
 
 reg [1:0] ram_wait;
@@ -346,7 +353,8 @@ task dump_state;
 endtask
 
 integer errors = 0;
-integer run_cycles;
+longint run_cycles;
+reg     halt_run = 0;
 
 task check;
 	input cond;
@@ -501,12 +509,61 @@ end
 // address and value that produced it.
 reg wtrace = 0;
 initial wtrace = $test$plusargs("walktrace");
-always @(posedge clk) if (wtrace && !reset) begin
-	if (dut.walker_req && dut.walker_ack)
-		$display("[%0t] WALK %s %08x %s %08x", $time,
-		         dut.walker_we ? "wr" : "rd", dut.walker_addr,
-		         dut.walker_we ? "=" : "->",
-		         dut.walker_we ? dut.walker_wdat : dut.walker_data);
+
+// a small ring of the most recent walker transactions, so when a walk
+// faults we can print the whole descriptor chain that led there
+reg [95:0] wring [0:31];      // {we, addr[31:0], data[31:0]} loosely packed
+integer    wrp = 0;
+reg        w_ack_d = 0;
+
+localparam W_FLT_ST = 4'd9;
+reg [3:0]  wst_d = 0;
+integer    faults_seen = 0;
+
+task dump_walk_ring;
+	integer k, idx;
+	begin
+		$display("  --- last walker transactions ---");
+		for (k = 31; k >= 0; k = k - 1) begin
+			idx = (wrp - k + 64) % 32;
+			if (wring[idx] !== 96'bx)
+				$display("    %s %08x %s %08x",
+				         wring[idx][64] ? "wr" : "rd",
+				         wring[idx][63:32],
+				         wring[idx][64] ? "=" : "->",
+				         wring[idx][31:0]);
+		end
+	end
+endtask
+
+always @(posedge clk) if (!reset) begin
+	// record every completed walker transaction
+	if (dut.walker_req && dut.walker_ack) begin
+		wring[wrp % 32] <= {31'd0, dut.walker_we, dut.walker_addr,
+		                    dut.walker_we ? dut.walker_wdat : dut.walker_data};
+		wrp <= wrp + 1;
+		if (wtrace &&
+		    (dut.walker_addr[31:24] == 8'h04 || dut.walker_addr[31:24] == 8'h05 ||
+		     dut.walker_addr[31:24] == 8'h06 || dut.walker_addr[31:24] == 8'h07))
+			// only near the tables the kernel actually uses
+			;
+	end
+
+	// the MMU walker just latched an invalid descriptor: report the
+	// faulting VA, the descriptor chain, and freeze a screen
+	wst_d <= dut.cpu.mmu.wst;
+	if (dut.cpu.mmu.wst == W_FLT_ST && wst_d != W_FLT_ST && !dut.cpu.mmu.w_pt) begin
+		faults_seen = faults_seen + 1;
+		$display("[%0t] MMU FAULT #%0d: VA=%08x super=%b instr=%b desc=%08x @%08x",
+		         $time, faults_seen, dut.cpu.mmu.w_la, dut.cpu.mmu.w_super,
+		         dut.cpu.mmu.f_bank, dut.cpu.mmu.w_desc, dut.cpu.mmu.w_desc_addr);
+		if (dut.cpu.mmu.w_la[31:24] == 8'h3c) begin
+			dump_walk_ring;
+			$display("[%0t] BOOT: the panic fault reproduced", $time);
+			fb_dump;
+			halt_run <= 1;
+		end
+	end
 	if (dut.walker_req && dut.walker_berr)
 		$display("[%0t] WALK BERR %08x", $time, dut.walker_addr);
 end
@@ -574,9 +631,19 @@ initial begin
 	repeat (20) @(posedge clk);
 	reset = 0;
 
-	// 3 ms of system time by default, more with +cycles=<n>
-	if (!$value$plusargs("cycles=%d", run_cycles)) run_cycles = 300000;
-	repeat (run_cycles) @(posedge clk);
+	// run length: +cycles=<n> for a small count, or +mcycles=<n> for
+	// n million cycles (avoids the 32-bit cap of %d for long boots)
+	begin : runlen
+		integer mc;
+		if ($value$plusargs("mcycles=%d", mc))
+			run_cycles = mc * 1000000;
+		else if (!$value$plusargs("cycles=%d", run_cycles))
+			run_cycles = 300000;
+	end
+	while (run_cycles > 0 && !halt_run) begin
+		@(posedge clk);
+		run_cycles = run_cycles - 1;
+	end
 
 	$display("");
 	$display("=== tb_next_boot results ===");
