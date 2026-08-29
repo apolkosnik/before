@@ -29,7 +29,7 @@ module next_ddram_arb
 	input             b_we,
 	input      [28:0] b_addr,
 	input      [63:0] b_wdata,
-	output     [63:0] b_rdata,
+	output reg [63:0] b_rdata,
 	output reg        b_ack,
 
 	// DDRAM
@@ -63,7 +63,11 @@ assign DDRAM_WE       = b_owns ? (gst == G_B_ISSUE &&  b_we) : a_we;
 assign a_busy         = b_owns | DDRAM_BUSY;
 assign a_dout         = DDRAM_DOUT;
 assign a_dout_ready   = DDRAM_DOUT_READY & !b_owns;
-assign b_rdata        = DDRAM_DOUT;
+// Port B's word is captured on the cycle the memory presents it:
+// b_ack is registered, so it rises after DDRAM_DOUT has moved on, and
+// a master sampling on its ack - the only thing it can do - would read
+// whatever the memory drove next.  A mailbox pointer read that way can
+// point the ring anywhere.
 
 always @(posedge clk) begin
 	b_ack <= 0;
@@ -71,6 +75,7 @@ always @(posedge clk) begin
 	if (reset) begin
 		gst <= G_A;
 		a_read_pending <= 0;
+		b_rdata <= 0;
 	end
 	else begin
 		// track port A's outstanding read so B never steals the bus
@@ -95,6 +100,7 @@ always @(posedge clk) begin
 		end
 		G_B_READ: begin
 			if (DDRAM_DOUT_READY) begin
+				b_rdata <= DDRAM_DOUT;
 				b_ack <= 1;
 				gst <= G_A;
 			end

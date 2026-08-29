@@ -32,6 +32,7 @@ module next_enet_bridge #(parameter CLK_HZ = 100000000)
 (
 	input             clk,
 	input             reset,
+	input             enable,        // OSD Network option is not Off
 
 	// frame streaming to/from next_enet_dma
 	input             btx_req,
@@ -77,23 +78,28 @@ localparam POLL = CLK_HZ / 1000000 * 200;
 reg [$clog2(POLL)-1:0] pollcnt;
 wire poll_tick = (pollcnt == POLL-1);
 
-localparam S_INIT_MAGIC = 5'd0,
-           S_INIT_MAC   = 5'd1,
-           S_IDLE       = 5'd2,
-           // transmit: enet -> DDR3
-           S_TX_FETCH   = 5'd3,
-           S_TX_PACK    = 5'd4,
-           S_TX_WRITE   = 5'd5,
-           S_TX_HDR     = 5'd6,
-           S_TX_WPTR    = 5'd7,
-           // receive: DDR3 -> enet
-           S_RX_POLL    = 5'd8,
-           S_RX_HDR     = 5'd9,
-           S_RX_READ    = 5'd10,
-           S_RX_STREAM  = 5'd11,
-           S_RX_RPTR    = 5'd12,
-           S_MAC        = 5'd13,
-           S_WAIT       = 5'd14;
+localparam S_OFF        = 5'd0,
+	       S_INIT_CLEAR = 5'd1,
+	       S_INIT_TXPTR = 5'd2,
+	       S_INIT_RXWPTR= 5'd3,
+	       S_INIT_RXRPTR= 5'd4,
+	       S_INIT_MAC   = 5'd5,
+	       S_INIT_MAGIC = 5'd6,
+	       S_IDLE       = 5'd7,
+	       // transmit: enet -> DDR3
+	       S_TX_FETCH   = 5'd8,
+	       S_TX_PACK    = 5'd9,
+	       S_TX_WRITE   = 5'd10,
+	       S_TX_HDR     = 5'd11,
+	       S_TX_WPTR    = 5'd12,
+	       // receive: DDR3 -> enet
+	       S_RX_POLL    = 5'd13,
+	       S_RX_HDR     = 5'd14,
+	       S_RX_READ    = 5'd15,
+	       S_RX_STREAM  = 5'd16,
+	       S_RX_RPTR    = 5'd17,
+	       S_MAC        = 5'd18,
+	       S_WAIT       = 5'd19;
 
 reg [4:0] st, ret;
 
@@ -104,6 +110,10 @@ reg [63:0] pack;
 reg [10:0] cur_len;
 reg [47:0] mac_last;
 reg        mac_dirty;
+reg        op_we;
+reg [63:0] op_rdata;
+reg        drop_seen;
+reg        disable_pending;
 
 // one DDR3 op with return state
 task automatic ddr_op;
@@ -116,6 +126,7 @@ task automatic ddr_op;
 		m_we <= we;
 		m_addr <= a;
 		m_wdata <= d;
+		op_we <= we;
 		ret <= nxt;
 		st <= S_WAIT;
 	end
@@ -131,7 +142,9 @@ always @(posedge clk) begin
 	brx_valid <= 0;
 
 	if (reset) begin
-		st <= S_INIT_MAGIC;
+		// Clear any mailbox generation left by the preceding core before
+		// deciding whether networking is enabled for this one.
+		st <= S_INIT_CLEAR;
 		m_req <= 0;
 		tx_wptr <= 0;
 		rx_wptr <= 0;
@@ -140,21 +153,68 @@ always @(posedge clk) begin
 		mac_last <= 0;
 		mac_dirty <= 0;
 		btx_addr <= 0;
+		op_we <= 0;
+		op_rdata <= 0;
+		drop_seen <= 0;
+		disable_pending <= 0;
 	end
 	else begin
 		pollcnt <= poll_tick ? 1'd0 : pollcnt + 1'd1;
 		if (guest_mac != mac_last) mac_dirty <= 1;
+		if (!btx_req) drop_seen <= 0;
+		if (!enable && st != S_OFF) disable_pending <= 1;
 
 		case (st)
-		S_INIT_MAGIC: ddr_op(1, A_MAGIC, MAGIC, S_INIT_MAC);
+		S_OFF: begin
+			m_req <= 0;
+			// A disabled bridge is a disconnected wire.  Complete one
+			// pending guest transmit so the MAC does not wedge in E_BTX.
+			if (btx_req && !drop_seen) begin
+				btx_done <= 1;
+				drop_seen <= 1;
+			end
+			if (enable) begin
+				tx_wptr <= 0;
+				rx_wptr <= 0;
+				rx_rptr <= 0;
+				pollcnt <= 0;
+				mac_dirty <= 0;
+				disable_pending <= 0;
+				st <= S_INIT_CLEAR;
+			end
+		end
+
+		// Invalidate the old mailbox generation first, then reset every
+		// shared ring pointer.  MAGIC is published last, after the MAC,
+		// so neither side can consume stale DDR contents after a reset.
+		S_INIT_CLEAR: begin
+			tx_wptr <= 0;
+			rx_wptr <= 0;
+			rx_rptr <= 0;
+			pollcnt <= 0;
+			ddr_op(1, A_MAGIC, 64'd0, S_INIT_TXPTR);
+		end
+		S_INIT_TXPTR: ddr_op(1, A_TXWPTR, 64'd0, S_INIT_RXWPTR);
+		S_INIT_RXWPTR: ddr_op(1, A_RXWPTR, 64'd0, S_INIT_RXRPTR);
+		S_INIT_RXRPTR: ddr_op(1, A_RXRPTR, 64'd0, S_INIT_MAC);
 		S_INIT_MAC: begin
 			mac_last <= guest_mac;
 			mac_dirty <= 0;
-			ddr_op(1, A_MAC, {1'b1, 15'd0, guest_mac}, S_IDLE);
+			if (enable && !disable_pending)
+				ddr_op(1, A_MAC, {1'b1, 15'd0, guest_mac}, S_INIT_MAGIC);
+			else begin
+				disable_pending <= 0;
+				ddr_op(1, A_MAC, {1'b1, 15'd0, guest_mac}, S_OFF);
+			end
 		end
+		S_INIT_MAGIC: ddr_op(1, A_MAGIC, MAGIC, S_IDLE);
 
 		S_IDLE: begin
-			if (btx_req) begin
+			if (disable_pending || !enable) begin
+				disable_pending <= 0;
+				st <= S_INIT_CLEAR;
+			end
+			else if (btx_req) begin
 				pos <= 0;
 				lane <= 0;
 				pack <= 0;
@@ -166,7 +226,7 @@ always @(posedge clk) begin
 			else if (poll_tick) begin
 				ddr_op(0, A_RXWPTR, 64'd0, S_RX_POLL);
 			end
-			else if (mac_dirty) st <= S_INIT_MAC;
+			else if (mac_dirty) st <= S_MAC;
 		end
 
 		//------------------------------------------------------------
@@ -199,6 +259,7 @@ always @(posedge clk) begin
 		S_TX_WPTR: begin
 			tx_wptr <= tx_wptr + 1'd1;
 			btx_done <= 1;
+			drop_seen <= 1;
 			ddr_op(1, A_TXWPTR, tx_wptr + 1'd1, S_IDLE);
 		end
 
@@ -206,26 +267,26 @@ always @(posedge clk) begin
 		// receive
 		//------------------------------------------------------------
 		S_RX_POLL: begin
-			rx_wptr <= m_rdata;
-			if (m_rdata != rx_rptr && brx_ready)
+			rx_wptr <= op_rdata;
+			if (op_rdata != rx_rptr && brx_ready)
 				ddr_op(0, rx_slot_base, 64'd0, S_RX_HDR);
 			else st <= S_IDLE;
 		end
 		S_RX_HDR: begin
-			cur_len <= m_rdata[10:0];
+			cur_len <= op_rdata[10:0];
 			pos <= 0;
-			if (m_rdata[10:0] == 0 || m_rdata[10:0] > 11'd1600) begin
+			if (op_rdata[10:0] == 0 || op_rdata[10:0] > 11'd1600) begin
 				// nonsense length: drop the slot
 				st <= S_RX_RPTR;
 			end
 			else begin
 				brx_start <= 1;
-				brx_len <= m_rdata[10:0];
+				brx_len <= op_rdata[10:0];
 				ddr_op(0, rx_slot_base + 29'd1, 64'd0, S_RX_READ);
 			end
 		end
 		S_RX_READ: begin
-			pack <= m_rdata;
+			pack <= op_rdata;
 			lane <= 0;
 			st <= S_RX_STREAM;
 		end
@@ -243,8 +304,15 @@ always @(posedge clk) begin
 			ddr_op(1, A_RXRPTR, rx_rptr + 1'd1, S_IDLE);
 		end
 
+		S_MAC: begin
+			mac_last <= guest_mac;
+			mac_dirty <= 0;
+			ddr_op(1, A_MAC, {1'b1, 15'd0, guest_mac}, S_IDLE);
+		end
+
 		S_WAIT: if (m_ack) begin
 			m_req <= 0;
+			if (!op_we) op_rdata <= m_rdata;
 			st <= ret;
 		end
 
