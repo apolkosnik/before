@@ -123,12 +123,13 @@ initial begin
 	reset = 0;
 	repeat (10) @(posedge clk);
 
-	// with no device polled, a key event is dropped
+	// disable all poll slots (0xF nibbles): a key event is dropped
+	// (a zero mask counts as device 0 polled, as in kms.c)
+	kms_cmd(8'hC6, 32'hFFFFFFF2);
 	key(1, 0, 8'h1C);            // 'a' down
 	check(!int_keymouse, "event dropped while keyboard not polled");
 
-	// poll the keyboard (device address 0 in the first mask nibble;
-	// the other nibbles idle at 0xF)
+	// poll the keyboard (device address 0 in the first mask nibble)
 	kms_cmd(8'hC6, 32'h0FFFFFF2);
 	key(1, 0, 8'h1C);            // 'a' down
 	check(int_keymouse, "INT_KEYMOUSE raised on key down");

@@ -54,6 +54,7 @@ vbuild tb_next_bridge    tb_next_bridge.sv $RTL/next_enet_dma.sv $RTL/next_enet_
 vbuild tb_next_rs        tb_next_rs.sv $RTL/next_rs.sv
 vbuild tb_next_mo        tb_next_mo.sv $RTL/next_mo.sv $RTL/next_rs.sv
 vbuild tb_next_snd       tb_next_snd.sv $RTL/next_kms_snd.sv
+vbuild tb_next_kbd       tb_next_kbd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_hardclock tb_next_hardclock.sv $RTL/next_timer.sv $RTL/next_intc.sv
 vbuild tb_next_video     tb_next_video.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/dpram.v
 vbuild tb_next_boot      -I"$CPU" tb_next_boot.sv $NEXTSRC $CPUSRC
@@ -77,6 +78,7 @@ run tb_bridge    "$WORK/vl_tb_next_bridge/tb_next_bridge"
 run tb_rs        "$WORK/vl_tb_next_rs/tb_next_rs"
 run tb_mo        "$WORK/vl_tb_next_mo/tb_next_mo"
 run tb_snd       "$WORK/vl_tb_next_snd/tb_next_snd"
+run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"
 run tb_video     "$WORK/vl_tb_next_video/tb_next_video"
 run tb_boot      "$WORK/vl_tb_next_boot/tb_next_boot"
