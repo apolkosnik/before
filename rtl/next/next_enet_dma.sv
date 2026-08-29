@@ -175,6 +175,15 @@ assign rdata = is_mb ? {`MB_READ({addr[3:1], 1'b0}), `MB_READ({addr[3:1], 1'b1})
 //----------------------------------------------------------------------------
 
 reg  [7:0] pkt [0:2047];
+
+// single-port discipline so the buffer maps to block RAM: exactly one
+// write site and one registered read site, addresses muxed by state
+reg        pw_we;
+reg [10:0] pw_addr;
+reg  [7:0] pw_data;
+reg  [7:0] pkt_q;
+reg        btx_pending;
+
 reg [11:0] tx_len;               // bytes gathered from memory
 reg [11:0] rx_len;               // bytes pending delivery to memory
 reg [11:0] rx_pos;
@@ -213,7 +222,8 @@ localparam E_IDLE   = 4'd0,
            E_RX_ACK = 4'd5,
            E_RX_END = 4'd6,
            E_BTX    = 4'd7,     // frame parked for the bridge to fetch
-           E_BRX    = 4'd8;     // frame streaming in from the bridge
+           E_BRX    = 4'd8,
+           E_RX_PRE = 4'd9;     // buffer read data settles     // frame streaming in from the bridge
 
 reg [3:0] est;
 reg [10:0] brx_pos;
@@ -320,7 +330,15 @@ endtask
 
 wire [7:0] csr_or = (be[1] ? wdata[15:8] : 8'h00) | (be[0] ? wdata[7:0] : 8'h00);
 
+wire [10:0] pkt_raddr = (est == E_BTX) ? btx_addr : rx_pos[10:0];
+
 always @(posedge clk) begin
+	if (pw_we) pkt[pw_addr] <= pw_data;
+	pkt_q <= pkt[pkt_raddr];
+end
+
+always @(posedge clk) begin
+	pw_we <= 0;
 	if (reset) begin
 		tx_status <= TXSTAT_READY;
 		tx_mask <= 0; rx_status <= 0; rx_mask <= 0;
@@ -336,6 +354,7 @@ always @(posedge clk) begin
 		tx_len <= 0; rx_len <= 0; rx_pos <= 0;
 		brx_pos <= 0;
 		btx_req <= 0; btx_len <= 0; btx_q <= 0; btx_ack <= 0;
+		btx_pending <= 0;
 		est <= E_IDLE;
 		m_req <= 0;
 		tickcnt <= 0;
@@ -408,7 +427,7 @@ always @(posedge clk) begin
 				end
 				else begin
 					rx_status <= rx_status & ~RXSTAT_PKT_OK;
-					est <= E_RX_WR;
+					est <= E_RX_PRE;
 				end
 			end
 			else if (tx_status[7] && tx_csr[CSR_ENABLE]) begin
@@ -436,7 +455,9 @@ always @(posedge clk) begin
 			    (tx_next[1:0] == 2'd1) ? m_dout[23:16] :
 			    (tx_next[1:0] == 2'd2) ? m_dout[15:8] : m_dout[7:0];
 			if (tx_len < 12'd2047) begin
-				pkt[tx_len] <= b;
+				pw_we <= 1;
+				pw_addr <= tx_len[10:0];
+				pw_data <= b;
 				tx_len <= tx_len + 1'd1;
 			end
 			case (tx_len)
@@ -484,14 +505,18 @@ always @(posedge clk) begin
 		end
 
 		E_BTX: begin
-			// serve the bridge's byte fetches out of the packet buffer
+			// serve the bridge's byte fetches out of the packet buffer;
+			// the read data settles one cycle after the address applies
 			btx_ack <= 0;
-			if (btx_rd) begin
-				btx_q <= pkt[btx_addr];
+			if (btx_pending) begin
+				btx_q <= pkt_q;
 				btx_ack <= 1;
+				btx_pending <= 0;
 			end
+			else if (btx_rd) btx_pending <= 1;
 			if (btx_done) begin
 				btx_req <= 0;
+				btx_pending <= 0;
 				tx_len <= 0;
 				est <= E_IDLE;
 			end
@@ -500,7 +525,9 @@ always @(posedge clk) begin
 		E_BRX: begin
 			// frame streaming in from the bridge into the packet buffer
 			if (brx_valid && brx_pos < 11'd2047) begin
-				pkt[brx_pos] <= brx_data;
+				pw_we <= 1;
+				pw_addr <= brx_pos;
+				pw_data <= brx_data;
 				case (brx_pos)
 					11'd0: dst0 <= brx_data;
 					11'd1: dst1 <= brx_data;
@@ -539,7 +566,7 @@ always @(posedge clk) begin
 				m_we <= 1;
 				m_be <= be_of(rx_next[1:0]);
 				m_addr <= rx_next[25:2];
-				m_din <= {4{pkt[rx_pos[10:0]]}};
+				m_din <= {4{pkt_q}};
 				est <= E_RX_ACK;
 			end
 		end
@@ -548,8 +575,10 @@ always @(posedge clk) begin
 			m_req <= 0;
 			rx_next <= rx_next + 1'd1;
 			rx_pos <= rx_pos + 1'd1;
-			est <= E_RX_WR;
+			est <= E_RX_PRE;
 		end
+
+		E_RX_PRE: est <= E_RX_WR;   // pkt_q settles for the new rx_pos
 
 		E_RX_END: begin
 			// packet delivered completely; the EN_BOP marker lands in the
