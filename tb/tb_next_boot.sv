@@ -93,10 +93,10 @@ next_system #(
 
 	.led(led),
 
-	.btx_req(), .btx_len(), .btx_addr(11'd0), .btx_rd(1'b0),
-	.btx_q(), .btx_ack(), .btx_done(1'b0),
-	.brx_start(1'b0), .brx_len(11'd0), .brx_valid(1'b0),
-	.brx_data(8'd0), .brx_ready(), .enet_mac(),
+	.btx_req(btx_req), .btx_len(btx_len), .btx_addr(btx_addr), .btx_rd(btx_rd),
+	.btx_q(btx_q), .btx_ack(btx_ack), .btx_done(btx_done),
+	.brx_start(brx_start), .brx_len(brx_len), .brx_valid(brx_valid),
+	.brx_data(brx_data), .brx_ready(brx_ready), .enet_mac(enet_mac),
 
 	.dbg_pc(dbg_pc),
 	.dbg_halted(dbg_halted),
@@ -187,6 +187,74 @@ always @(posedge clk) begin
 		cv_left <= cv_left - 1'd1;
 	end
 end
+
+//----------------------------------------------------------------------------
+// Ethernet mailbox bridge, against a mailbox the host never wrote.
+//
+// The boot bench used to tie these ports off, which is why a bridge
+// that reads uninitialised ring pointers and streams whatever DDR3
+// holds into the guest could never show up here.  The model below
+// starts every mailbox word as stale rubbish, exactly as DDR3 is when
+// no daemon has touched it, and +netoff runs with the OSD Network
+// option off, which must leave the mailbox alone entirely.
+//----------------------------------------------------------------------------
+
+wire        btx_req, btx_rd, btx_ack, btx_done;
+wire [10:0] btx_len, btx_addr;
+wire  [7:0] btx_q;
+wire        brx_start, brx_valid, brx_ready;
+wire [10:0] brx_len;
+wire  [7:0] brx_data;
+wire [47:0] enet_mac;
+
+reg         net_enable = 1;
+
+wire        eb_req, eb_we;
+wire [28:0] eb_addr;
+wire [63:0] eb_wdata;
+reg  [63:0] eb_rdata;
+reg         eb_ack = 0;
+
+next_enet_bridge #(.CLK_HZ(50000000)) bridge
+(
+	.clk(clk), .reset(reset), .enable(net_enable),
+	.btx_req(btx_req), .btx_len(btx_len), .btx_addr(btx_addr),
+	.btx_rd(btx_rd), .btx_q(btx_q), .btx_ack(btx_ack), .btx_done(btx_done),
+	.brx_start(brx_start), .brx_len(brx_len), .brx_valid(brx_valid),
+	.brx_data(brx_data), .brx_ready(brx_ready),
+	.guest_mac(enet_mac),
+	.m_req(eb_req), .m_we(eb_we), .m_addr(eb_addr), .m_wdata(eb_wdata),
+	.m_rdata(eb_rdata), .m_ack(eb_ack)
+);
+
+// mailbox memory, stale from the start
+reg [63:0] mbox [0:2047];
+integer mb_i;
+initial for (mb_i = 0; mb_i < 2048; mb_i = mb_i + 1)
+	mbox[mb_i] = {32'hDEADBEEF, mb_i[15:0], 16'hFACE};
+
+integer mbox_writes = 0;
+integer mbox_reads = 0;
+wire [10:0] mb_idx = eb_addr[10:0];
+
+always @(posedge clk) begin
+	eb_ack <= 0;
+	if (!reset && eb_req && !eb_ack) begin
+		if (eb_we) begin
+			mbox[mb_idx] <= eb_wdata;
+			mbox_writes = mbox_writes + 1;
+		end
+		else begin
+			eb_rdata <= mbox[mb_idx];   // latched, as the arbiter does
+			mbox_reads = mbox_reads + 1;
+		end
+		eb_ack <= 1;
+	end
+end
+
+// frames the bridge pushed at the guest
+integer injected = 0;
+always @(posedge clk) if (!reset && brx_start) injected = injected + 1;
 
 //----------------------------------------------------------------------------
 // bus monitor
@@ -677,6 +745,8 @@ initial begin
 		$dumpvars(0, tb_next_boot);
 	end
 
+	if ($test$plusargs("netoff")) net_enable = 0;
+
 	if ($test$plusargs("bootsd")) begin
 		bootsd = 1;
 		@(posedge clk);
@@ -720,6 +790,25 @@ initial begin
 	check(!dbg_halted,  "CPU not halted");
 	$display("colour scan-out requests: %0d", cv_reqs);
 	check(cv_reqs == 0, "monochrome machine issues no frame buffer fetches");
+
+	$display("mailbox: %0d reads, %0d writes, %0d frames pushed at the guest",
+	         mbox_reads, mbox_writes, injected);
+	if (!net_enable) begin
+		// The bridge may invalidate the mailbox once so the host daemon
+		// sees no magic, but it must never READ it: reading is how a
+		// stale ring pointer left in DDR3 turns into frames the guest
+		// never asked for.
+		check(mbox_reads == 0,
+		      "network off: the bridge reads no mailbox state");
+		check(mbox_writes <= 8,
+		      "network off: at most a one-off invalidation is written");
+		check(injected == 0,
+		      "network off: no frame reaches the guest");
+	end
+	else begin
+		check(injected == 0,
+		      "a stale mailbox injects no frames into the guest");
+	end
 
 	// The host time of day reached the clock through the system wiring
 	// and survived the machine coming out of reset.  Only meaningful
