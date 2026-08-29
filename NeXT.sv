@@ -69,6 +69,7 @@ localparam CONF_STR = {
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
 	"O[56:55],Boot device,Auto,Disk,Network,ROM Default;",
+	"O[57],Machine,NeXTcube,NeXTstation Color;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -159,6 +160,12 @@ wire reset = RESET | status[0] | buttons[1] | rom_download | ~rom_loaded;
 
 wire        hsync, vsync, hblank, vblank;
 wire  [7:0] gray;
+wire  [7:0] vid_r, vid_g, vid_b;
+wire        ram_vram;
+wire        cv_req, cv_ack, cv_data_valid;
+wire [28:0] cv_addr;
+wire  [7:0] cv_burst;
+wire [63:0] cv_data;
 wire        led;
 
 wire        ram_req, ram_we, ram_ack;
@@ -192,6 +199,7 @@ next_system #(
 
 	.ps2_key(ps2_key),
 	.boot_sel(status[56:55]),
+	.machine_color(status[57]),
 	.hps_rtc(hps_rtc),
 
 	.img_mounted(img_mounted),
@@ -215,11 +223,19 @@ next_system #(
 	.hblank(hblank),
 	.vblank(vblank),
 	.gray(gray),
+	.vid_red(vid_r), .vid_green(vid_g), .vid_blue(vid_b),
 
 	.ram_req(ram_req),
 	.ram_we(ram_we),
 	.ram_be(ram_be),
 	.ram_addr(ram_addr),
+	.ram_vram(ram_vram),
+	.cv_req(cv_req),
+	.cv_addr(cv_addr),
+	.cv_burst(cv_burst),
+	.cv_ack(cv_ack),
+	.cv_data(cv_data),
+	.cv_data_valid(cv_data_valid),
 	.ram_din(ram_din),
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
@@ -270,6 +286,7 @@ next_ddram ddram
 	.ram_we(ram_we),
 	.ram_be(ram_be),
 	.ram_addr(ram_addr),
+	.ram_vram(ram_vram),
 	.ram_din(ram_din),
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
@@ -299,6 +316,13 @@ next_ddram_arb ddram_arb
 	.a_busy(ga_busy),
 	.a_dout(ga_dout),
 	.a_dout_ready(ga_dout_ready),
+
+	.v_req(cv_req),
+	.v_addr(cv_addr),
+	.v_burst(cv_burst),
+	.v_ack(cv_ack),
+	.v_data(cv_data),
+	.v_data_valid(cv_data_valid),
 
 	.b_req(eb_req),
 	.b_we(eb_we),
@@ -355,8 +379,8 @@ assign CE_PIXEL  = 1;
 assign VGA_DE = ~(hblank | vblank);
 assign VGA_HS = hsync;
 assign VGA_VS = vsync;
-assign VGA_R  = gray;
-assign VGA_G  = gray;
-assign VGA_B  = gray;
+assign VGA_R  = vid_r;
+assign VGA_G  = vid_g;
+assign VGA_B  = vid_b;
 
 endmodule

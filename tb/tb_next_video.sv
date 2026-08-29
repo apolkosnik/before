@@ -28,7 +28,10 @@ next_video dut
 (
 	.clk(clk),
 	.hsync(hsync), .vsync(vsync), .hblank(hblank), .vblank(vblank),
-	.gray(gray), .vbl(vbl),
+	.gray(gray),
+	.color_mode(1'b0),
+	.cpx_data(16'd0), .cpx(), .fetch_line(), .line_start(),
+	.r(), .g(), .b(), .vbl(vbl),
 	.vram_addr(scan_addr), .vram_q(scan_q)
 );
 

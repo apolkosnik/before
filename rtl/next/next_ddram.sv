@@ -19,6 +19,10 @@ module next_ddram
 	input             ram_we,
 	input       [3:0] ram_be,      // [3] = MSB = lowest byte address
 	input      [23:0] ram_addr,    // 32-bit word index (64 MB)
+	// this access targets the colour frame buffer, which sits in its own
+	// DDR3 window above main RAM (main RAM 0x30000000, frame buffer
+	// 0x34000000) rather than in the 64 MB the machine sees as memory
+	input             ram_vram,
 	input      [31:0] ram_din,
 	output reg [31:0] ram_dout,
 	output reg        ram_ack,
@@ -72,7 +76,9 @@ always @(posedge clk) begin
 
 		if (!ram_req) ram_ack <= 0;
 		else if (!ram_ack && !busy && !DDRAM_RD && !DDRAM_WE) begin
-			DDRAM_ADDR <= {5'b00110, 1'b0, ram_addr[23:1]};
+			DDRAM_ADDR <= ram_vram
+			              ? {5'b00110, 1'b1, 4'd0, ram_addr[18:1]}  // 0x34000000
+			              : {5'b00110, 1'b0, ram_addr[23:1]};       // 0x30000000
 			half       <= ram_addr[0];
 			if (ram_we) begin
 				DDRAM_DIN <= {2{bswap(ram_din)}};

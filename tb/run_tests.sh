@@ -30,7 +30,7 @@ CPUSRC="$CPU/ap040_tg68k_compat.v $CPU/ap040_core.v $CPU/ap040_bus16_adapter.v \
         $CPU/ap040_walker_cdc.v"
 
 NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
-         $RTL/next_timer.sv $RTL/next_video.sv $RTL/next_vram.sv \
+         $RTL/next_timer.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/next_cvram.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
          $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_enet_dma.sv \
          $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_rs.sv $RTL/dpram.v"
@@ -85,6 +85,7 @@ run tb_snd       "$WORK/vl_tb_next_snd/tb_next_snd"
 run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"
 run tb_video     "$WORK/vl_tb_next_video/tb_next_video"
+run tb_cvram     "$WORK/vl_tb_next_cvram/tb_next_cvram"
 run tb_boot      "$WORK/vl_tb_next_boot/tb_next_boot"
 
 if [ "${1:-}" = "post" ]; then

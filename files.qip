@@ -6,6 +6,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_intc.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_timer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_video.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_vram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_cvram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_rom.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_bmap.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_dma_stub.sv

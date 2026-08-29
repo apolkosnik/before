@@ -55,6 +55,12 @@ module next_system #(
 	// boot device menu (to the NVRAM boot command, see next_scr)
 	input   [1:0] boot_sel,
 
+	// machine model: 0 = NeXTcube (68040, monochrome MegaPixel),
+	// 1 = NeXTstation Color (68040 slab, 16 bit color).  Selects the
+	// system control register identity the ROM reads, the frame buffer
+	// and the video interrupt path.
+	input         machine_color,
+
 	// host time of day (hps_io RTC port)
 	input  [64:0] hps_rtc,
 
@@ -85,6 +91,9 @@ module next_system #(
 	output        hblank,
 	output        vblank,
 	output  [7:0] gray,
+	output  [7:0] vid_red,
+	output  [7:0] vid_green,
+	output  [7:0] vid_blue,
 
 	// main RAM port, 32 bit, 64 MB (level req, level ack; see NeXT.sv
 	// and tb/ for the two implementations)
@@ -92,6 +101,15 @@ module next_system #(
 	output reg        ram_we,
 	output reg  [3:0] ram_be,     // [3] = MSB byte lane
 	output reg [23:0] ram_addr,   // 32-bit word index
+	output reg        ram_vram,   // this access targets the colour frame buffer
+
+	// colour frame buffer scan-out port, onto the DDR3 arbiter
+	output            cv_req,
+	output     [28:0] cv_addr,
+	output      [7:0] cv_burst,
+	input             cv_ack,
+	input      [63:0] cv_data,
+	input             cv_data_valid,
 	output reg [31:0] ram_din,
 	input      [31:0] ram_dout,
 	input             ram_ack,
@@ -275,10 +293,16 @@ wire d_io   = (cpu_addr[31:24] == 8'h02) &&
 wire d_bmap = (cpu_addr[31:16] == 16'h020C) || (cpu_addr[31:16] == 16'h820C);
 wire d_ram  = (cpu_addr[31:26] == 6'b000001) ||   // 0x04-0x07
               (cpu_addr[31:28] == 4'h1);          // 0x10-0x1F MWF mirrors
-wire d_vram = (cpu_addr[31:24] == 8'h0B) ||
-              (cpu_addr[31:26] == 6'b000011);     // 0x0C-0x0F MWF mirrors
+wire d_vram = !machine_color &&
+              ((cpu_addr[31:24] == 8'h0B) ||
+               (cpu_addr[31:26] == 6'b000011));    // 0x0C-0x0F MWF mirrors
 
-wire d_any  = d_rom | d_io | d_bmap | d_ram | d_vram;
+// NeXTstation Color frame buffer: 2 MB at 0x2C000000, held in DDR3
+// because 1120x832 at 16 bpp is far larger than the block RAM on this
+// device.  Accesses take the RAM path with cvram_sel set.
+wire d_cvram = machine_color && (cpu_addr[31:21] == {8'h2C, 3'd0});
+
+wire d_any  = d_rom | d_io | d_bmap | d_ram | d_vram | d_cvram;
 
 //----------------------------------------------------------------------------
 // bus cycle state machine
@@ -322,6 +346,7 @@ always @(posedge clk) begin
 		berr_hold <= 0;
 		{sel_rom, sel_vram, sel_io, sel_bmap} <= 0;
 		ram_req <= 0;
+		ram_vram <= 0;
 		walker_armed <= 1;
 		walker_busy <= 0;
 	end
@@ -341,6 +366,7 @@ always @(posedge clk) begin
 					ram_we   <= walker_we;
 					ram_be   <= 4'b1111;
 					ram_addr <= walker_addr[25:2];
+					ram_vram <= 0;
 					ram_din  <= walker_wdat;
 					state    <= S_RAM;
 				end
@@ -351,6 +377,7 @@ always @(posedge clk) begin
 				ram_be   <= en_m_be;
 				ram_addr <= en_m_addr;
 				ram_din  <= en_m_din;
+				ram_vram <= 0;
 				dma_grant <= G_ENET;
 				state    <= S_RAM_E;
 			end
@@ -360,6 +387,7 @@ always @(posedge clk) begin
 				ram_be   <= mo_m_be;
 				ram_addr <= mo_m_addr;
 				ram_din  <= mo_m_din;
+				ram_vram <= 0;
 				dma_grant <= G_MO;
 				state    <= S_RAM_E;
 			end
@@ -369,6 +397,7 @@ always @(posedge clk) begin
 				ram_be   <= sn_m_be;
 				ram_addr <= sn_m_addr;
 				ram_din  <= sn_m_din;
+				ram_vram <= 0;
 				dma_grant <= G_SND;
 				state    <= S_RAM_E;
 			end
@@ -378,16 +407,18 @@ always @(posedge clk) begin
 				ram_be   <= sc_m_be;
 				ram_addr <= sc_m_addr;
 				ram_din  <= sc_m_din;
+				ram_vram <= 0;
 				dma_grant <= G_SCSI;
 				state    <= S_RAM_E;
 			end
 			else if (cpu_req && !berr_hold) begin
 				if (!d_any) berr_hold <= 1;
-				else if (d_ram) begin
+				else if (d_ram || d_cvram) begin
 					ram_req  <= 1;
 					ram_we   <= is_write;
 					ram_be   <= cpu_addr[1] ? {2'b00, lanes} : {lanes, 2'b00};
 					ram_addr <= cpu_addr[25:2];
+					ram_vram <= d_cvram;
 					ram_din  <= {cpu_dout, cpu_dout};
 					state    <= S_RAM;
 				end
@@ -484,6 +515,12 @@ next_video video
 	.vblank(vblank),
 	.gray(gray),
 	.vbl(),
+	.color_mode(machine_color),
+	.cpx_data(cpx_data),
+	.cpx(cpx),
+	.fetch_line(fetch_line),
+	.line_start(line_start),
+	.r(vid_r), .g(vid_g), .b(vid_b),
 	.vram_addr(scan_addr),
 	.vram_q(scan_q)
 );
@@ -533,6 +570,7 @@ wire io_timer = sel_io && (io_off[16:12] == 5'h16);             // 0x16000-0x16f
 wire io_scc   = sel_io && (io_off[16:3]  == 14'h3000);          // 0x18000-0x18007
 wire io_esp   = sel_io && (io_off[16:6]  == 11'h500);           // 0x14000-0x1403f
 wire io_evt   = sel_io && (io_off[16:12] == 5'h1a);             // 0x1a000-0x1afff
+wire io_cvid  = sel_io && (io_off[16:0]  == 17'h18180);         // colour video cmd
 wire io_scr   = io_scr1 | io_sid | io_scr2;
 
 wire [15:0] scr_rdata, intc_rdata, timer_rdata, dma_rdata, scc_rdata, esp_rdata, enet_rdata, mo_rdata, snd_rdata;
@@ -574,6 +612,60 @@ assign io_rdata = io_enet  ? enet_rdata :
                   io_esp   ? esp_rdata :
                   io_evt   ? evt_rdata : 16'h0000;
 
+// Colour video command register, ColorVideo_CMD_Write() in sysReg.c:
+//   bit 0 clear interrupt, bit 1 enable it for the next frame,
+//   bit 2 unblank.  The frame interrupt of a colour slab is INT_DISK.
+reg  [7:0] cvid_cmd;
+reg        cvid_int;
+wire       cvid_wr = io_cvid & is_write;
+wire [7:0] cvid_wdata = lanes[1] ? cpu_dout[15:8] : cpu_dout[7:0];
+
+always @(posedge clk) begin
+	if (reset) begin
+		cvid_cmd <= 0;
+		cvid_int <= 0;
+	end
+	else begin
+		if (cvid_wr) begin
+			cvid_cmd <= cvid_wdata;
+			if (cvid_wdata[0]) cvid_int <= 0;         // VID_CMD_CLEAR_INT
+		end
+		// the frame pulse raises it only while armed, and disarms
+		else if (vbl && cvid_cmd[1]) begin
+			cvid_int <= 1;
+			cvid_cmd[1] <= 1'b0;
+		end
+	end
+end
+
+assign vid_red   = vid_r;
+assign vid_green = vid_g;
+assign vid_blue  = vid_b;
+
+// colour frame buffer scan-out (DDR3 backed)
+wire [15:0] cpx_data;
+wire [10:0] cpx;
+wire  [9:0] fetch_line;
+wire        line_start;
+wire  [7:0] vid_r, vid_g, vid_b;
+
+next_cvram cvram
+(
+	.clk(clk),
+	.reset(reset),
+	.f_req(cv_req),
+	.f_addr(cv_addr),
+	.f_burst(cv_burst),
+	.f_ack(cv_ack),
+	.f_data(cv_data),
+	.f_data_valid(cv_data_valid),
+	.clk_vid(clk_vid),
+	.px(cpx),
+	.fetch_line(fetch_line),
+	.line_start(line_start),
+	.px_data(cpx_data)
+);
+
 // system control registers and RTC
 wire timer_ipl7, softint1, softint2;
 
@@ -593,7 +685,8 @@ next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 	.be(lanes),
 	.wdata(cpu_dout),
 	.rdata(scr_rdata),
-	.scr1(32'h00012052),         // 25MHz NeXTcube 68040, 100ns memory
+	.scr1(machine_color ? 32'h00013052    // 25MHz NeXTstation Color
+	                    : 32'h00012052),  // 25MHz NeXTcube 68040, 100ns memory
 	.boot_sel(boot_sel),
 	.disk_mounted(disk_mounted),
 	.hps_rtc(hps_rtc),
@@ -809,7 +902,7 @@ always @(posedge clk) begin
 	enrx_d  <= int_en_rx;
 	entxd_d <= int_en_tx_dma;
 	enrxd_d <= int_en_rx_dma;
-	disk_d  <= int_disk;
+	disk_d  <= machine_color ? cvid_int : int_disk;
 	diskd_d <= int_disk_dma;
 	sndo_d  <= int_snd_ovrun;
 	sndd_d  <= int_snd_out_dma;
@@ -820,12 +913,12 @@ wire [31:0] int_set =
 	(32'd1  & {31'd0,  softint1 & ~soft1_d}) |
 	({31'd0, softint2 & ~soft2_d} << 1) |
 	({31'd0, int_keymouse & ~km_d} << 3) |
-	({31'd0, vid_int_set} << 5) |
+	({31'd0, vid_int_set & ~machine_color} << 5) |
 	({31'd0, int_snd_ovrun & ~sndo_d} << 8) |
 	({31'd0, int_en_rx & ~enrx_d} << 9) |
 	({31'd0, int_en_tx & ~entx_d} << 10) |
 	({31'd0, esp_int_scsi & ~scsi_d} << 12) |
-	({31'd0, int_disk & ~disk_d} << 13) |
+	({31'd0, (machine_color ? cvid_int : int_disk) & ~disk_d} << 13) |
 	({31'd0, int_snd_out_dma & ~sndd_d} << 23) |
 	({31'd0, int_disk_dma & ~diskd_d} << 25) |
 	({31'd0, int_scsi_dma & ~scsid_d} << 26) |
@@ -837,12 +930,12 @@ wire [31:0] int_clr =
 	({31'd0, ~softint1 & soft1_d}) |
 	({31'd0, ~softint2 & soft2_d} << 1) |
 	({31'd0, ~int_keymouse & km_d} << 3) |
-	({31'd0, vid_int_clr} << 5) |
+	({31'd0, vid_int_clr | machine_color} << 5) |
 	({31'd0, ~int_snd_ovrun & sndo_d} << 8) |
 	({31'd0, ~int_en_rx & enrx_d} << 9) |
 	({31'd0, ~int_en_tx & entx_d} << 10) |
 	({31'd0, ~esp_int_scsi & scsi_d} << 12) |
-	({31'd0, ~int_disk & disk_d} << 13) |
+	({31'd0, ~(machine_color ? cvid_int : int_disk) & disk_d} << 13) |
 	({31'd0, ~int_snd_out_dma & sndd_d} << 23) |
 	({31'd0, ~int_disk_dma & diskd_d} << 25) |
 	({31'd0, ~int_scsi_dma & scsid_d} << 26) |

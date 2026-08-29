@@ -25,7 +25,15 @@ module next_video
 	output reg    vsync,
 	output reg    hblank,
 	output reg    vblank,
-	output  [7:0] gray,          // pixel luminance
+	output  [7:0] gray,          // pixel luminance (monochrome machine)
+
+	// colour machine: RGBA4444 pixel from the DDR3 line buffer
+	input         color_mode,
+	input  [15:0] cpx_data,      // pixel under cpx, two clocks late
+	output [10:0] cpx,           // pixel within the line being fetched
+	output  [9:0] fetch_line,    // line the frame buffer should hold next
+	output reg    line_start,    // one pulse per line
+	output  [7:0] r, g, b,       // colour output
 
 	output reg    vbl,           // one-cycle pulse at start of vertical blank
 
@@ -86,6 +94,31 @@ wire active = (vcnt < V_ACT) && (hcnt < H_ACT);
 wire [1:0] px = sr[15:14];
 assign gray = {4{~px}};
 
+//----------------------------------------------------------------------------
+// colour path: the line buffer is addressed two clocks ahead so its
+// registered output lines up with the pixel being displayed
+//----------------------------------------------------------------------------
+
+wire [21:0] a2 = ahead(hcnt, vcnt, 2'd2);
+wire [11:0] h2 = a2[11:0];
+assign cpx = h2[10:0];
+
+// the line the frame buffer engine should hold next: the one after the
+// line being displayed, and line 0 through vertical blanking so the
+// first visible line is always primed
+wire [9:0] next_line = (vcnt >= V_ACT-1) ? 10'd0 : vcnt + 10'd1;
+assign fetch_line = next_line;
+
+// NeXT colour is 16 bit RGBA 4:4:4:4 (fast_screen.c: r = col & 0xF000),
+// each nibble replicated to eight bits
+wire [3:0] cr = cpx_data[15:12];
+wire [3:0] cg = cpx_data[11:8];
+wire [3:0] cb = cpx_data[7:4];
+
+assign r = color_mode ? {cr, cr} : gray;
+assign g = color_mode ? {cg, cg} : gray;
+assign b = color_mode ? {cb, cb} : gray;
+
 always @(posedge clk) begin
 	if (hcnt == H_TOTAL-1) begin
 		hcnt <= 0;
@@ -104,6 +137,10 @@ always @(posedge clk) begin
 	vblank <= (v1 >= V_ACT);
 
 	vbl <= (vcnt == V_ACT-1) && (hcnt == H_TOTAL-1);
+
+	// one pulse at the end of each line, when next_line is already the
+	// line the frame buffer must hold
+	line_start <= (hcnt == H_TOTAL-1);
 end
 
 endmodule
