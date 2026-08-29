@@ -21,6 +21,7 @@ reg clk_vid = 0;         // pixel clock, deliberately a different rate
 always #4 clk_vid = ~clk_vid;
 
 reg reset = 1;
+reg cv_enable = 1;
 
 wire        f_req;
 wire [28:0] f_addr;
@@ -36,7 +37,7 @@ wire [15:0] px_data;
 
 next_cvram dut
 (
-	.clk(clk), .reset(reset),
+	.clk(clk), .reset(reset), .enable(cv_enable),
 	.f_req(f_req), .f_addr(f_addr), .f_burst(f_burst),
 	.f_ack(f_ack), .f_data(f_data), .f_data_valid(f_data_valid),
 	.clk_vid(clk_vid),
@@ -249,6 +250,14 @@ initial begin
 	// the whole line comes from one burst sequence: 280 words in
 	// bursts of 16 is 18 requests
 	check(bursts_served >= 4*18, "each line is fetched in bounded bursts");
+
+	// disabled, the engine must go quiet even across line starts
+	cv_enable = 0;
+	i = bursts_served;
+	begin_line(10'd5);
+	settle;
+	check(bursts_served == i, "a disabled engine issues no fetches");
+	cv_enable = 1;
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

@@ -60,8 +60,8 @@ next_system #(
 	.boot_sel(bootsd ? 2'd1 : 2'd0),
 	.machine_color(1'b0),
 	.vid_red(), .vid_green(), .vid_blue(),
-	.cv_req(), .cv_addr(), .cv_burst(),
-	.cv_ack(1'b0), .cv_data(64'd0), .cv_data_valid(1'b0),
+	.cv_req(cv_req), .cv_addr(cv_addr), .cv_burst(cv_burst),
+	.cv_ack(cv_ack), .cv_data(64'hA5A5A5A5A5A5A5A5), .cv_data_valid(cv_dv),
 	.hps_rtc(hps_rtc),
 	.img_mounted(img_mounted),
 	.img_readonly(1'b0),
@@ -153,6 +153,38 @@ always @(posedge clk) begin
 			ram_ack <= 1;
 		end
 		else ram_wait <= ram_wait + 1'd1;
+	end
+end
+
+//----------------------------------------------------------------------------
+// colour scan-out port: a live model, never a tie-off.  The engine ran
+// full-tilt on hardware while the bench's cv_ack tie-off kept it
+// politely stalled in simulation, hiding a fetch stream that outranks
+// the CPU at the DDR3 arbiter and starved the machine out of booting.
+// The model serves any request so the engine can misbehave visibly,
+// and the epilogue checks a monochrome machine never issues one.
+//----------------------------------------------------------------------------
+
+wire        cv_req;
+wire [28:0] cv_addr;
+wire  [7:0] cv_burst;
+reg         cv_ack = 0;
+reg         cv_dv = 0;
+reg  [7:0]  cv_left = 0;
+integer     cv_reqs = 0;
+
+always @(posedge clk) begin
+	cv_ack <= 0;
+	cv_dv  <= 0;
+	if (reset) cv_left <= 0;
+	else if (cv_req && !cv_ack && cv_left == 0) begin
+		cv_ack  <= 1;
+		cv_left <= cv_burst;
+		cv_reqs = cv_reqs + 1;
+	end
+	else if (cv_left != 0) begin
+		cv_dv   <= 1;
+		cv_left <= cv_left - 1'd1;
 	end
 end
 
@@ -686,6 +718,8 @@ initial begin
 	check(scr1_ok,      "SCR1 returned machine id 0x00012052");
 	check(seen_scr2_wr, "ROM wrote SCR2");
 	check(!dbg_halted,  "CPU not halted");
+	$display("colour scan-out requests: %0d", cv_reqs);
+	check(cv_reqs == 0, "monochrome machine issues no frame buffer fetches");
 
 	// The host time of day reached the clock through the system wiring
 	// and survived the machine coming out of reset.  Only meaningful

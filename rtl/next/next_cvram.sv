@@ -25,6 +25,11 @@ module next_cvram
 	// fetch side (system clock, DDR3)
 	input             clk,
 	input             reset,
+	// a monochrome machine must issue no fetch traffic at all: the
+	// scan-out port outranks the CPU at the DDR3 arbiter and a line's
+	// fetch is most of the 28 MHz port's bandwidth, so an ungated
+	// engine starves the CPU out of booting
+	input             enable,
 
 	output reg        f_req,        // burst read request
 	output reg [28:0] f_addr,       // 64-bit word address
@@ -160,9 +165,13 @@ always @(posedge clk) begin
 	else begin
 		w_en <= 0;
 
+		if (!enable) begin
+			f_req <= 0;
+			fst   <= F_IDLE;
+		end
 		// a new line always restarts the engine: the display has moved
 		// on and whatever remained of the previous line no longer matters
-		if (new_line) begin
+		else if (new_line) begin
 			f_req <= 0;
 			start_line;
 		end

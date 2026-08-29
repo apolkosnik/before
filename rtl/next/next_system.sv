@@ -653,6 +653,7 @@ next_cvram cvram
 (
 	.clk(clk),
 	.reset(reset),
+	.enable(machine_color),
 	.f_req(cv_req),
 	.f_addr(cv_addr),
 	.f_burst(cv_burst),
