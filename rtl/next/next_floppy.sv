@@ -105,6 +105,18 @@ wire [7:0] sra = (int_pend ? SRA_INT : 8'h00) |
                  ((cyl == 0) ? 8'h00 : SRA_TRK0_N) |
                  (readonly ? 8'h00 : SRA_WP_N);
 wire [7:0] srb = 8'hC0;
+
+// The drive and its medium are reported through the NeXT external
+// control register, not through anything in the 82077: bit 2 clear
+// says a drive is connected, and the low two bits carry the media ID
+// that floppy_dor_write() publishes when the motor is turned on.
+// Leaving them at zero is what "No Floppy Disk Present" means.
+localparam [1:0] MEDIA_NONE = 2'd0, MEDIA_2880 = 2'd1,
+                 MEDIA_1440 = 2'd2, MEDIA_720  = 2'd3;
+
+wire [1:0] media_id = !present            ? MEDIA_NONE :
+                      (spt == 8'd9)       ? MEDIA_720  :
+                      (spt == 8'd36)      ? MEDIA_2880 : MEDIA_1440;
 wire [7:0] dir = present ? 8'h00 : 8'h80;  // disk change when empty
 
 //----------------------------------------------------------------------------
@@ -391,7 +403,14 @@ always @(posedge clk) begin
 					a = {addr[3:1], k[0]};
 					v = k[0] ? wdata[7:0] : wdata[15:8];
 					case (a)
-					4'h2: dor <= v;
+					4'h2: begin
+						dor <= v;
+						// floppy_dor_write(): a connected drive clears
+						// the drive id bit, and spinning the motor up
+						// publishes what medium is in it
+						ctrl[2] <= 1'b0;
+						ctrl[1:0] <= v[4] ? media_id : MEDIA_NONE;
+					end
 					4'h4: ccr <= v;          // data rate select
 					4'h7: ccr <= v;          // configuration control
 					4'h8: begin

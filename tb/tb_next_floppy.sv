@@ -216,6 +216,22 @@ initial begin
 	rd8(4'h4, msr);
 	check(msr[7] && !msr[6], "reset leaves the controller ready for a command");
 
+	// The ROM decides whether there is a drive and a disk from the
+	// external control register, not from anything in the 82077: bit 2
+	// clear means a drive is connected, and the low two bits are the
+	// media ID that appears when the motor spins up.  Zero there is
+	// what "No Floppy Disk Present" means.
+	wr8(4'h2, 8'h1C);            // motor 0 on, reset released, drive 0
+	rd8(4'h8, v);
+	$display("  control register = %02x", v);
+	check(v[2] == 1'b0, "a drive is reported as connected");
+	check(v[1:0] == 2'd2, "a 1.44 MB medium reports media id 2");
+
+	wr8(4'h2, 8'h0C);            // motor off
+	rd8(4'h8, v);
+	check(v[1:0] == 2'd0, "no media id while the motor is stopped");
+	wr8(4'h2, 8'h1C);            // motor back on for the rest of the test
+
 	// SPECIFY: two parameters, no result
 	wr8(4'h5, 8'h03); wr8(4'h5, 8'hDF); wr8(4'h5, 8'h02);
 	rd8(4'h4, msr);
