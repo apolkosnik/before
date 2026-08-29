@@ -129,8 +129,13 @@ passed path, about 5 minutes):
    through the KMS data path with INT_KEYMOUSE.
 2. (done) SCSI: ESP (53C90) + DMA channel + disk image from the
    MiSTer SD card (hps_io block access) in next_scsi.sv.
-3. Boot NeXTSTEP from the SCSI disk (exercise the ROM "bsd" boot
-   path against next_scsi, fix what falls out).
+3. (in progress) Boot NeXTSTEP from the SCSI disk: the OSD "Boot
+   device" option loads the NVRAM boot command on reset (Auto picks
+   "sd" when an image is mounted, else the ROM default order, which
+   tries the network first - that is why an idle machine shows
+   "Loading from network").  The ROM's SCSI boot path (select, sector
+   reads by DMA) runs in simulation with "./run_tests.sh bootsd"; a
+   real NeXTSTEP image is needed for an actual boot.
 4. KMS mouse input.
 5. SCC serial data path, sound output path, DSP as stretch goals.
 6. CPU caches on (cacheable windows for RAM/ROM/VRAM), snoop from DMA

@@ -49,6 +49,9 @@ module next_system #(
 	input         clk,            // system clock: CPU, devices, RAM
 	input  [10:0] ps2_key,       // MiSTer keyboard events (to the KMS)
 
+	// boot device menu (to the NVRAM boot command, see next_scr)
+	input   [1:0] boot_sel,
+
 	// SCSI disk image (MiSTer SD block interface)
 	input         img_mounted,
 	input         img_readonly,
@@ -567,6 +570,11 @@ assign io_rdata = io_enet  ? enet_rdata :
 // system control registers and RTC
 wire timer_ipl7, softint1, softint2;
 
+// survives reset: the mount pulse fires once at OSD time, usually
+// before the user resets into the new configuration
+reg disk_mounted = 0;
+always @(posedge clk) if (img_mounted) disk_mounted <= (img_size != 0);
+
 next_scr #(.CLK_HZ(CLK_HZ)) scr
 (
 	.clk(clk),
@@ -579,6 +587,8 @@ next_scr #(.CLK_HZ(CLK_HZ)) scr
 	.wdata(cpu_dout),
 	.rdata(scr_rdata),
 	.scr1(32'h00012052),         // 25MHz NeXTcube 68040, 100ns memory
+	.boot_sel(boot_sel),
+	.disk_mounted(disk_mounted),
 	.timer_ipl7(timer_ipl7),
 	.led(led),
 	.rom_overlay(),

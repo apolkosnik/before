@@ -26,6 +26,14 @@ quartus_sh --flow compile NeXT     # Quartus 17.0.x, DE10-Nano / MiSTer
 
 Output: `output_files/NeXT.rbf`.
 
+## Boot device
+
+The ROM picks its boot device from the NVRAM boot command.  The OSD
+"Boot device" option loads it at reset: Auto (boot from the SCSI disk
+whenever an image is mounted in the "SCSI Disk" slot, otherwise the
+ROM default order, which tries the network first), Disk, Network, or
+ROM Default.  Mount the image first, then reset the machine.
+
 ## Network
 
 The OSD "Network" option bridges the machine's onboard ethernet to a

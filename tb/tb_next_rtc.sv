@@ -8,7 +8,10 @@
 //
 //  Checks against the nvram_default[] content from Previous rtcnvram.c:
 //    - NVRAM byte 0 reads 0x94, byte 1 reads 0x0F
-//    - checksum bytes 30/31 read 0x0F 0x13
+//    - checksum bytes 30/31 carry the one's-complement sum
+//    - the boot device menu loads the NVRAM boot command on reset
+//      ("sd"/"en"/empty per selection, Auto follows the mounted disk)
+//      with the matching checksum
 //    - burst read auto-increments the address
 //    - a write to NVRAM byte 5 reads back
 //    - SCR1 reads the machine id
@@ -23,6 +26,8 @@ always #5 clk = ~clk;
 
 reg reset = 1;
 
+reg   [1:0] boot_sel = 0;
+reg         disk_mounted = 0;
 reg         sel = 0;
 reg   [1:0] reg_id = 0;
 reg         addr1 = 0;
@@ -37,6 +42,7 @@ next_scr #(.CLK_HZ(100000000)) dut
 	.sel(sel), .reg_id(reg_id), .addr1(addr1), .we(we), .be(be),
 	.wdata(wdata), .rdata(rdata),
 	.scr1(32'h00012052),
+	.boot_sel(boot_sel), .disk_mounted(disk_mounted),
 	.timer_ipl7(), .led(), .rom_overlay(),
 	.softint1(), .softint2()
 );
@@ -119,7 +125,30 @@ task check;
 endtask
 
 reg [7:0] b0, b1, b30, b31, wb;
+reg [7:0] c18, c19;
 reg [15:0] w;
+
+// reset with a menu selection, then read boot command and checksum
+task boot_variant;
+	input [1:0] bsel;
+	input mounted;
+	begin
+		boot_sel = bsel;
+		disk_mounted = mounted;
+		reset = 1;
+		repeat (5) @(posedge clk);
+		reset = 0;
+		repeat (5) @(posedge clk);
+		rtc_send_byte(8'h12);
+		rtc_recv_byte(c18);
+		rtc_recv_byte(c19);
+		rtc_stop;
+		rtc_send_byte(8'h1E);
+		rtc_recv_byte(b30);
+		rtc_recv_byte(b31);
+		rtc_stop;
+	end
+endtask
 
 initial begin
 	if ($test$plusargs("dump")) begin
@@ -158,7 +187,7 @@ initial begin
 	rtc_recv_byte(b31);
 	rtc_stop;
 	$display("nvram[30]=%02x nvram[31]=%02x", b30, b31);
-	check(b30 == 8'h0F && b31 == 8'h13, "NVRAM checksum bytes are 0x0F 0x13");
+	check(b30 == 8'hE0 && b31 == 8'hEF, "NVRAM checksum bytes are 0xE0 0xEF");
 
 	// write NVRAM byte 5 and read it back
 	rtc_send_byte(8'h85);          // write, address 5
@@ -169,6 +198,25 @@ initial begin
 	rtc_stop;
 	$display("nvram[5]=%02x after write", wb);
 	check(wb == 8'h5A, "NVRAM write/readback");
+
+	// boot device menu variants
+	boot_variant(2'd0, 1'b0);    // Auto, no disk: empty command
+	check(c18 == 8'h00 && c19 == 8'h00, "Auto without disk: empty boot command");
+	check(b30 == 8'hE0 && b31 == 8'hEF, "Auto without disk: checksum");
+
+	boot_variant(2'd0, 1'b1);    // Auto with a disk: "sd"
+	check(c18 == "s" && c19 == "d", "Auto with disk: boot command sd");
+	check(b30 == 8'h6D && b31 == 8'h8B, "Auto with disk: checksum");
+
+	boot_variant(2'd2, 1'b1);    // Network: "en"
+	check(c18 == "e" && c19 == "n", "Network: boot command en");
+	check(b30 == 8'h7B && b31 == 8'h81, "Network: checksum");
+
+	boot_variant(2'd3, 1'b1);    // ROM Default: empty even with a disk
+	check(c18 == 8'h00 && c19 == 8'h00, "ROM Default: empty boot command");
+
+	boot_variant(2'd1, 1'b0);    // Disk forced, even without an image
+	check(c18 == "s" && c19 == "d", "Disk: boot command sd");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

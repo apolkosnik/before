@@ -68,6 +68,7 @@ localparam CONF_STR = {
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
+	"O[56:55],Boot device,Auto,Disk,Network,ROM Default;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -187,6 +188,7 @@ next_system #(
 	.reset(reset),
 
 	.ps2_key(ps2_key),
+	.boot_sel(status[56:55]),
 
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),

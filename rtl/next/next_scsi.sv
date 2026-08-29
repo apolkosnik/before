@@ -104,9 +104,9 @@ assign int_scsi = dma_control[5] & status[7];   // ESPCTRL_ENABLE_INT & STAT_INT
 // SCSI disk target state
 //----------------------------------------------------------------------------
 
-reg        disk_present;
-reg        disk_ro;
-reg [31:0] img_blocks;           // disk size in 512 byte blocks
+reg        disk_present = 0;
+reg        disk_ro = 0;
+reg [31:0] img_blocks = 0;       // disk size in 512 byte blocks
 
 reg  [7:0] t_status;             // status byte for ICCS
 reg  [7:0] t_message;            // message byte for ICCS
@@ -121,12 +121,12 @@ reg [15:0] blockcounter;
 
 // disk geometry for mode sense page 4 (cylinders = blocks / (16*63),
 // rounded up; the head/sector fallback geometry of SCSI_GuessGeometry)
-reg [23:0] geo_cyl;
-reg [31:0] g_num;
-reg [31:0] g_rem;
-reg [23:0] g_quot;
-reg  [5:0] g_step;
-reg        g_run;
+reg [23:0] geo_cyl = 0;
+reg [31:0] g_num = 0;
+reg [31:0] g_rem = 0;
+reg [23:0] g_quot = 0;
+reg  [5:0] g_step = 0;
+reg        g_run = 0;
 
 //----------------------------------------------------------------------------
 // DMA channel (CHANNEL_SCSI)
@@ -185,6 +185,46 @@ localparam ESP_DELAY_US = 25'd100;
 
 reg [31:0] sd_lba_r;
 assign sd_lba = sd_lba_r;
+
+//----------------------------------------------------------------------------
+// disk image mount and geometry (cylinders = blocks/1008, rounded up,
+// by shift-subtract division).  Outside the reset: the mount pulse
+// fires once at OSD time, usually before the user resets the machine
+// into the new configuration.
+//----------------------------------------------------------------------------
+
+always @(posedge clk) begin
+	if (img_mounted) begin
+		disk_present <= (img_size != 0);
+		disk_ro <= img_readonly;
+		img_blocks <= img_size[40:9];
+		g_num <= img_size[40:9];
+		g_rem <= 0;
+		g_quot <= 0;
+		g_step <= 6'd32;
+		g_run <= 1;
+	end
+	else if (g_run) begin : geom
+		reg [31:0] top;
+		top = {g_rem[30:0], g_num[31]};
+		if (g_step != 0) begin
+			g_num <= {g_num[30:0], 1'b0};
+			if (top >= 32'd1008) begin
+				g_rem <= top - 32'd1008;
+				g_quot <= {g_quot[22:0], 1'b1};
+			end
+			else begin
+				g_rem <= top;
+				g_quot <= {g_quot[22:0], 1'b0};
+			end
+			g_step <= g_step - 1'd1;
+		end
+		else begin
+			geo_cyl <= (g_rem != 0) ? g_quot + 24'd1 : g_quot;
+			g_run <= 0;
+		end
+	end
+end
 
 // microsecond tick (a 1 MHz simulation clock degenerates to a tick
 // every cycle; keep the counter width legal for that case)
@@ -637,14 +677,9 @@ always @(posedge clk) begin
 		dma_status <= 0;
 		mode_dma <= 0;
 		phase <= PHASE_DO;
-		disk_present <= 0;
-		disk_ro <= 0;
-		img_blocks <= 0;
 		t_status <= 0; t_message <= 0; t_lun <= 0;
 		sense_code <= 0; sense_key <= 0; sense_valid <= 0; sense_info <= 0;
 		lba <= 0; blockcounter <= 0;
-		geo_cyl <= 0; g_run <= 0; g_step <= 0; g_rem <= 0; g_quot <= 0;
-		g_num <= 0;
 		d_csr <= 0;
 		d_next <= 0; d_limit <= 0; d_start <= 0; d_stop <= 0;
 		buf_pos <= 0; buf_limit <= 0; buf_disk <= 0;
@@ -667,41 +702,6 @@ always @(posedge clk) begin
 	else begin
 		tickcnt <= tick ? 1'd0 : tickcnt + 1'd1;
 		eng_we <= 0;
-
-		//------------------------------------------------------------
-		// disk image mount and geometry (cylinders = blocks/1008,
-		// rounded up, by shift-subtract division)
-		//------------------------------------------------------------
-		if (img_mounted) begin
-			disk_present <= (img_size != 0);
-			disk_ro <= img_readonly;
-			img_blocks <= img_size[40:9];
-			g_num <= img_size[40:9];
-			g_rem <= 0;
-			g_quot <= 0;
-			g_step <= 6'd32;
-			g_run <= 1;
-		end
-		else if (g_run) begin : geom
-			reg [31:0] top;
-			top = {g_rem[30:0], g_num[31]};
-			if (g_step != 0) begin
-				g_num <= {g_num[30:0], 1'b0};
-				if (top >= 32'd1008) begin
-					g_rem <= top - 32'd1008;
-					g_quot <= {g_quot[22:0], 1'b1};
-				end
-				else begin
-					g_rem <= top;
-					g_quot <= {g_quot[22:0], 1'b0};
-				end
-				g_step <= g_step - 1'd1;
-			end
-			else begin
-				geo_cyl <= (g_rem != 0) ? g_quot + 24'd1 : g_quot;
-				g_run <= 0;
-			end
-		end
 
 		//------------------------------------------------------------
 		// execution engine

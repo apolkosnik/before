@@ -57,17 +57,18 @@ next_system #(
 	.clk_vid(clk),   // both domains on one clock in simulation
 	.reset(reset),
 	.ps2_key(11'd0),
-	.img_mounted(1'b0),
+	.boot_sel(bootsd ? 2'd1 : 2'd0),
+	.img_mounted(img_mounted),
 	.img_readonly(1'b0),
-	.img_size(64'd0),
-	.sd_lba(),
-	.sd_rd(),
-	.sd_wr(),
-	.sd_ack(1'b0),
-	.sd_buff_addr(9'd0),
-	.sd_buff_dout(8'd0),
-	.sd_buff_din(),
-	.sd_buff_wr(1'b0),
+	.img_size(64'd1048576),
+	.sd_lba(sd_lba),
+	.sd_rd(sd_rd),
+	.sd_wr(sd_wr),
+	.sd_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din(sd_buff_din),
+	.sd_buff_wr(sd_buff_wr),
 
 	.rom_wr(1'b0),
 	.rom_waddr(17'd0),
@@ -358,10 +359,118 @@ task check;
 	end
 endtask
 
+//----------------------------------------------------------------------------
+// +bootsd: a 2048 block disk image on the SD model and the boot device
+// menu at Disk, to drive the ROM's SCSI boot path ("sd" boot command).
+// The image carries a byte pattern, not a real filesystem: the pass
+// criteria are that the ROM selects the disk, the target serves sector
+// reads and the DMA channel lands them in memory.
+//----------------------------------------------------------------------------
+
+reg        bootsd = 0;
+reg        img_mounted = 0;
+wire [31:0] sd_lba;
+wire        sd_rd, sd_wr;
+reg         sd_ack = 0;
+reg   [8:0] sd_buff_addr = 0;
+reg   [7:0] sd_buff_dout = 0;
+wire  [7:0] sd_buff_din;
+reg         sd_buff_wr = 0;
+
+reg  [7:0] disk [0:2048*512-1];
+
+function [7:0] dpat;
+	input [31:0] blk;
+	input [31:0] off;
+	begin
+		dpat = blk[7:0] ^ off[7:0] ^ {off[10:8], 5'd0};
+	end
+endfunction
+
+integer sdi;
+initial for (sdi = 0; sdi < 2048*512; sdi = sdi + 1)
+	disk[sdi] = dpat(sdi / 512, sdi % 512);
+
+reg sd_rd_act = 0, sd_wr_act = 0, sd_rphase = 0;
+integer sd_reads = 0;
+reg sd_lba0 = 0;
+
+always @(posedge clk) begin
+	if (sd_rd && !sd_ack) begin
+		sd_ack <= 1;
+		sd_rd_act <= 1;
+		sd_buff_addr <= 0;
+		sd_buff_wr <= 0;
+		sd_reads = sd_reads + 1;
+		if (sd_lba == 0) sd_lba0 <= 1;
+		$display("[%0t] BOOT: SD read lba %0d", $time, sd_lba);
+	end
+	else if (sd_ack && sd_rd_act) begin
+		if (!sd_buff_wr) begin
+			sd_buff_dout <= disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}];
+			sd_buff_wr <= 1;
+		end
+		else begin
+			sd_buff_wr <= 0;
+			if (sd_buff_addr == 9'd511) begin
+				sd_ack <= 0;
+				sd_rd_act <= 0;
+			end
+			else sd_buff_addr <= sd_buff_addr + 1'd1;
+		end
+	end
+	else if (sd_wr && !sd_ack) begin
+		sd_ack <= 1;
+		sd_wr_act <= 1;
+		sd_buff_addr <= 0;
+		sd_rphase <= 0;
+		$display("[%0t] BOOT: SD write lba %0d", $time, sd_lba);
+	end
+	else if (sd_ack && sd_wr_act) begin
+		if (sd_rphase) begin
+			disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
+			sd_rphase <= 0;
+			if (sd_buff_addr == 9'd511) begin
+				sd_ack <= 0;
+				sd_wr_act <= 0;
+			end
+			else sd_buff_addr <= sd_buff_addr + 1'd1;
+		end
+		else sd_rphase <= 1;
+	end
+end
+
+// ESP activity trace: selection commands and DMA writes to memory
+reg saw_esp_sel = 0;
+integer scsi_dma_writes = 0;
+reg [7:0] esp_cmd_d = 0;
+always @(posedge clk) if (!reset && bootsd) begin
+	if (dut.scsi.command0 != esp_cmd_d) begin
+		esp_cmd_d <= dut.scsi.command0;
+		if ((dut.scsi.command0 & 8'h7F) == 8'h41 ||
+		    (dut.scsi.command0 & 8'h7F) == 8'h42) begin
+			if (!saw_esp_sel)
+				$display("[%0t] BOOT: ESP select command %02x, target %0d",
+				         $time, dut.scsi.command0, dut.scsi.selectbusid[2:0]);
+			saw_esp_sel <= 1;
+		end
+	end
+	if (dut.sc_m_req && dut.sc_m_we && dut.sc_m_ack)
+		scsi_dma_writes = scsi_dma_writes + 1;
+end
+
 initial begin
 	if ($test$plusargs("dump")) begin
 		$dumpfile("build/tb_next_boot.vcd");
 		$dumpvars(0, tb_next_boot);
+	end
+
+	if ($test$plusargs("bootsd")) begin
+		bootsd = 1;
+		@(posedge clk);
+		img_mounted <= 1;
+		@(posedge clk);
+		img_mounted <= 0;
 	end
 
 	repeat (20) @(posedge clk);
@@ -383,6 +492,14 @@ initial begin
 	check(scr1_ok,      "SCR1 returned machine id 0x00012052");
 	check(seen_scr2_wr, "ROM wrote SCR2");
 	check(!dbg_halted,  "CPU not halted");
+
+	if (bootsd) begin
+		$display("SD reads: %0d, SCSI DMA words to memory: %0d",
+		         sd_reads, scsi_dma_writes);
+		check(saw_esp_sel, "boot: ROM selected the SCSI disk");
+		check(sd_lba0, "boot: sector 0 fetched from the SD image");
+		check(scsi_dma_writes >= 128, "boot: a full sector reached memory by DMA");
+	end
 
 	if (errors != 0 || $test$plusargs("iotrace")) dump_state;
 

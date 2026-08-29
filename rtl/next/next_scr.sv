@@ -40,6 +40,12 @@ module next_scr #(parameter CLK_HZ = 100000000)
 	// SCR1 value (machine id), default 25MHz Cube 040
 	input  [31:0] scr1,
 
+	// boot device menu: 0 = Auto (disk when an image is mounted, else
+	// the ROM default order), 1 = Disk, 2 = Network, 3 = ROM Default.
+	// Loaded into the NVRAM boot command on reset.
+	input   [1:0] boot_sel,
+	input         disk_mounted,
+
 	output        timer_ipl7,    // SCR2 byte 2 bit 7
 	output        led,           // SCR2 byte 3 bit 0
 	output        rom_overlay,   // SCR2 byte 3 bit 7 (not used by decode)
@@ -133,19 +139,41 @@ wire [3:0] rtc_bit_idx = 5'd16 - next_phase;
 wire       rtc_bit_out = rtc_is_write ? rtc_bit_in : rtc_val_cur[rtc_bit_idx[2:0]];
 
 integer i;
-initial begin
-	// nvram_default[] from Previous rtcnvram.c (valid checksum)
-	nvram[0]=8'h94; nvram[1]=8'h0f; nvram[2]=8'h40; nvram[3]=8'h00;
-	nvram[4]=8'h00; nvram[5]=8'h00; nvram[6]=8'h00; nvram[7]=8'h00;
-	nvram[8]=8'h00; nvram[9]=8'h00; nvram[10]=8'h00; nvram[11]=8'h00;
-	nvram[12]=8'h00; nvram[13]=8'h00; nvram[14]=8'h4b; nvram[15]=8'h00;
-	nvram[16]=8'h00; nvram[17]=8'h00;
-	for (i=18;i<30;i=i+1) nvram[i]=8'h00;
-	nvram[30]=8'h0F; nvram[31]=8'h13;
-end
+
+// effective boot device: 1 = SCSI disk ("sd"), 2 = ethernet ("en"),
+// 3 = empty boot command (the ROM walks its device table, network
+// first).  Auto picks the disk exactly when an image is mounted.
+wire [1:0] bootdev = (boot_sel == 2'd0) ? (disk_mounted ? 2'd1 : 2'd3)
+                                        : boot_sel;
+
+// nvram_default[] from Previous rtcnvram.c with the boot command from
+// the OSD (nvram_init() semantics) and the matching checksum: 16-bit
+// one's-complement sum over bytes 0-29, complemented, at bytes 30/31
+function automatic [7:0] nv_init;
+	input [4:0] i;
+	input [1:0] dev;
+	begin
+		case (i)
+			5'd0:  nv_init = 8'h94;
+			5'd1:  nv_init = 8'h0F;
+			5'd2:  nv_init = 8'h40;
+			5'd14: nv_init = 8'h4B;
+			5'd18: nv_init = (dev == 2'd1) ? "s" :
+			                 (dev == 2'd2) ? "e" : 8'h00;
+			5'd19: nv_init = (dev == 2'd1) ? "d" :
+			                 (dev == 2'd2) ? "n" : 8'h00;
+			5'd30: nv_init = (dev == 2'd1) ? 8'h6D :
+			                 (dev == 2'd2) ? 8'h7B : 8'hE0;
+			5'd31: nv_init = (dev == 2'd1) ? 8'h8B :
+			                 (dev == 2'd2) ? 8'h81 : 8'hEF;
+			default: nv_init = 8'h00;
+		endcase
+	end
+endfunction
 
 always @(posedge clk) begin
 	if (reset) begin
+		for (i = 0; i < 32; i = i + 1) nvram[i] <= nv_init(i[4:0], bootdev);
 		scr2_0 <= 8'h00;
 		scr2_1 <= 8'h00;
 		scr2_2 <= 8'h00;   // non-turbo reset values, SCR_Reset() in sysReg.c

@@ -8,6 +8,8 @@
 # behind the ram_* port, which is DDR3 on hardware.
 #
 #   ./run_tests.sh         device suites plus a 3 ms boot smoke test
+#   ./run_tests.sh bootsd  additionally boots with a mounted disk image
+#                          and checks the ROM's SCSI boot path
 #   ./run_tests.sh post    additionally runs the full power-on system
 #                          test to the "System test passed" path
 #                          (about 5 seconds of machine time)
@@ -93,6 +95,17 @@ if [ "${1:-}" = "post" ]; then
 		fail=1
 	else
 		grep -E "measured|passed path" "$WORK/tb_post.log" | tail -2
+	fi
+fi
+
+if [ "${1:-}" = "bootsd" ]; then
+	echo "--- SCSI boot path: POST plus disk boot (about 7 minutes) ---"
+	if ! "$WORK/vl_tb_next_boot/tb_next_boot" +bootsd +cycles=600000000 \
+		| tee "$WORK/tb_bootsd.log" | grep -q "boot: ROM selected the SCSI disk"; then
+		echo "*** SCSI boot path FAILED (see tb/$WORK/tb_bootsd.log)"
+		fail=1
+	else
+		grep -E "passed path|BOOT:|boot:" "$WORK/tb_bootsd.log" | head -12
 	fi
 fi
 
