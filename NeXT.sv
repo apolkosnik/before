@@ -190,7 +190,9 @@ wire [47:0] enet_mac;
 next_system #(
 	.CLK_HZ(50000000),
 	.CPU_PACE_NUM(2),
-	.CPU_PACE_DEN(2)
+	.CPU_PACE_DEN(2),
+	.CLK_REAL_HZ(28000000),   // the real clk_sys, for the time of day
+	.COLOR_FB(0)              // colour scan-out withheld until verified
 ) system
 (
 	.clk(clk_sys),
