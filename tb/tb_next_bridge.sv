@@ -21,6 +21,7 @@ reg clk = 0;
 always #5 clk = ~clk;
 
 reg reset = 1;
+reg bridge_enable = 0;
 
 // register access to the enet module
 reg         sel = 0;
@@ -69,7 +70,7 @@ next_enet_dma #(.CLK_HZ(1000000)) enet
 
 next_enet_bridge #(.CLK_HZ(1000000)) bridge
 (
-	.clk(clk), .reset(reset),
+	.clk(clk), .reset(reset), .enable(bridge_enable),
 	.btx_req(btx_req), .btx_len(btx_len), .btx_addr(btx_addr),
 	.btx_rd(btx_rd), .btx_q(btx_q), .btx_ack(btx_ack), .btx_done(btx_done),
 	.brx_start(brx_start), .brx_len(brx_len), .brx_valid(brx_valid),
@@ -199,7 +200,7 @@ integer errors = 0;
 
 task check;
 	input cond;
-	input [255:0] name;
+	input [511:0] name;
 	begin
 		if (cond) $display("PASS: %0s", name);
 		else begin $display("FAIL: %0s", name); errors = errors + 1; end
@@ -227,6 +228,12 @@ localparam MB_RXSLOT = 16'h2800;
 initial begin
 	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'h00000000;
 	for (i = 0; i < 8192; i = i + 1) ddr[i] = 64'h0;
+	// DDR survives a core reset.  Start with a valid-looking stale
+	// mailbox to prove Network=Off neither polls nor consumes it.
+	ddr[MB_MAGIC/8]  = 64'h4E58544554483031;
+	ddr[MB_TXWPTR/8] = 64'h1122334455667788;
+	ddr[MB_RXWPTR/8] = 64'h0102030405060708;
+	ddr[MB_RXRPTR/8] = 64'h8877665544332211;
 
 	// transmit frame: some destination, payload pattern
 	for (i = 0; i < PKT_LEN; i = i + 1)
@@ -236,7 +243,16 @@ initial begin
 	reset = 0;
 	repeat (30) @(posedge clk);
 
-	check(ddr[MB_MAGIC/8] == 64'h4E58544554483031, "magic written at reset");
+	check(!eb_req, "Network Off mailbox is idle");
+	check(ddr[MB_MAGIC/8] == 0 && ddr[MB_TXWPTR/8] == 0 &&
+	      ddr[MB_RXWPTR/8] == 0 && ddr[MB_RXRPTR/8] == 0,
+	      "Network Off invalidates stale ring");
+
+	bridge_enable = 1;
+	repeat (80) @(posedge clk);
+	check(ddr[MB_MAGIC/8] == 64'h4E58544554483031, "enable publishes mailbox magic");
+	check(ddr[MB_TXWPTR/8] == 0 && ddr[MB_RXWPTR/8] == 0 &&
+	      ddr[MB_RXRPTR/8] == 0, "enable clears stale pointers");
 
 	// station MAC and modes; loopback DISABLED (DIS_LOOP set)
 	wr8(15'h6008, 8'h00); wr8(15'h6009, 8'h00); wr8(15'h600a, 8'h0f);
@@ -334,6 +350,18 @@ initial begin
 	check(ddr[MB_RXRPTR/8] == 64'd3, "ring consumed while in loopback");
 	rd8(15'h6002, v);
 	check(!v[7], "no delivery while in loopback (wire disconnected)");
+
+	// Turning networking off invalidates the mailbox and then becomes
+	// completely quiescent.  Re-enabling starts a fresh empty generation.
+	bridge_enable = 0;
+	repeat (80) @(posedge clk);
+	check(!eb_req && ddr[MB_MAGIC/8] == 0,
+	      "disable invalidates and quiesces");
+	bridge_enable = 1;
+	repeat (80) @(posedge clk);
+	check(ddr[MB_MAGIC/8] == 64'h4E58544554483031 &&
+	      ddr[MB_TXWPTR/8] == 0 && ddr[MB_RXWPTR/8] == 0 &&
+	      ddr[MB_RXRPTR/8] == 0, "re-enable starts an empty ring");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

@@ -346,6 +346,7 @@ next_enet_bridge #(.CLK_HZ(32000000)) enet_bridge
 (
 	.clk(clk_sys),
 	.reset(reset),
+	.enable(|status[54:52]),
 
 	.btx_req(btx_req),
 	.btx_len(btx_len),
