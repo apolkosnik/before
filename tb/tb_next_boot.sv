@@ -564,11 +564,23 @@ always @(posedge clk) if (!reset) begin
 	// the MMU walker just latched an invalid descriptor: report the
 	// faulting VA, the descriptor chain, and freeze a screen
 	wst_d <= dut.cpu.mmu.wst;
-	if (dut.cpu.mmu.wst == W_FLT_ST && wst_d != W_FLT_ST && !dut.cpu.mmu.w_pt) begin
+	if (dut.cpu.mmu.wst == W_FLT_ST && wst_d != W_FLT_ST && !dut.cpu.mmu.w_pt) begin : mmufault
+		reg [31:0] da;
+		reg [31:0] memword;
 		faults_seen = faults_seen + 1;
-		$display("[%0t] MMU FAULT #%0d: VA=%08x super=%b instr=%b desc=%08x @%08x",
+		da = dut.cpu.mmu.w_desc_addr;
+		// what the tb RAM actually holds at the faulting descriptor
+		// address (walker reads via next_system's [25:2] word index)
+		memword = ram_mem[da[25:2]];
+		$display("[%0t] MMU FAULT #%0d: VA=%08x super=%b instr=%b",
 		         $time, faults_seen, dut.cpu.mmu.w_la, dut.cpu.mmu.w_super,
-		         dut.cpu.mmu.f_bank, dut.cpu.mmu.w_desc, dut.cpu.mmu.w_desc_addr);
+		         dut.cpu.mmu.f_bank);
+		$display("    faulting descriptor: value=%08x read-from=%08x  mem[@]=%08x  %s",
+		         dut.cpu.mmu.w_desc, da, memword,
+		         (dut.cpu.mmu.w_desc === memword) ? "(walker read matches memory)"
+		                                          : "(MISMATCH: walker read != memory)");
+		$display("    srp=%08x urp=%08x tc=%08x",
+		         dut.cpu.mmu.srp, dut.cpu.mmu.urp, dut.cpu.mmu.tc);
 		if (dut.cpu.mmu.w_la[31:24] == 8'h3c) begin
 			dump_walk_ring;
 			$display("[%0t] BOOT: the panic fault reproduced", $time);
@@ -670,16 +682,22 @@ initial begin
 	check(seen_scr2_wr, "ROM wrote SCR2");
 	check(!dbg_halted,  "CPU not halted");
 
-	// the host time of day reached the clock through the system
-	// wiring and survived the machine coming out of reset
-	$display("clock: %02x:%02x %02x/%02x/%02x",
+	// The host time of day reached the clock through the system wiring
+	// and survived the machine coming out of reset.  Only meaningful
+	// before a guest takes the clock over: NeXTSTEP sets its own time
+	// during startup (and writing year 0xB2 for 2012 is how the kernel
+	// confirmed the decade-overflow encoding we use).
+	$display("clock: %02x:%02x %02x/%02x/%02x guest_set=%b",
 	         dut.scr.t_hour, dut.scr.t_min,
-	         dut.scr.t_month, dut.scr.t_mday, dut.scr.t_year);
-	check(dut.scr.t_hour == 8'h21 && dut.scr.t_min == 8'h47,
-	      "host time of day reached the RTC");
-	check(dut.scr.t_mday == 8'h28 && dut.scr.t_month == 8'h08 &&
-	      dut.scr.t_year == 8'hC6,
-	      "host date reached the RTC (2026 as 0xC6)");
+	         dut.scr.t_month, dut.scr.t_mday, dut.scr.t_year,
+	         dut.scr.guest_set);
+	if (!dut.scr.guest_set) begin
+		check(dut.scr.t_hour == 8'h21 && dut.scr.t_min == 8'h47,
+		      "host time of day reached the RTC");
+		check(dut.scr.t_mday == 8'h28 && dut.scr.t_month == 8'h08 &&
+		      dut.scr.t_year == 8'hC6,
+		      "host date reached the RTC (2026 as 0xC6)");
+	end
 
 	if (bootsd) begin
 		$display("SD reads: %0d, SCSI DMA words to memory: %0d",
