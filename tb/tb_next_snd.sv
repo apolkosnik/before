@@ -36,12 +36,14 @@ wire int_snd_ovrun, int_snd_out_dma;
 next_kms_snd #(.CLK_HZ(1000000)) dut
 (
 	.clk(clk), .reset(reset),
+	.ps2_key(11'd0),
 	.sel_kms(sel_kms), .sel_csr(sel_csr), .sel_sptr(sel_sptr),
 	.sel_ptr(sel_ptr), .sel_ini(sel_ini),
 	.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
 	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
-	.int_snd_ovrun(int_snd_ovrun), .int_snd_out_dma(int_snd_out_dma)
+	.int_snd_ovrun(int_snd_ovrun), .int_snd_out_dma(int_snd_out_dma),
+	.int_keymouse()
 );
 
 // simple RAM ack

@@ -540,8 +540,13 @@ always @(posedge clk) begin
 				brx_pos <= brx_pos + 1'd1;
 			end
 			if (brx_pos >= brx_len) begin
-				// enet_receive(): filter and queue for RX DMA delivery
-				if (pkt_for_me) begin
+				// enet_receive(): filter and queue for RX DMA delivery.
+				// In loopback state the machine is disconnected from the
+				// wire (enet_state() in ethernet.c): the frame is
+				// consumed from the bridge but discarded, which keeps
+				// the boot ROM's quiet-network and address-filter test
+				// phases deterministic on a live LAN.
+				if (pkt_for_me && !loopback) begin
 					tx_status <= tx_status | TXSTAT_NET_BUSY;
 					rx_len <= (({1'b0, brx_pos} < 12'd60) ? 12'd60 : {1'b0, brx_pos}) + 12'd4;
 					rx_pos <= 0;

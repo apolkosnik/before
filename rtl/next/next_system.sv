@@ -47,6 +47,7 @@ module next_system #(
 )
 (
 	input         clk,            // system clock: CPU, devices, RAM
+	input  [10:0] ps2_key,       // MiSTer keyboard events (to the KMS)
 	input         clk_vid,        // video clock: scan-out (100 MHz for
 	                              // the 1600x912 pixel timing)
 	input         reset,          // active high, synchronous
@@ -144,7 +145,7 @@ wire [23:0] sn_m_addr;
 wire  [3:0] sn_m_be;
 wire [31:0] sn_m_din;
 wire        sn_m_ack;
-wire        int_snd_ovrun, int_snd_out_dma;
+wire        int_snd_ovrun, int_snd_out_dma, int_keymouse;
 
 wire  [2:0] ipl_level;
 
@@ -653,6 +654,7 @@ next_kms_snd #(.CLK_HZ(CLK_HZ)) kms_snd
 (
 	.clk(clk),
 	.reset(dev_reset),
+	.ps2_key(ps2_key),
 	.sel_kms(io_kms),
 	.sel_csr(io_sn_csr),
 	.sel_sptr(io_sn_sptr),
@@ -671,7 +673,8 @@ next_kms_snd #(.CLK_HZ(CLK_HZ)) kms_snd
 	.m_dout(ram_dout),
 	.m_ack(sn_m_ack),
 	.int_snd_ovrun(int_snd_ovrun),
-	.int_snd_out_dma(int_snd_out_dma)
+	.int_snd_out_dma(int_snd_out_dma),
+	.int_keymouse(int_keymouse)
 );
 
 // SCSI controller
@@ -719,7 +722,7 @@ next_bmap bmap
 
 // interrupt controller
 reg soft1_d, soft2_d, scsi_d;
-reg entx_d, enrx_d, entxd_d, enrxd_d, disk_d, diskd_d, sndo_d, sndd_d;
+reg entx_d, enrx_d, entxd_d, enrxd_d, disk_d, diskd_d, sndo_d, sndd_d, km_d;
 always @(posedge clk) begin
 	soft1_d <= softint1;
 	soft2_d <= softint2;
@@ -732,11 +735,13 @@ always @(posedge clk) begin
 	diskd_d <= int_disk_dma;
 	sndo_d  <= int_snd_ovrun;
 	sndd_d  <= int_snd_out_dma;
+	km_d    <= int_keymouse;
 end
 
 wire [31:0] int_set =
 	(32'd1  & {31'd0,  softint1 & ~soft1_d}) |
 	({31'd0, softint2 & ~soft2_d} << 1) |
+	({31'd0, int_keymouse & ~km_d} << 3) |
 	({31'd0, vid_int_set} << 5) |
 	({31'd0, int_snd_ovrun & ~sndo_d} << 8) |
 	({31'd0, int_en_rx & ~enrx_d} << 9) |
@@ -752,6 +757,7 @@ wire [31:0] int_set =
 wire [31:0] int_clr =
 	({31'd0, ~softint1 & soft1_d}) |
 	({31'd0, ~softint2 & soft2_d} << 1) |
+	({31'd0, ~int_keymouse & km_d} << 3) |
 	({31'd0, vid_int_clr} << 5) |
 	({31'd0, ~int_snd_ovrun & sndo_d} << 8) |
 	({31'd0, ~int_en_rx & enrx_d} << 9) |

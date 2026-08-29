@@ -56,6 +56,7 @@ next_system #(
 	.clk(clk),
 	.clk_vid(clk),   // both domains on one clock in simulation
 	.reset(reset),
+	.ps2_key(11'd0),
 
 	.rom_wr(1'b0),
 	.rom_waddr(17'd0),

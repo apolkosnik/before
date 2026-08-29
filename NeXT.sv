@@ -164,6 +164,8 @@ next_system #(
 	.clk_vid(clk_vid),
 	.reset(reset),
 
+	.ps2_key(ps2_key),
+
 	.rom_wr(ioctl_wr & rom_download),
 	.rom_waddr(ioctl_addr[16:0]),
 	.rom_wdata(ioctl_dout),

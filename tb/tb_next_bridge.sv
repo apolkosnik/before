@@ -314,6 +314,27 @@ initial begin
 	rd8(15'h6002, v);
 	check(!v[7], "mismatched frame filtered (no PKT_OK)");
 
+	// with loopback enabled the machine is off the wire: a bridge frame
+	// must be consumed from the ring but never delivered (the boot ROM's
+	// self-test phases depend on this on a live LAN)
+	wr8(15'h6002, 8'h8f);
+	wr8(15'h6004, 8'h00);        // loopback on (DIS_LOOP clear)
+	wr32(15'h0150, 32'h00380000);
+	wr32(15'h4350, RX_BASE + 32'h1000);
+	wr32(15'h4154, RX_BASE + 32'h1000 + 32'd104);
+	wr32(15'h0150, 32'h00050000);
+	ddr_set_byte(MB_RXSLOT + 16'h1000 + 8 + 0, 8'hff);
+	for (i = 1; i < 6; i = i + 1) ddr_set_byte(MB_RXSLOT + 16'h1000 + 8 + i, 8'hff);
+	for (i = 6; i < PKT_LEN; i = i + 1) ddr_set_byte(MB_RXSLOT + 16'h1000 + 8 + i, i[7:0]);
+	ddr[(MB_RXSLOT + 16'h1000)/8] = {53'd0, 11'd100};
+	ddr[MB_RXWPTR/8] = 64'd3;
+
+	repeat (12000) @(posedge clk);
+
+	check(ddr[MB_RXRPTR/8] == 64'd3, "ring consumed while in loopback");
+	rd8(15'h6002, v);
+	check(!v[7], "no delivery while in loopback (wire disconnected)");
+
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);
 	$finish;
