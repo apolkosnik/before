@@ -78,12 +78,12 @@ reg  [7:0] clkctrl;              // reg 0x31
 reg  [7:0] intctrl;              // reg 0x32
 
 // time of day, BCD (date part is static, see docs/PORTING.md)
-reg  [7:0] t_sec, t_min, t_hour;
-reg  [7:0] t_wday, t_mday, t_month, t_year;
+reg  [7:0] t_sec = 8'h00, t_min = 8'h00, t_hour = 8'h00;
+reg  [7:0] t_wday = 8'h01, t_mday = 8'h01, t_month = 8'h01, t_year = 8'h00;
 
 // one second tick
 localparam integer SEC_DIV = CLK_HZ;
-reg [$clog2(SEC_DIV)-1:0] sec_presc;
+reg [$clog2(SEC_DIV)-1:0] sec_presc = 0;
 wire sec_tick = (sec_presc == SEC_DIV-1);
 
 function [7:0] bcd_inc;
@@ -197,6 +197,24 @@ always @(posedge clk) begin
 	if (bootdev != bootdev_d)
 		for (i = 0; i < 32; i = i + 1) nvram[i] <= nv_init(i[4:0], bootdev);
 
+	// The time of day keeps counting across a reset.  dev_reset carries
+	// the CPU's RESET instruction, and the ROM's clock test waits up to
+	// 1100 milliseconds for the seconds register to change: restarting
+	// the prescaler on every RESET stops it ever getting there, which
+	// is POST error 91.
+	sec_presc <= sec_tick ? 1'd0 : sec_presc + 1'd1;
+	if (sec_tick) begin
+		if (t_sec == 8'h59) begin
+			t_sec <= 0;
+			if (t_min == 8'h59) begin
+				t_min <= 0;
+				t_hour <= (t_hour == 8'h23) ? 8'h00 : bcd_inc(t_hour);
+			end
+			else t_min <= bcd_inc(t_min);
+		end
+		else t_sec <= bcd_inc(t_sec);
+	end
+
 	if (reset) begin
 		scr2_0 <= 8'h00;
 		scr2_1 <= 8'h00;
@@ -207,9 +225,6 @@ always @(posedge clk) begin
 		rtc_val <= 0;
 		clkctrl <= 8'h00;
 		intctrl <= 8'h00;
-		t_sec <= 8'h00; t_min <= 8'h00; t_hour <= 8'h00;
-		t_wday <= 8'h01; t_mday <= 8'h01; t_month <= 8'h01; t_year <= 8'h00;
-		sec_presc <= 0;
 	end
 	else begin
 

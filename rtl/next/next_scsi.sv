@@ -198,6 +198,7 @@ reg [31:0] word_buf;
 reg  [2:0] do_rem;               // bytes left to unpack from a DMA word
 
 reg        flp_active;         // a floppy sector is in flight
+reg        flp_req_d;          // for the rising edge of a sector request
 reg [24:0] dly_us;               // interrupt delay countdown
 localparam ESP_DELAY_US = 25'd100;
 
@@ -742,6 +743,7 @@ always @(posedge clk) begin
 		rd_ret <= 0; sd_ret <= 0; pad_mode <= 0;
 		gap_us <= 0;
 		flp_active <= 0;
+		flp_req_d <= 0;
 		flp_done <= 0;
 		word_cnt <= 0; word_buf <= 0; do_rem <= 0;
 		dly_us <= 0;
@@ -757,8 +759,13 @@ always @(posedge clk) begin
 		flp_done <= 0;
 		if (tick && gap_us != 0) gap_us <= gap_us - 1'd1;
 
-		// the floppy asks for the channel while the ESP is idle
-		if (flp_select && flp_req && !flp_active && (xst == X_IDLE)) begin
+		// The floppy asks for the channel while the ESP is idle.  It must
+		// be a fresh request: the drive holds dma_req up until it sees
+		// the sector completed, so a level test restarts the channel on
+		// the buffer it has just handed over, before the next sector has
+		// been loaded into it.
+		flp_req_d <= flp_req;
+		if (flp_select && flp_req && !flp_req_d && !flp_active && (xst == X_IDLE)) begin
 			flp_active <= 1;
 			buf_pos    <= 0;
 			buf_limit  <= flp_len[9:0];

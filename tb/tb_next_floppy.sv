@@ -160,6 +160,10 @@ integer   moved = 0;
 task run_channel;
 	integer k;
 	begin
+		// wait for any previous request to be retired first, or a
+		// multi-sector transfer reads the buffer while the next sector
+		// is still being loaded into it
+		while (dma_req) @(posedge clk);
 		while (!dma_req) @(posedge clk);
 		if (dma_wr) begin
 			for (k = 0; k < buf_len; k = k + 1) begin
@@ -289,6 +293,37 @@ initial begin
 	check(v[7], "result: end of cylinder");
 	for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
 	check(!int_floppy, "reading the result clears the interrupt");
+
+	// A driver reads whole tracks, not single sectors: R=1 through
+	// EOT=18, which is the path that reports a sector number when it
+	// goes wrong.
+	wr8(4'h5, 8'h46);
+	wr8(4'h5, 8'h00);       // drive 0, head 0
+	wr8(4'h5, 8'h00);       // C
+	wr8(4'h5, 8'h00);       // H
+	wr8(4'h5, 8'h01);       // R = 1
+	wr8(4'h5, 8'h02);       // N = 512
+	wr8(4'h5, 8'd18);       // EOT = 18
+	wr8(4'h5, 8'h1B);
+	wr8(4'h5, 8'hFF);
+
+	bad = 0;
+	for (i = 0; i < 18; i = i + 1) begin
+		run_channel;
+		if (host[0] !== pat(i, 0) || host[511] !== pat(i, 511)) begin
+			if (bad < 3)
+				$display("  track sector %0d: first %02x want %02x, last %02x want %02x",
+				         i + 1, host[0], pat(i, 0), host[511], pat(i, 511));
+			bad = bad + 1;
+		end
+	end
+	check(bad == 0, "a whole track reads back, all 18 sectors in order");
+
+	repeat (400) @(posedge clk);
+	check(int_floppy, "the track read finishes with an interrupt");
+	rd8(4'h5, v);
+	$display("  track result ST0 = %02x", v);
+	for (i = 0; i < 6; i = i + 1) rd8(4'h5, v);
 
 	// WRITE one sector to cylinder 0, head 1, sector 3
 	for (i = 0; i < 512; i = i + 1) host[i] = 8'hA0 + i[7:0];

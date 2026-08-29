@@ -53,6 +53,7 @@ vbuild tb_next_rtc       tb_next_rtc.sv $RTL/next_scr.sv
 vbuild tb_next_scc       tb_next_scc.sv $RTL/next_scc.sv
 vbuild tb_next_esp       tb_next_esp.sv $RTL/next_scsi.sv
 vbuild tb_next_floppy    tb_next_floppy.sv $RTL/next_floppy.sv
+vbuild tb_next_flpdma    tb_next_flpdma.sv $RTL/next_floppy.sv $RTL/next_scsi.sv
 vbuild tb_next_scsi      tb_next_scsi.sv $RTL/next_scsi.sv
 vbuild tb_next_enet      tb_next_enet.sv $RTL/next_enet_dma.sv
 vbuild tb_next_bridge    tb_next_bridge.sv $RTL/next_enet_dma.sv $RTL/next_enet_bridge.sv
@@ -93,6 +94,7 @@ run tb_scc       "$WORK/vl_tb_next_scc/tb_next_scc"
 run tb_esp       "$WORK/vl_tb_next_esp/tb_next_esp"
 run tb_scsi      "$WORK/vl_tb_next_scsi/tb_next_scsi"
 run tb_floppy    "$WORK/vl_tb_next_floppy/tb_next_floppy"
+run tb_flpdma    "$WORK/vl_tb_next_flpdma/tb_next_flpdma"
 run tb_enet      "$WORK/vl_tb_next_enet/tb_next_enet"
 run tb_bridge    "$WORK/vl_tb_next_bridge/tb_next_bridge"
 run tb_rs        "$WORK/vl_tb_next_rs/tb_next_rs"

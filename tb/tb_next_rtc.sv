@@ -37,7 +37,8 @@ reg   [1:0] be = 0;
 reg  [15:0] wdata = 0;
 wire [15:0] rdata;
 
-next_scr #(.CLK_HZ(100000000)) dut
+// CLK_HZ of 1000 puts a clock second within reach of a simulation
+next_scr #(.CLK_HZ(1000)) dut
 (
 	.clk(clk), .reset(reset),
 	.sel(sel), .reg_id(reg_id), .addr1(addr1), .we(we), .be(be),
@@ -244,6 +245,23 @@ initial begin
 	rtc_stop;
 	check(wb == 8'h5A, "an NVRAM byte survives a reset");
 
+
+	// The ROM's clock test waits up to 1100 ms for the seconds register
+	// to change, and the reset it competes with carries the CPU's RESET
+	// instruction.  A clock restarted by that never ticks: POST 91.
+	rtc_send_byte(8'h20);
+	rtc_recv_byte(r_sec);
+	rtc_stop;
+	repeat (400) @(posedge clk);
+	reset = 1;                    // a RESET instruction lands mid-second
+	repeat (5) @(posedge clk);
+	reset = 0;
+	repeat (900) @(posedge clk);  // past one clock second in total
+	rtc_send_byte(8'h20);
+	rtc_recv_byte(r_min);
+	rtc_stop;
+	$display("seconds %02x -> %02x across a reset", r_sec, r_min);
+	check(r_min != r_sec, "the seconds keep counting across a reset");
 
 	// boot device menu variants
 	boot_variant(3'd0, 1'b0);    // Auto, no disk: empty command
