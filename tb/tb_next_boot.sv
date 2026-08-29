@@ -58,7 +58,7 @@ next_system #(
 	.reset(reset),
 	.ps2_key(11'd0),
 	.boot_sel(bootsd ? 2'd1 : 2'd0),
-	.hps_rtc(65'd0),
+	.hps_rtc(hps_rtc),
 	.img_mounted(img_mounted),
 	.img_readonly(1'b0),
 	.img_size(64'd1048576),
@@ -368,6 +368,22 @@ endtask
 // reads and the DMA channel lands them in memory.
 //----------------------------------------------------------------------------
 
+// host time of day, delivered the way hps_io does it: the data words
+// land first and the toggle flips at the end of the transfer
+reg [64:0] hps_rtc = 0;
+
+task host_time;
+	input [7:0] sec, min, hour, mday, month, year;
+	input [3:0] wday;
+	begin
+		@(posedge clk);
+		hps_rtc[63:0] <= {8'h40, {4'd0, wday}, year, month, mday, hour, min, sec};
+		@(posedge clk);
+		hps_rtc[64] <= ~hps_rtc[64];
+		repeat (4) @(posedge clk);
+	end
+endtask
+
 reg        bootsd = 0;
 reg        img_mounted = 0;
 wire [31:0] sd_lba;
@@ -474,6 +490,10 @@ initial begin
 		img_mounted <= 0;
 	end
 
+	// the host clock arrives before the machine leaves reset, exactly
+	// as Main sends it at core load
+	host_time(8'h30, 8'h47, 8'h21, 8'h28, 8'h08, 8'h26, 4'd5);
+
 	repeat (20) @(posedge clk);
 	reset = 0;
 
@@ -493,6 +513,17 @@ initial begin
 	check(scr1_ok,      "SCR1 returned machine id 0x00012052");
 	check(seen_scr2_wr, "ROM wrote SCR2");
 	check(!dbg_halted,  "CPU not halted");
+
+	// the host time of day reached the clock through the system
+	// wiring and survived the machine coming out of reset
+	$display("clock: %02x:%02x %02x/%02x/%02x",
+	         dut.scr.t_hour, dut.scr.t_min,
+	         dut.scr.t_month, dut.scr.t_mday, dut.scr.t_year);
+	check(dut.scr.t_hour == 8'h21 && dut.scr.t_min == 8'h47,
+	      "host time of day reached the RTC");
+	check(dut.scr.t_mday == 8'h28 && dut.scr.t_month == 8'h08 &&
+	      dut.scr.t_year == 8'hC6,
+	      "host date reached the RTC (2026 as 0xC6)");
 
 	if (bootsd) begin
 		$display("SD reads: %0d, SCSI DMA words to memory: %0d",
