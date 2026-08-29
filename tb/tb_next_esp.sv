@@ -31,7 +31,7 @@ wire [15:0] rdata;
 next_scsi #(.CLK_HZ(1000000)) dut
 (
 	.clk(clk), .reset(reset),
-	.sel_esp(sel), .sel_csr(1'b0), .sel_ptr(1'b0), .sel_ini(1'b0),
+	.sel_esp(sel), .sel_csr(1'b0), .sel_sptr(1'b0), .sel_ptr(1'b0), .sel_ini(1'b0),
 	.addr(addr), .we(we), .be(be),
 	.wdata(wdata), .rdata(rdata),
 	.m_req(), .m_we(), .m_addr(), .m_be(), .m_din(),

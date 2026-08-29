@@ -24,6 +24,7 @@ module next_scsi #(parameter CLK_HZ = 50000000)
 
 	input         sel_esp,
 	input         sel_csr,
+	input         sel_sptr,      // saved next/limit/start/stop
 	input         sel_ptr,
 	input         sel_ini,
 	input   [5:0] addr,          // byte offset within the selected block
@@ -134,6 +135,9 @@ reg        g_run = 0;
 
 reg  [7:0] d_csr;
 reg [31:0] d_next, d_limit, d_start, d_stop;
+// saved registers: plain storage on the non-turbo board (the engine
+// never writes them, DMA_Saved_*_Read/Write in dma.c)
+reg [31:0] s_next, s_limit, s_start, s_stop;
 
 assign int_scsi_dma = d_csr[3];
 
@@ -182,6 +186,17 @@ reg  [2:0] do_rem;               // bytes left to unpack from a DMA word
 
 reg [24:0] dly_us;               // interrupt delay countdown
 localparam ESP_DELAY_US = 25'd100;
+
+// DMA pacing, matching the reference emulator: the first memory pass
+// of a transfer waits a seek/sector time, and after every channel
+// limit event (buffer complete, chain swap) the next pass waits the
+// ESP_IO tick.  This is what gives the driver time to service the
+// complete interrupt and program the next chain segment before data
+// flows again; without it the engine outruns the CPU and fills a
+// swapped-in buffer whose start/stop the driver has not refreshed yet.
+localparam SECTOR_US = 9'd350;    // SCSI_SECTOR_TIME_HD
+localparam GAP_US    = 9'd100;    // ESP_IO tick
+reg  [8:0] gap_us;
 
 reg [31:0] sd_lba_r;
 assign sd_lba = sd_lba_r;
@@ -260,8 +275,13 @@ wire [31:0] ptr_q = (addr[3:2] == 2'd0) ? d_next :
                     (addr[3:2] == 2'd1) ? d_limit :
                     (addr[3:2] == 2'd2) ? d_start : d_stop;
 
+wire [31:0] sptr_q = (addr[3:2] == 2'd0) ? s_next :
+                     (addr[3:2] == 2'd1) ? s_limit :
+                     (addr[3:2] == 2'd2) ? s_start : s_stop;
+
 assign rdata = sel_esp ? {`ESP_READ(a_even), `ESP_READ(a_odd)} :
                sel_csr ? (addr[1] ? 16'h0000 : {d_csr, 8'h00}) :
+               sel_sptr ? (addr[1] ? sptr_q[15:0] : sptr_q[31:16]) :
                sel_ptr ? (addr[1] ? ptr_q[15:0] : ptr_q[31:16]) :
                sel_ini ? (addr[1] ? d_next[15:0] : d_next[31:16]) : 16'h0000;
 
@@ -595,6 +615,7 @@ task automatic reg_write;
 						if (v[7]) begin
 							pad_mode <= 0;
 							word_cnt <= 0;
+							gap_us <= SECTOR_US;
 							xst <= (phase == PHASE_DI) ? X_DI_CHK :
 							       (phase == PHASE_DO) ? X_DO_CHK : X_IDLE;
 						end
@@ -618,6 +639,12 @@ task automatic reg_write;
 						       (phase == PHASE_DO) ? X_DO_CHK : X_IDLE;
 					end
 					7'h41, 7'h42: begin       // select without/with ATN
+						// a select aborts whatever transfer state was
+						// left behind, including an in-flight memory
+						// request
+						m_req <= 0;
+						sd_rd <= 0;
+						sd_wr <= 0;
 						seqstep <= 8'h00;
 						sel_atn <= v[1];
 						cdb_n <= 0;
@@ -682,6 +709,7 @@ always @(posedge clk) begin
 		lba <= 0; blockcounter <= 0;
 		d_csr <= 0;
 		d_next <= 0; d_limit <= 0; d_start <= 0; d_stop <= 0;
+		s_next <= 0; s_limit <= 0; s_start <= 0; s_stop <= 0;
 		buf_pos <= 0; buf_limit <= 0; buf_disk <= 0;
 		fill_idx <= 0; fill_kind <= R_INQ;
 		ms_page <= 0; ms_ctl <= 0; ms_hdr <= 0; ms_total <= 0;
@@ -691,6 +719,7 @@ always @(posedge clk) begin
 		cdb5 <= 0; cdb6 <= 0; cdb7 <= 0; cdb8 <= 0; cdb9 <= 0;
 		cdb_n <= 0;
 		rd_ret <= 0; sd_ret <= 0; pad_mode <= 0;
+		gap_us <= 0;
 		word_cnt <= 0; word_buf <= 0; do_rem <= 0;
 		dly_us <= 0;
 		sd_lba_r <= 0;
@@ -702,6 +731,7 @@ always @(posedge clk) begin
 	else begin
 		tickcnt <= tick ? 1'd0 : tickcnt + 1'd1;
 		eng_we <= 0;
+		if (tick && gap_us != 0) gap_us <= gap_us - 1'd1;
 
 		//------------------------------------------------------------
 		// execution engine
@@ -1034,7 +1064,7 @@ always @(posedge clk) begin
 		// of the transfer goes out with byte enables
 		X_DI_WR: begin
 			if (!m_req) begin
-				if (d_csr[0] && d_next < d_limit) begin
+				if (d_csr[0] && d_next < d_limit && gap_us == 0) begin
 					m_req <= 1;
 					m_we <= 1;
 					m_addr <= d_next[25:2];
@@ -1050,9 +1080,12 @@ always @(posedge clk) begin
 				m_req <= 0;
 				d_next <= d_next + 3'd4;
 				word_cnt <= 0;
-				// dma_interrupt(CHANNEL_SCSI)
+				// dma_interrupt(CHANNEL_SCSI): the pause before data
+				// flows into the swapped buffer is the driver's window
+				// to program the next chain segment
 				if (d_next + 3'd4 == d_limit) begin
 					d_csr[3] <= 1;
+					gap_us <= GAP_US;
 					if (d_csr[1]) begin
 						d_next <= d_start;
 						d_limit <= d_stop;
@@ -1090,7 +1123,7 @@ always @(posedge clk) begin
 
 		X_DO_RD: begin
 			if (!m_req) begin
-				if (d_csr[0] && d_next < d_limit) begin
+				if (d_csr[0] && d_next < d_limit && gap_us == 0) begin
 					m_req <= 1;
 					m_we <= 0;
 					m_addr <= d_next[25:2];
@@ -1104,6 +1137,7 @@ always @(posedge clk) begin
 				d_next <= d_next + 3'd4;
 				if (d_next + 3'd4 == d_limit) begin
 					d_csr[3] <= 1;
+					gap_us <= GAP_US;
 					if (d_csr[1]) begin
 						d_next <= d_start;
 						d_limit <= d_stop;
@@ -1204,6 +1238,15 @@ always @(posedge clk) begin
 			if (csr_or[1]) d_csr[1] <= 1;                   // SETSUPDATE
 			if (csr_or[0]) d_csr[0] <= 1;                   // SETENABLE
 			if (csr_or[3]) d_csr[3] <= 0;                   // CLRCOMPLETE
+		end
+
+		if (sel_sptr & we) begin
+			case (addr[3:2])
+				2'd0: begin if (!addr[1]) begin if (be[1]) s_next[31:24] <= wdata[15:8]; if (be[0]) s_next[23:16] <= wdata[7:0]; end else begin if (be[1]) s_next[15:8] <= wdata[15:8]; if (be[0]) s_next[7:0] <= wdata[7:0]; end end
+				2'd1: begin if (!addr[1]) begin if (be[1]) s_limit[31:24] <= wdata[15:8]; if (be[0]) s_limit[23:16] <= wdata[7:0]; end else begin if (be[1]) s_limit[15:8] <= wdata[15:8]; if (be[0]) s_limit[7:0] <= wdata[7:0]; end end
+				2'd2: begin if (!addr[1]) begin if (be[1]) s_start[31:24] <= wdata[15:8]; if (be[0]) s_start[23:16] <= wdata[7:0]; end else begin if (be[1]) s_start[15:8] <= wdata[15:8]; if (be[0]) s_start[7:0] <= wdata[7:0]; end end
+				2'd3: begin if (!addr[1]) begin if (be[1]) s_stop[31:24] <= wdata[15:8]; if (be[0]) s_stop[23:16] <= wdata[7:0]; end else begin if (be[1]) s_stop[15:8] <= wdata[15:8]; if (be[0]) s_stop[7:0] <= wdata[7:0]; end end
+			endcase
 		end
 
 		if (sel_ptr & we) begin

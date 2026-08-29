@@ -24,7 +24,7 @@ always #5 clk = ~clk;
 
 reg reset = 1;
 
-reg         sel_esp = 0, sel_csr = 0, sel_ptr = 0, sel_ini = 0;
+reg         sel_esp = 0, sel_csr = 0, sel_sptr = 0, sel_ptr = 0, sel_ini = 0;
 reg   [5:0] addr = 0;
 reg         we = 0;
 reg   [1:0] be = 0;
@@ -52,7 +52,7 @@ reg         sd_buff_wr = 0;
 next_scsi #(.CLK_HZ(1000000)) dut
 (
 	.clk(clk), .reset(reset),
-	.sel_esp(sel_esp), .sel_csr(sel_csr), .sel_ptr(sel_ptr), .sel_ini(sel_ini),
+	.sel_esp(sel_esp), .sel_csr(sel_csr), .sel_sptr(sel_sptr), .sel_ptr(sel_ptr), .sel_ini(sel_ini),
 	.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
 	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
@@ -209,6 +209,34 @@ task ptr_wr32;
 	end
 endtask
 
+task sptr_wr32;
+	input [5:0] a;
+	input [31:0] v;
+	begin
+		@(posedge clk);
+		sel_sptr <= 1; addr <= a; we <= 1; be <= 2'b11; wdata <= v[31:16];
+		@(posedge clk);
+		addr <= a + 6'd2; wdata <= v[15:0];
+		@(posedge clk);
+		sel_sptr <= 0; we <= 0;
+	end
+endtask
+
+task sptr_rd32;
+	input [5:0] a;
+	output [31:0] v;
+	begin
+		@(posedge clk);
+		sel_sptr <= 1; addr <= a; we <= 0; be <= 2'b11;
+		@(posedge clk);
+		v[31:16] = rdata;
+		addr <= a + 6'd2;
+		@(posedge clk);
+		v[15:0] = rdata;
+		sel_sptr <= 0;
+	end
+endtask
+
 task csr_cmd;
 	input [7:0] v;
 	begin
@@ -216,6 +244,22 @@ task csr_cmd;
 		sel_csr <= 1; addr <= 6'h00; we <= 1; be <= 2'b11; wdata <= {8'h00, v};
 		@(posedge clk);
 		sel_csr <= 0; we <= 0;
+	end
+endtask
+
+// wait for the DMA channel complete interrupt
+task wait_dma_complete;
+	integer n;
+	begin
+		n = 0;
+		while (!int_scsi_dma && n < 4000000) begin
+			@(posedge clk);
+			n = n + 1;
+		end
+		if (!int_scsi_dma) begin
+			$display("FAIL: dma complete timed out");
+			errors = errors + 1;
+		end
 	end
 endtask
 
@@ -326,6 +370,7 @@ localparam BUF2 = 32'h00003000;
 
 integer i;
 reg [7:0] v, sts;
+reg [31:0] d;
 reg [7:0] intr;
 reg ok;
 
@@ -447,6 +492,68 @@ initial begin
 	check(sts == 8'h00, "write: good status");
 
 	//------------------------------------------------------------
+	// chained READ(6), the way the NeXTSTEP driver runs the channel:
+	// double buffered 512 byte segments, the next segment programmed
+	// into start/stop upon each buffer-complete interrupt.  The whole
+	// RAM is a canary field: any DMA write outside the four programmed
+	// windows is corruption of the kind that panics the kernel.
+	//------------------------------------------------------------
+	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'hDEADBEEF;
+	// the write test above inverted block 5 on the disk; restore it
+	for (i = 0; i < 512; i = i + 1) disk[5*512 + i] = pat(5, i);
+
+	select_atn6(8'h08, 8'h00, 8'h00, 8'h02, 8'h04, 8'h00);   // 4 blocks from LBA 2
+	wait_irq;
+	read_intr(intr);
+
+	ptr_wr32(6'h10, 32'h00002000);           // segment A
+	ptr_wr32(6'h14, 32'h00002200);
+	ptr_wr32(6'h18, 32'h00002400);           // segment B armed in start/stop
+	ptr_wr32(6'h1C, 32'h00002600);
+	csr_cmd(8'h13);                          // SETENABLE | SETSUPDATE
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h08);                   // 2048 bytes
+	esp_wr8(6'h03, 8'h90);                   // transfer info, DMA
+
+	// driver interrupt service: two more segments then let it finish
+	wait_dma_complete;
+	csr_cmd(8'h08);                          // CLRCOMPLETE
+	ptr_wr32(6'h18, 32'h00002800);           // segment C
+	ptr_wr32(6'h1C, 32'h00002A00);
+	csr_cmd(8'h02);                          // SETSUPDATE
+	wait_dma_complete;
+	csr_cmd(8'h08);
+	ptr_wr32(6'h18, 32'h00002C00);           // segment D
+	ptr_wr32(6'h1C, 32'h00002E00);
+	csr_cmd(8'h02);
+	wait_dma_complete;
+	csr_cmd(8'h08);
+
+	wait_irq;                                // ESP: counter reached zero
+	read_intr(intr);
+	check(intr == 8'h08, "chained read: function complete");
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1) begin
+		if (ram_byte(32'h00002000 + i) != pat(2, i)) ok = 0;
+		if (ram_byte(32'h00002400 + i) != pat(3, i)) ok = 0;
+		if (ram_byte(32'h00002800 + i) != pat(4, i)) ok = 0;
+		if (ram_byte(32'h00002C00 + i) != pat(5, i)) ok = 0;
+	end
+	check(ok, "chained read: all four segments carry their block");
+	ok = 1;
+	for (i = 0; i < 16384; i = i + 1) begin
+		if ((i < 'h800 || i >= 'h880) && (i < 'h900 || i >= 'h980) &&
+		    (i < 'hA00 || i >= 'hA80) && (i < 'hB00 || i >= 'hB80) &&
+		    ram[i] !== 32'hDEADBEEF) begin
+			$display("  corrupted word at %08x = %08x", i*4, ram[i]);
+			ok = 0;
+		end
+	end
+	check(ok, "chained read: no DMA write outside the programmed windows");
+	finish_command(sts);
+	check(sts == 8'h00, "chained read: good status");
+
+	//------------------------------------------------------------
 	// selection timeout on target 1 (no disk there)
 	//------------------------------------------------------------
 	esp_wr8(6'h05, 8'h01);       // short select timeout
@@ -488,6 +595,15 @@ initial begin
 	      "request sense: info holds the failed lba");
 	finish_command(sts);
 	check(sts == 8'h00, "request sense: good status");
+
+	// saved registers: plain storage the driver can use for residual
+	// bookkeeping (dropping the write was worth a kernel panic)
+	sptr_wr32(6'h00, 32'h04123450);
+	sptr_wr32(6'h04, 32'h04123650);
+	sptr_rd32(6'h00, d);
+	check(d == 32'h04123450, "saved next holds a written value");
+	sptr_rd32(6'h04, d);
+	check(d == 32'h04123650, "saved limit holds a written value");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

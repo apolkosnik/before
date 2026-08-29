@@ -520,9 +520,10 @@ wire io_sn_ptr = sel_io && (io_off[16:4] == 13'h404);           // 0x04040-0x040
 wire io_sn_ini = sel_io && (io_off[16:2] == 15'h1090);          // 0x04240-0x04243
 wire io_snd    = io_kms | io_sn_csr | io_sn_sptr | io_sn_ptr | io_sn_ini;
 wire io_sc_csr = sel_io && (io_off[16:2] == 15'h0004);          // 0x00010-0x00013
+wire io_sc_sptr= sel_io && (io_off[16:4] == 13'h400);           // 0x04000-0x0400f
 wire io_sc_ptr = sel_io && (io_off[16:4] == 13'h401);           // 0x04010-0x0401f
 wire io_sc_ini = sel_io && (io_off[16:2] == 15'h1084);          // 0x04210-0x04213
-wire io_scsi   = io_sc_csr | io_sc_ptr | io_sc_ini;
+wire io_scsi   = io_sc_csr | io_sc_sptr | io_sc_ptr | io_sc_ini;
 wire io_dma   = sel_io && (io_off[16:12] < 5'h05) && !io_enet && !io_mo && !io_snd && !io_scsi; // 0x00000-0x04FFF
 wire io_intc  = sel_io && (io_off[16:12] == 5'h07);             // 0x07000-0x07FFF
 wire io_scr1  = sel_io && (io_off[16:11] == 6'h18);             // 0x0c000-0x0c7ff
@@ -738,6 +739,7 @@ next_scsi #(.CLK_HZ(CLK_HZ)) scsi
 	.reset(dev_reset),
 	.sel_esp(io_esp),
 	.sel_csr(io_sc_csr),
+	.sel_sptr(io_sc_sptr),
 	.sel_ptr(io_sc_ptr),
 	.sel_ini(io_sc_ini),
 	.addr(io_off[5:0]),
