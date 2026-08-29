@@ -32,8 +32,8 @@ wire        ram_req, ram_we;
 wire  [3:0] ram_be;
 wire [23:0] ram_addr;
 wire [31:0] ram_din;
-reg  [31:0] ram_dout;
-reg         ram_ack;
+wire [31:0] ram_dout;   // driven by next_ddram
+wire        ram_ack;
 
 wire        hsync, vsync, hblank, vblank;
 wire  [7:0] gray;
@@ -58,7 +58,7 @@ next_system #(
 	.reset(reset),
 	.ps2_key(11'd0),
 	.boot_sel(bootsd ? 2'd1 : 2'd0),
-	.machine_color(1'b0),
+	.machine_color_in(1'b0),
 	.vid_red(), .vid_green(), .vid_blue(),
 	.cv_req(cv_req), .cv_addr(cv_addr), .cv_burst(cv_burst),
 	.cv_ack(cv_ack), .cv_data(64'hA5A5A5A5A5A5A5A5), .cv_data_valid(cv_dv),
@@ -115,88 +115,75 @@ next_system #(
 // mem_ram_empty_*() in Previous src/cpu/memory.c.
 //----------------------------------------------------------------------------
 
-// Full 64 MB, so a real kernel's page tables and code above 4 MB are
-// stored faithfully instead of aliasing onto low memory (which would
-// corrupt the kernel and produce spurious MMU faults).  ram_addr is the
-// word index within the 64 MB bank region (next_system passes [25:2]).
-reg [31:0] ram_mem [0:16777215];   // 64 MB
+// Main memory, 64 MB, as the 32-bit words the machine sees.  The DDR3
+// model below reads and writes it in 64-bit pairs through next_ddram's
+// byte lanes, so the adapter's lane and endian handling is exercised.
+reg [31:0] ram_mem [0:16777215];
 integer    ram_init_i;
 initial for (ram_init_i = 0; ram_init_i < 16777216; ram_init_i = ram_init_i + 1)
 	ram_mem[ram_init_i] = 32'h00000000;
 
-wire        bank0     = 1'b1;                        // all four banks populated
-wire [23:0] ram_index = ram_addr[23:0];             // 16M words = 64 MB
-wire [31:0] open_bus  = {6'b000001, ram_addr, 2'b00};
-
-reg [1:0] ram_wait;
-always @(posedge clk) begin
-	if (reset) begin
-		ram_ack <= 0;
-		ram_wait <= 0;
-	end
-	else if (!ram_req) begin
-		ram_ack <= 0;
-		ram_wait <= 0;
-	end
-	else if (!ram_ack) begin
-		// a few wait states, like the DDR3 on hardware
-		if (ram_wait == 2'd3) begin
-			if (ram_we) begin
-				if (bank0) begin
-					if (ram_be[3]) ram_mem[ram_index][31:24] <= ram_din[31:24];
-					if (ram_be[2]) ram_mem[ram_index][23:16] <= ram_din[23:16];
-					if (ram_be[1]) ram_mem[ram_index][15:8]  <= ram_din[15:8];
-					if (ram_be[0]) ram_mem[ram_index][7:0]   <= ram_din[7:0];
-				end
-			end
-			else ram_dout <= bank0 ? ram_mem[ram_index] : open_bus;
-			ram_ack <= 1;
-		end
-		else ram_wait <= ram_wait + 1'd1;
-	end
-end
-
 //----------------------------------------------------------------------------
-// colour scan-out port: a live model, never a tie-off.  The engine ran
-// full-tilt on hardware while the bench's cv_ack tie-off kept it
-// politely stalled in simulation, hiding a fetch stream that outranks
-// the CPU at the DDR3 arbiter and starved the machine out of booting.
-// The model serves any request so the engine can misbehave visibly,
-// and the epilogue checks a monochrome machine never issues one.
+// The real DDR3 path: next_ddram and next_ddram_arb, wired as the emu
+// top wires them.  The bench used to hang its own RAM model straight on
+// next_system's port, so the entire DDR3 chain - the adapter, the
+// arbiter, its colour and mailbox ports, its read latch - had never
+// executed a single instruction of POST.
 //----------------------------------------------------------------------------
 
-wire        cv_req;
+wire        ga_rd, ga_we, ga_busy, ga_dout_ready;
+wire [28:0] ga_addr;
+wire [63:0] ga_din, ga_dout;
+wire  [7:0] ga_be, ga_burst;
+
+wire        cv_req, cv_ack, cv_data_valid;
 wire [28:0] cv_addr;
 wire  [7:0] cv_burst;
-reg         cv_ack = 0;
-reg         cv_dv = 0;
-reg  [7:0]  cv_left = 0;
-integer     cv_reqs = 0;
+wire [63:0] cv_data;
 
-always @(posedge clk) begin
-	cv_ack <= 0;
-	cv_dv  <= 0;
-	if (reset) cv_left <= 0;
-	else if (cv_req && !cv_ack && cv_left == 0) begin
-		cv_ack  <= 1;
-		cv_left <= cv_burst;
-		cv_reqs = cv_reqs + 1;
-	end
-	else if (cv_left != 0) begin
-		cv_dv   <= 1;
-		cv_left <= cv_left - 1'd1;
-	end
-end
+wire        eb_req, eb_we, eb_ack;
+wire [28:0] eb_addr;
+wire [63:0] eb_wdata, eb_rdata;
+
+wire        dr_busy, dr_dout_ready, dr_rd, dr_we;
+wire [28:0] dr_addr;
+wire [63:0] dr_dout, dr_din;
+wire  [7:0] dr_be, dr_burst;
+
+next_ddram ddram
+(
+	.clk(clk), .reset(reset),
+	.ram_req(ram_req), .ram_we(ram_we), .ram_be(ram_be),
+	.ram_addr(ram_addr), .ram_vram(ram_vram), .ram_din(ram_din),
+	.ram_dout(ram_dout), .ram_ack(ram_ack),
+	.DDRAM_BUSY(ga_busy), .DDRAM_BURSTCNT(ga_burst), .DDRAM_ADDR(ga_addr),
+	.DDRAM_DOUT(ga_dout), .DDRAM_DOUT_READY(ga_dout_ready),
+	.DDRAM_RD(ga_rd), .DDRAM_DIN(ga_din), .DDRAM_BE(ga_be), .DDRAM_WE(ga_we)
+);
+
+next_ddram_arb ddram_arb
+(
+	.clk(clk), .reset(reset),
+	.a_rd(ga_rd), .a_we(ga_we), .a_addr(ga_addr), .a_din(ga_din),
+	.a_be(ga_be), .a_burst(ga_burst), .a_busy(ga_busy),
+	.a_dout(ga_dout), .a_dout_ready(ga_dout_ready),
+	.v_req(cv_req), .v_addr(cv_addr), .v_burst(cv_burst),
+	.v_ack(cv_ack), .v_data(cv_data), .v_data_valid(cv_data_valid),
+	.b_req(eb_req), .b_we(eb_we), .b_addr(eb_addr),
+	.b_wdata(eb_wdata), .b_rdata(eb_rdata), .b_ack(eb_ack),
+	.DDRAM_BUSY(dr_busy), .DDRAM_BURSTCNT(dr_burst), .DDRAM_ADDR(dr_addr),
+	.DDRAM_DOUT(dr_dout), .DDRAM_DOUT_READY(dr_dout_ready),
+	.DDRAM_RD(dr_rd), .DDRAM_DIN(dr_din), .DDRAM_BE(dr_be), .DDRAM_WE(dr_we)
+);
+
+integer cv_reqs = 0;
+always @(posedge clk) if (!reset && cv_req && cv_ack) cv_reqs = cv_reqs + 1;
 
 //----------------------------------------------------------------------------
-// Ethernet mailbox bridge, against a mailbox the host never wrote.
-//
-// The boot bench used to tie these ports off, which is why a bridge
-// that reads uninitialised ring pointers and streams whatever DDR3
-// holds into the guest could never show up here.  The model below
-// starts every mailbox word as stale rubbish, exactly as DDR3 is when
-// no daemon has touched it, and +netoff runs with the OSD Network
-// option off, which must leave the mailbox alone entirely.
+// The ethernet mailbox bridge, on the arbiter's port B, against a
+// mailbox the host never wrote (the DDR3 model starts those words as
+// rubbish).  With the network off it must read none of it: reading is
+// how a stale ring pointer becomes frames the guest never asked for.
 //----------------------------------------------------------------------------
 
 wire        btx_req, btx_rd, btx_ack, btx_done;
@@ -208,12 +195,6 @@ wire  [7:0] brx_data;
 wire [47:0] enet_mac;
 
 reg         net_enable = 1;
-
-wire        eb_req, eb_we;
-wire [28:0] eb_addr;
-wire [63:0] eb_wdata;
-reg  [63:0] eb_rdata;
-reg         eb_ack = 0;
 
 next_enet_bridge #(.CLK_HZ(50000000)) bridge
 (
@@ -227,34 +208,102 @@ next_enet_bridge #(.CLK_HZ(50000000)) bridge
 	.m_rdata(eb_rdata), .m_ack(eb_ack)
 );
 
-// mailbox memory, stale from the start
-reg [63:0] mbox [0:2047];
-integer mb_i;
-initial for (mb_i = 0; mb_i < 2048; mb_i = mb_i + 1)
-	mbox[mb_i] = {32'hDEADBEEF, mb_i[15:0], 16'hFACE};
+integer injected = 0;
+always @(posedge clk) if (!reset && brx_start) injected = injected + 1;
 
-integer mbox_writes = 0;
-integer mbox_reads = 0;
-wire [10:0] mb_idx = eb_addr[10:0];
+// DDR3 model: throttles with BUSY, answers reads after a latency, and
+// returns bursts back to back.  A memory that always accepts instantly
+// is the memory that hides handshake bugs.  Each window has its own
+// storage so an access landing in the wrong one is visible.
+localparam [28:0] W_RAM  = 29'h0600_0000;   // byte 0x30000000
+localparam [28:0] W_VRAM = 29'h0680_0000;   // byte 0x34000000
+localparam [28:0] W_MBOX = 29'h03FE_0000;   // byte 0x1FF00000
+
+reg [63:0] vram64 [0:262143];
+reg [63:0] mbox   [0:2047];
+integer    mb_i;
+initial begin
+	for (mb_i = 0; mb_i < 2048; mb_i = mb_i + 1)
+		mbox[mb_i] = {32'hDEADBEEF, mb_i[15:0], 16'hFACE};
+	for (mb_i = 0; mb_i < 262144; mb_i = mb_i + 1) vram64[mb_i] = 64'd0;
+end
+
+integer mbox_reads = 0, mbox_writes = 0, stray_ddr = 0;
+
+wire in_ram  = (dr_addr[28:23] == W_RAM[28:23]);
+wire in_vram = (dr_addr[28:18] == W_VRAM[28:18]);
+wire in_mbox = (dr_addr[28:11] == W_MBOX[28:11]);
+
+function [31:0] bsw; input [31:0] x; bsw = {x[7:0], x[15:8], x[23:16], x[31:24]}; endfunction
+
+reg  [7:0] d3_left = 0;
+reg [28:0] d3_addr = 0;
+reg  [5:0] d3_lat = 0;
+reg [31:0] d3_lfsr = 32'h1234_5678;
+reg        d3_busy_r = 0;
+reg        d3_dv = 0;
+reg [63:0] d3_dout = 0;
+
+assign dr_busy       = d3_busy_r;
+assign dr_dout_ready = d3_dv;
+assign dr_dout       = d3_dout;
 
 always @(posedge clk) begin
-	eb_ack <= 0;
-	if (!reset && eb_req && !eb_ack) begin
-		if (eb_we) begin
-			mbox[mb_idx] <= eb_wdata;
-			mbox_writes = mbox_writes + 1;
+	d3_lfsr <= {d3_lfsr[30:0], d3_lfsr[31] ^ d3_lfsr[21] ^ d3_lfsr[1] ^ d3_lfsr[0]};
+	d3_dv   <= 0;
+
+	if (reset) begin
+		d3_left   <= 0;
+		d3_lat    <= 0;
+		d3_busy_r <= 0;
+	end
+	else begin
+		d3_busy_r <= (d3_left != 0) || (d3_lfsr[3:0] == 4'd0);
+
+		if (d3_left == 0 && !d3_busy_r) begin
+			if (dr_we) begin
+				if (in_ram) begin
+					if (dr_be[0]) ram_mem[{dr_addr[22:0], 1'b0}][31:24] <= dr_din[7:0];
+					if (dr_be[1]) ram_mem[{dr_addr[22:0], 1'b0}][23:16] <= dr_din[15:8];
+					if (dr_be[2]) ram_mem[{dr_addr[22:0], 1'b0}][15:8]  <= dr_din[23:16];
+					if (dr_be[3]) ram_mem[{dr_addr[22:0], 1'b0}][7:0]   <= dr_din[31:24];
+					if (dr_be[4]) ram_mem[{dr_addr[22:0], 1'b1}][31:24] <= dr_din[39:32];
+					if (dr_be[5]) ram_mem[{dr_addr[22:0], 1'b1}][23:16] <= dr_din[47:40];
+					if (dr_be[6]) ram_mem[{dr_addr[22:0], 1'b1}][15:8]  <= dr_din[55:48];
+					if (dr_be[7]) ram_mem[{dr_addr[22:0], 1'b1}][7:0]   <= dr_din[63:56];
+				end
+				else if (in_vram) vram64[dr_addr[17:0]] <= dr_din;
+				else if (in_mbox) begin
+					mbox[dr_addr[10:0]] <= dr_din;
+					mbox_writes = mbox_writes + 1;
+				end
+				else stray_ddr = stray_ddr + 1;
+			end
+			else if (dr_rd) begin
+				d3_addr <= dr_addr;
+				d3_left <= dr_burst;
+				d3_lat  <= 6'd12;
+				if (in_mbox) mbox_reads = mbox_reads + 1;
+				else if (!in_ram && !in_vram) stray_ddr = stray_ddr + 1;
+			end
 		end
-		else begin
-			eb_rdata <= mbox[mb_idx];   // latched, as the arbiter does
-			mbox_reads = mbox_reads + 1;
+		else if (d3_left != 0) begin
+			if (d3_lat != 0) d3_lat <= d3_lat - 1'd1;
+			else begin
+				d3_dout <= (d3_addr[28:23] == W_RAM[28:23])
+				           ? {bsw(ram_mem[{d3_addr[22:0], 1'b1}]),
+				              bsw(ram_mem[{d3_addr[22:0], 1'b0}])} :
+				           (d3_addr[28:18] == W_VRAM[28:18]) ? vram64[d3_addr[17:0]] :
+				           (d3_addr[28:11] == W_MBOX[28:11]) ? mbox[d3_addr[10:0]] :
+				                                               64'hBADD_BADD_BADD_BADD;
+				d3_dv   <= 1;
+				d3_addr <= d3_addr + 1'd1;
+				d3_left <= d3_left - 1'd1;
+			end
 		end
-		eb_ack <= 1;
 	end
 end
 
-// frames the bridge pushed at the guest
-integer injected = 0;
-always @(posedge clk) if (!reset && brx_start) injected = injected + 1;
 
 //----------------------------------------------------------------------------
 // bus monitor

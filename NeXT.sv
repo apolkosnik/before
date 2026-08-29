@@ -199,7 +199,7 @@ next_system #(
 
 	.ps2_key(ps2_key),
 	.boot_sel(status[56:55]),
-	.machine_color(status[57]),
+	.machine_color_in(status[57]),
 	.hps_rtc(hps_rtc),
 
 	.img_mounted(img_mounted),

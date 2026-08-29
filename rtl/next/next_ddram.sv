@@ -77,7 +77,7 @@ always @(posedge clk) begin
 		if (!ram_req) ram_ack <= 0;
 		else if (!ram_ack && !busy && !DDRAM_RD && !DDRAM_WE) begin
 			DDRAM_ADDR <= ram_vram
-			              ? {5'b00110, 1'b1, 4'd0, ram_addr[18:1]}  // 0x34000000
+			              ? {5'b00110, 1'b1, 5'd0, ram_addr[18:1]}  // 0x34000000
 			              : {5'b00110, 1'b0, ram_addr[23:1]};       // 0x30000000
 			half       <= ram_addr[0];
 			if (ram_we) begin

@@ -45,6 +45,10 @@ module next_system #(
 	// physical clock rate, for the battery backed time of day (CLK_HZ
 	// is the virtual rate the CPU calibration is built on)
 	parameter CLK_REAL_HZ = CLK_HZ,
+	// Colour frame buffer hardware.  With it compiled out the machine is
+	// a NeXTcube and the DDR3 arbiter has no scan-out port at all, which
+	// is the configuration the NeXTSTEP boot was verified in.
+	parameter COLOR_FB = 1,
 	parameter ROM_INIT_EN = 0,
 	parameter ROM_INIT    = "rom.hex"
 )
@@ -59,7 +63,7 @@ module next_system #(
 	// 1 = NeXTstation Color (68040 slab, 16 bit color).  Selects the
 	// system control register identity the ROM reads, the frame buffer
 	// and the video interrupt path.
-	input         machine_color,
+	input         machine_color_in,
 
 	// host time of day (hps_io RTC port)
 	input  [64:0] hps_rtc,
@@ -293,6 +297,8 @@ wire d_io   = (cpu_addr[31:24] == 8'h02) &&
 wire d_bmap = (cpu_addr[31:16] == 16'h020C) || (cpu_addr[31:16] == 16'h820C);
 wire d_ram  = (cpu_addr[31:26] == 6'b000001) ||   // 0x04-0x07
               (cpu_addr[31:28] == 4'h1);          // 0x10-0x1F MWF mirrors
+wire machine_color = COLOR_FB ? machine_color_in : 1'b0;
+
 wire d_vram = !machine_color &&
               ((cpu_addr[31:24] == 8'h0B) ||
                (cpu_addr[31:26] == 6'b000011));    // 0x0C-0x0F MWF mirrors
@@ -649,6 +655,7 @@ wire  [9:0] fetch_line;
 wire        line_start;
 wire  [7:0] vid_r, vid_g, vid_b;
 
+generate if (COLOR_FB) begin : g_color
 next_cvram cvram
 (
 	.clk(clk),
@@ -666,6 +673,14 @@ next_cvram cvram
 	.line_start(line_start),
 	.px_data(cpx_data)
 );
+end
+else begin : g_nocolor
+	assign cv_req   = 1'b0;
+	assign cv_addr  = 29'd0;
+	assign cv_burst = 8'd0;
+	assign cpx_data = 16'd0;
+end
+endgenerate
 
 // system control registers and RTC
 wire timer_ipl7, softint1, softint2;

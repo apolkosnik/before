@@ -33,7 +33,9 @@ NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_timer.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/next_cvram.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
          $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_enet_dma.sv \
-         $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_rs.sv $RTL/dpram.v"
+         $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_rs.sv \
+         $RTL/next_ddram.sv $RTL/next_ddram_arb.sv $RTL/next_enet_bridge.sv \
+         $RTL/dpram.v"
 
 echo "== converting boot ROM =="
 python3 rom2hex.py "$ROM" "$WORK/rom.hex"
