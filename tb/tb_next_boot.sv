@@ -57,11 +57,12 @@ next_system #(
 	.clk_vid(clk),   // both domains on one clock in simulation
 	.reset(reset),
 	.ps2_key(11'd0),
-	.boot_sel(bootsd ? 3'd1 : 3'd0),
-	.fimg_mounted(1'b0), .fimg_readonly(1'b0), .fimg_size(64'd0),
-	.fsd_lba(), .fsd_rd(), .fsd_wr(), .fsd_ack(1'b0),
-	.fsd_buff_addr(9'd0), .fsd_buff_dout(8'd0), .fsd_buff_din(),
-	.fsd_buff_wr(1'b0),
+	.boot_sel(bootfd ? 3'd2 : bootsd ? 3'd1 : 3'd0),
+	.fimg_mounted(fimg_mounted), .fimg_readonly(1'b0),
+	.fimg_size(bootfd ? 64'd1474560 : 64'd0),
+	.fsd_lba(fsd_lba), .fsd_rd(fsd_rd), .fsd_wr(fsd_wr), .fsd_ack(fsd_ack),
+	.fsd_buff_addr(fsd_buff_addr), .fsd_buff_dout(fsd_buff_dout),
+	.fsd_buff_din(fsd_buff_din), .fsd_buff_wr(fsd_buff_wr),
 
 	.img_mounted(img_mounted),
 	.img_readonly(1'b0),
@@ -382,6 +383,84 @@ endtask
 
 
 reg        bootsd = 0;
+
+//----------------------------------------------------------------------------
+// +bootfd: a 1.44 MB floppy on the second image slot with the boot
+// device set to Floppy, so the ROM's own floppy driver runs - which is
+// the only way to see what it programs into the shared DMA channel.
+//----------------------------------------------------------------------------
+
+reg         bootfd = 0;
+reg         fimg_mounted = 0;
+wire [31:0] fsd_lba;
+wire        fsd_rd, fsd_wr;
+reg         fsd_ack = 0;
+reg   [8:0] fsd_buff_addr = 0;
+reg   [7:0] fsd_buff_dout = 0;
+wire  [7:0] fsd_buff_din;
+reg         fsd_buff_wr = 0;
+
+reg  [7:0] fdisk [0:2880*512-1];
+integer    fdi;
+initial for (fdi = 0; fdi < 2880*512; fdi = fdi + 1)
+	fdisk[fdi] = fdi[7:0] ^ {fdi[16:9], 1'b0};
+
+reg fsd_act = 0;
+integer fsd_reads = 0;
+always @(posedge clk) begin
+	if (fsd_rd && !fsd_ack && !fsd_act) begin
+		fsd_ack <= 1; fsd_act <= 1; fsd_buff_addr <= 0; fsd_buff_wr <= 0;
+		fsd_reads = fsd_reads + 1;
+		if (fsd_reads < 40)
+			$display("[%0t] FD: read lba %0d", $time, fsd_lba);
+	end
+	else if (fsd_ack && fsd_act) begin
+		if (!fsd_buff_wr) begin
+			fsd_buff_dout <= fdisk[{fsd_lba[11:0], 9'd0} + {23'd0, fsd_buff_addr}];
+			fsd_buff_wr <= 1;
+		end
+		else begin
+			fsd_buff_wr <= 0;
+			if (fsd_buff_addr == 9'd511) begin fsd_ack <= 0; fsd_act <= 0; end
+			else fsd_buff_addr <= fsd_buff_addr + 1'd1;
+		end
+	end
+end
+
+// every register the ROM's floppy driver touches, and the controller's
+// answer: this is the conversation the "DMA buf overflow" ends
+integer fdreg_n = 0;
+always @(posedge clk) if (bootfd && !reset && dut.io_flp && dut.state == 2'd1) begin
+	if (fdreg_n < 120) begin
+		if (is_write)
+			$display("[%0t] FDREG wr +%0d = %04x", $time, dut.io_off[3:0],
+			         cpu_dout);
+		else
+			$display("[%0t] FDREG rd +%0d -> %04x", $time, dut.io_off[3:0],
+			         cpu_din);
+	end
+	fdreg_n = fdreg_n + 1;
+end
+
+// what the ROM programs into the shared channel, and what the transfer
+// does with it: this is the accounting the ROM checks afterwards
+reg [31:0] dnext_d = 0, dlimit_d = 0;
+reg  [7:0] dcsr_d = 0;
+always @(posedge clk) if (bootfd && !reset) begin
+	if (dut.scsi.d_next != dnext_d && dut.scsi.flp_active)
+		dnext_d <= dut.scsi.d_next;
+	if (dut.scsi.d_limit != dlimit_d) begin
+		dlimit_d <= dut.scsi.d_limit;
+		$display("[%0t] FD chan: next %08x limit %08x csr %02x", $time,
+		         dut.scsi.d_next, dut.scsi.d_limit, dut.scsi.d_csr);
+	end
+	if (dut.scsi.d_csr != dcsr_d) begin
+		dcsr_d <= dut.scsi.d_csr;
+		$display("[%0t] FD csr: %02x  next %08x limit %08x", $time,
+		         dut.scsi.d_csr, dut.scsi.d_next, dut.scsi.d_limit);
+	end
+end
+
 reg        img_mounted = 0;
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
@@ -629,6 +708,8 @@ initial begin
 		$dumpvars(0, tb_next_boot);
 	end
 
+	if ($test$plusargs("bootfd")) bootfd = 1;
+
 	if ($test$plusargs("bootsd")) begin
 		bootsd = 1;
 		@(posedge clk);
@@ -640,6 +721,15 @@ initial begin
 
 	repeat (20) @(posedge clk);
 	reset = 0;
+
+	// the medium arrives once the machine is running, the way the OSD
+	// delivers it: a mount pulse during reset is simply not seen
+	if (bootfd) begin
+		repeat (20) @(posedge clk);
+		fimg_mounted <= 1;
+		@(posedge clk);
+		fimg_mounted <= 0;
+	end
 
 	// run length: +cycles=<n> for a small count, or +mcycles=<n> for
 	// n million cycles (avoids the 32-bit cap of %d for long boots)
@@ -668,6 +758,12 @@ initial begin
 	check(seen_scr2_wr, "ROM wrote SCR2");
 	check(!dbg_halted,  "CPU not halted");
 
+
+	if (bootfd) begin
+		$display("floppy register accesses: %0d, sectors fetched: %0d",
+		         fdreg_n, fsd_reads);
+		fb_dump;
+	end
 
 	if (bootsd) begin
 		$display("SD reads: %0d, SCSI DMA words to memory: %0d",

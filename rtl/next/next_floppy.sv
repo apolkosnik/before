@@ -222,6 +222,7 @@ assign sd_lba  = lba;
 // execution engine
 //----------------------------------------------------------------------------
 
+localparam E_SEEKINT = 4'd11;   // a seek in progress, drive busy
 localparam E_IDLE  = 4'd0,  E_EXEC   = 4'd1,  E_RESULT = 4'd2,
            E_RD_GO = 4'd3,  E_RD_ACK = 4'd4,  E_XFER   = 4'd5,
            E_WR_GO = 4'd6,  E_WR_ACK = 4'd7,  E_NEXT   = 4'd8,
@@ -399,6 +400,19 @@ always @(posedge clk) begin
 			finish_int;
 		end
 
+		// A seek holds the drive busy in the main status register while
+		// it runs and finishes through the interrupt, which clears the
+		// busy bits again.  Reporting the seek complete the instant the
+		// command was written never showed a driver the drive working.
+		E_SEEKINT: begin
+			if (dly == 0) begin
+				msr <= STAT_RQM;          // busy bits cleared
+				int_pend <= 1;
+				est <= E_IDLE;
+			end
+			else if (tick) dly <= dly - 1'd1;
+		end
+
 		default: est <= E_IDLE;
 		endcase
 
@@ -493,16 +507,20 @@ always @(posedge clk) begin
 									pcn <= 0;
 									st0 <= IC_NORMAL | ST0_SE;
 									st1 <= 0; st2 <= 0;
-									int_pend <= 1;
-									msr <= STAT_RQM;
+									// the drive is busy seeking; the
+									// controller still takes commands
+									msr <= STAT_RQM | 8'h01;
+									dly <= 25'd200;
+									est <= E_SEEKINT;
 								end
 								5'h0F: begin      // seek
 									cyl <= (v > CYLS-1) ? CYLS-8'd1 : v;
 									pcn <= (v > CYLS-1) ? CYLS-8'd1 : v;
 									head <= {7'd0, cmd_data[0][2]};
 									st0 <= IC_NORMAL | ST0_SE;
-									int_pend <= 1;
-									msr <= STAT_RQM;
+									msr <= STAT_RQM | 8'h01;
+									dly <= 25'd200;
+									est <= E_SEEKINT;
 								end
 								5'h04: begin      // drive status
 									res[0] <= {2'd0, readonly, 1'b1,

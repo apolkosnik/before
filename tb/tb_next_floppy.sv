@@ -262,8 +262,13 @@ initial begin
 
 	// RECALIBRATE, then SENSE INTERRUPT STATUS
 	wr8(4'h5, 8'h07); wr8(4'h5, 8'h00);
-	repeat (20) @(posedge clk);
+	@(posedge clk);
+	rd8(4'h4, msr);
+	check(msr[0], "the drive reports busy while it seeks");
+	repeat (400) @(posedge clk);      // the seek takes time, as a seek does
 	check(int_floppy, "recalibrate raises the interrupt");
+	rd8(4'h4, msr);
+	check(!msr[0], "the busy bit is cleared when the seek completes");
 	wr8(4'h5, 8'h08);
 	rd8(4'h5, v);
 	check(v == 8'h20, "sense interrupt: seek end, normal termination");
@@ -273,7 +278,7 @@ initial begin
 
 	// SEEK to cylinder 5
 	wr8(4'h5, 8'h0F); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
-	repeat (20) @(posedge clk);
+	repeat (400) @(posedge clk);
 	wr8(4'h5, 8'h08);
 	rd8(4'h5, v);
 	rd8(4'h5, v);
