@@ -23,7 +23,23 @@
 //  which carries a valid checksum in bytes 30/31.
 //============================================================================
 
-module next_scr #(parameter CLK_HZ = 100000000)
+module next_scr #(
+	parameter CLK_HZ = 100000000,
+	// Power-on time of day, in the chip's own packed decimal.  The real
+	// machine has a battery behind this; here the emu top hands over the
+	// moment the core was built, so a freshly built core comes up at a
+	// plausible date instead of 1900.  RTC_YEAR carries the encoding
+	// rtcnvram.c uses, years since 1900 with the decade digit allowed
+	// past nine (2026 is 0xC6), which is what the system software writes
+	// back when it sets the clock itself.
+	parameter [7:0] RTC_SEC   = 8'h00,
+	parameter [7:0] RTC_MIN   = 8'h00,
+	parameter [7:0] RTC_HOUR  = 8'h00,
+	parameter [7:0] RTC_WDAY  = 8'h01,
+	parameter [7:0] RTC_MDAY  = 8'h01,
+	parameter [7:0] RTC_MONTH = 8'h01,
+	parameter [7:0] RTC_YEAR  = 8'h00
+)
 (
 	input         clk,
 	input         reset,
@@ -207,8 +223,9 @@ always @(posedge clk) begin
 		rtc_val <= 0;
 		clkctrl <= 8'h00;
 		intctrl <= 8'h00;
-		t_sec <= 8'h00; t_min <= 8'h00; t_hour <= 8'h00;
-		t_wday <= 8'h01; t_mday <= 8'h01; t_month <= 8'h01; t_year <= 8'h00;
+		t_sec <= RTC_SEC; t_min <= RTC_MIN; t_hour <= RTC_HOUR;
+		t_wday <= RTC_WDAY; t_mday <= RTC_MDAY;
+		t_month <= RTC_MONTH; t_year <= RTC_YEAR;
 		sec_presc <= 0;
 	end
 	else begin

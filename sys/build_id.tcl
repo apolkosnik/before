@@ -5,7 +5,11 @@
 proc generateBuildID_Verilog {} {
 
 	# Get the timestamp (see: http://www.altera.com/support/examples/tcl/tcl-date-time-stamp.html)
-	set buildDate "`define BUILD_DATE \"[clock format [ clock seconds ] -format %y%m%d]\""
+	set now [clock seconds]
+	set buildDate "`define BUILD_DATE \"[clock format $now -format %y%m%d]\""
+	# The NeXT core also starts its time of day here, so the clock the
+	# machine powers on with is the time the core was built.
+	append buildDate "\n`define BUILD_TIME \"[clock format $now -format %H%M%S]\""
 
 	# Create a Verilog file for output
 	set outputFileName "build_id.v"

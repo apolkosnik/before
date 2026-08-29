@@ -37,7 +37,14 @@ reg   [1:0] be = 0;
 reg  [15:0] wdata = 0;
 wire [15:0] rdata;
 
-next_scr #(.CLK_HZ(100000000)) dut
+// power-on time of day: what the emu top hands over from the build
+// timestamp, here a fixed stand-in for 2026-08-29 14:35:12
+next_scr #(
+	.CLK_HZ(100000000),
+	.RTC_SEC(8'h12), .RTC_MIN(8'h35), .RTC_HOUR(8'h14),
+	.RTC_WDAY(8'h01), .RTC_MDAY(8'h29), .RTC_MONTH(8'h08),
+	.RTC_YEAR(8'hC6)
+) dut
 (
 	.clk(clk), .reset(reset),
 	.sel(sel), .reg_id(reg_id), .addr1(addr1), .we(we), .be(be),
@@ -244,6 +251,24 @@ initial begin
 	rtc_stop;
 	check(wb == 8'h5A, "an NVRAM byte survives a reset");
 
+
+	// the clock powers on at the time the core was built, rather than
+	// at 1900, which the system software calls preposterous
+	rtc_send_byte(8'h20);
+	rtc_recv_byte(r_sec);
+	rtc_recv_byte(r_min);
+	rtc_recv_byte(r_hour);
+	rtc_recv_byte(r_wday);
+	rtc_recv_byte(r_mday);
+	rtc_recv_byte(r_month);
+	rtc_recv_byte(r_year);
+	rtc_stop;
+	$display("power-on clock = %02x:%02x:%02x %02x/%02x year %02x",
+	         r_hour, r_min, r_sec, r_month, r_mday, r_year);
+	check(r_hour == 8'h14 && r_min == 8'h35,
+	      "the clock powers on at the build time");
+	check(r_mday == 8'h29 && r_month == 8'h08 && r_year == 8'hC6,
+	      "the clock powers on at the build date (2026 as 0xC6)");
 
 	// boot device menu variants
 	boot_variant(3'd0, 1'b0);    // Auto, no disk: empty command

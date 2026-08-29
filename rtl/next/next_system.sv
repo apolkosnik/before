@@ -42,6 +42,14 @@ module next_system #(
 	// below (100 MHz, 1/2) satisfy the same invariant.
 	parameter CPU_PACE_NUM = 1,
 	parameter CPU_PACE_DEN = 2,
+	// power-on time of day, passed down to the clock
+	parameter [7:0] RTC_SEC   = 8'h00,
+	parameter [7:0] RTC_MIN   = 8'h00,
+	parameter [7:0] RTC_HOUR  = 8'h00,
+	parameter [7:0] RTC_WDAY  = 8'h01,
+	parameter [7:0] RTC_MDAY  = 8'h01,
+	parameter [7:0] RTC_MONTH = 8'h01,
+	parameter [7:0] RTC_YEAR  = 8'h00,
 	parameter ROM_INIT_EN = 0,
 	parameter ROM_INIT    = "rom.hex"
 )
@@ -596,7 +604,12 @@ always @(posedge clk) if (img_mounted) disk_mounted <= (img_size != 0);
 reg floppy_mounted = 0;
 always @(posedge clk) if (fimg_mounted) floppy_mounted <= (fimg_size != 0);
 
-next_scr #(.CLK_HZ(CLK_HZ)) scr
+next_scr #(
+	.CLK_HZ(CLK_HZ),
+	.RTC_SEC(RTC_SEC), .RTC_MIN(RTC_MIN), .RTC_HOUR(RTC_HOUR),
+	.RTC_WDAY(RTC_WDAY), .RTC_MDAY(RTC_MDAY),
+	.RTC_MONTH(RTC_MONTH), .RTC_YEAR(RTC_YEAR)
+) scr
 (
 	.clk(clk),
 	.reset(dev_reset),

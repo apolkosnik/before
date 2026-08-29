@@ -61,6 +61,32 @@ assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
 assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 
 `include "build_id.v"
+
+// The build timestamp, converted to what the MC68HC68T1 holds.  Both
+// macros are "yymmdd" and "hhmmss" of ASCII digits, so a packed decimal
+// digit is the character less '0'.  The year register is not plain BCD:
+// rtcnvram.c stores years since 1900 with the decade digit allowed to
+// run past nine, so 2026 is 0xC6 - the same encoding NeXTSTEP writes
+// back when it sets the clock itself.
+// A tree that has not been through the pre-flow script yet has no
+// build time; midnight of the build date is a fine stand-in.
+`ifndef BUILD_TIME
+`define BUILD_TIME "000000"
+`endif
+
+localparam [47:0] BUILD_D = `BUILD_DATE;   // "yymmdd"
+localparam [47:0] BUILD_T = `BUILD_TIME;   // "hhmmss"
+
+localparam [7:0] BUILD_YY = {BUILD_D[43:40], BUILD_D[35:32]};
+localparam [7:0] BUILD_MO = {BUILD_D[27:24], BUILD_D[19:16]};
+localparam [7:0] BUILD_DD = {BUILD_D[11:8],  BUILD_D[3:0]};
+localparam [7:0] BUILD_HH = {BUILD_T[43:40], BUILD_T[35:32]};
+localparam [7:0] BUILD_MI = {BUILD_T[27:24], BUILD_T[19:16]};
+localparam [7:0] BUILD_SS = {BUILD_T[11:8],  BUILD_T[3:0]};
+
+// years since 1900 for a 20xx build date, in that packed form
+localparam integer BUILD_TMY = 100 + (BUILD_YY[7:4] * 10) + BUILD_YY[3:0];
+localparam [7:0] BUILD_YR = ((BUILD_TMY / 10) << 4) | (BUILD_TMY % 10);
 localparam CONF_STR = {
 	"NeXT;;",
 	"F1,BINROM,Boot ROM;",
@@ -188,7 +214,11 @@ wire [47:0] enet_mac;
 next_system #(
 	.CLK_HZ(50000000),
 	.CPU_PACE_NUM(2),
-	.CPU_PACE_DEN(2)
+	.CPU_PACE_DEN(2),
+	// the clock powers on at the moment this core was built
+	.RTC_SEC(BUILD_SS),   .RTC_MIN(BUILD_MI),  .RTC_HOUR(BUILD_HH),
+	.RTC_WDAY(8'h01),
+	.RTC_MDAY(BUILD_DD),  .RTC_MONTH(BUILD_MO), .RTC_YEAR(BUILD_YR)
 ) system
 (
 	.clk(clk_sys),
