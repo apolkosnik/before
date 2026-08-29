@@ -42,6 +42,19 @@ module next_scsi #(parameter CLK_HZ = 50000000)
 	input      [31:0] m_dout,
 	input             m_ack,
 
+	// The floppy shares this DMA channel: when the controller switches
+	// it over, the engine moves the floppy's sector buffer instead of
+	// its own, exactly as dma_esp_*_memory does on floppy_select.
+	input         flp_select,
+	input         flp_req,       // the floppy wants the channel
+	input         flp_wr,        // 1 = floppy to memory
+	input  [10:0] flp_len,       // bytes in the sector
+	output  [9:0] flp_addr,
+	output        flp_bwe,
+	output  [7:0] flp_bwdata,
+	input   [7:0] flp_bq,
+	output reg    flp_done,
+
 	output        int_scsi,      // level, for INT_SCSI
 	output        int_scsi_dma,  // level, for INT_SCSI_DMA
 
@@ -184,6 +197,7 @@ reg  [1:0] word_cnt;             // bytes gathered in the current DMA word
 reg [31:0] word_buf;
 reg  [2:0] do_rem;               // bytes left to unpack from a DMA word
 
+reg        flp_active;         // a floppy sector is in flight
 reg [24:0] dly_us;               // interrupt delay countdown
 localparam ESP_DELAY_US = 25'd100;
 
@@ -300,6 +314,13 @@ wire       db_we   = in_sd_rd ? sd_buff_wr   : eng_we;
 wire [8:0] db_addr = in_sd_rd ? sd_buff_addr :
                      in_sd_wr ? sd_buff_addr : eng_addr;
 wire [7:0] db_wd   = in_sd_rd ? sd_buff_dout : eng_wd;
+
+// while the floppy owns the channel the engine addresses its buffer
+wire fdma = flp_select & flp_active;
+assign flp_addr   = {1'b0, eng_addr};
+assign flp_bwe    = fdma & eng_we;
+assign flp_bwdata = eng_wd;
+wire [7:0] eng_q  = fdma ? flp_bq : db_q;
 
 always @(posedge clk) begin
 	if (db_we) dbuf[db_addr] <= db_wd;
@@ -720,6 +741,8 @@ always @(posedge clk) begin
 		cdb_n <= 0;
 		rd_ret <= 0; sd_ret <= 0; pad_mode <= 0;
 		gap_us <= 0;
+		flp_active <= 0;
+		flp_done <= 0;
 		word_cnt <= 0; word_buf <= 0; do_rem <= 0;
 		dly_us <= 0;
 		sd_lba_r <= 0;
@@ -731,7 +754,21 @@ always @(posedge clk) begin
 	else begin
 		tickcnt <= tick ? 1'd0 : tickcnt + 1'd1;
 		eng_we <= 0;
+		flp_done <= 0;
 		if (tick && gap_us != 0) gap_us <= gap_us - 1'd1;
+
+		// the floppy asks for the channel while the ESP is idle
+		if (flp_select && flp_req && !flp_active && (xst == X_IDLE)) begin
+			flp_active <= 1;
+			buf_pos    <= 0;
+			buf_limit  <= flp_len[9:0];
+			buf_disk   <= 0;
+			word_cnt   <= 0;
+			pad_mode   <= 0;
+			counter    <= {6'd0, flp_len};
+			phase      <= flp_wr ? PHASE_DI : PHASE_DO;
+			xst        <= flp_wr ? X_DI_CHK : X_DO_CHK;
+		end
 
 		//------------------------------------------------------------
 		// execution engine
@@ -1019,8 +1056,15 @@ always @(posedge clk) begin
 		// transfer info, data in (disk to memory)
 		//------------------------------------------------------------
 		X_DI_CHK: begin
+			// a floppy sector ends by handing the channel back
+			if (flp_active && (buf_pos >= buf_limit) && (word_cnt == 0)) begin
+				flp_active <= 0;
+				flp_done   <= 1;
+				xst        <= X_IDLE;
+			end
+			else if (flp_active && (buf_pos >= buf_limit)) xst <= X_DI_WR;
 			// esp_transfer_done(): counter end first, then phase change
-			if (counter == 0) begin
+			else if (counter == 0) begin
 				intstatus <= INTR_FC;
 				status[4] <= 1'b1;       // STAT_TC
 				if (word_cnt != 0) xst <= X_DI_WR;
@@ -1047,10 +1091,10 @@ always @(posedge clk) begin
 			buf_pos <= buf_pos + 1'd1;
 			counter <= counter - 1'd1;
 			case (word_cnt)
-				2'd0: word_buf[31:24] <= db_q;
-				2'd1: word_buf[23:16] <= db_q;
-				2'd2: word_buf[15:8]  <= db_q;
-				2'd3: word_buf[7:0]   <= db_q;
+				2'd0: word_buf[31:24] <= eng_q;
+				2'd1: word_buf[23:16] <= eng_q;
+				2'd2: word_buf[15:8]  <= eng_q;
+				2'd3: word_buf[7:0]   <= eng_q;
 			endcase
 			word_cnt <= word_cnt + 1'd1;
 			if (!pad_mode && word_cnt == 2'd3) xst <= X_DI_WR;
@@ -1103,7 +1147,12 @@ always @(posedge clk) begin
 		// transfer info, data out (memory to disk)
 		//------------------------------------------------------------
 		X_DO_CHK: begin
-			if (counter == 0) begin
+			if (flp_active && (buf_pos >= buf_limit)) begin
+				flp_active <= 0;
+				flp_done   <= 1;
+				xst        <= X_IDLE;
+			end
+			else if (counter == 0) begin
 				intstatus <= INTR_FC;
 				status[4] <= 1'b1;       // STAT_TC
 				esp_irq(ESP_DELAY_US);
@@ -1204,7 +1253,7 @@ always @(posedge clk) begin
 		end
 
 		X_PIO_GET: begin
-			fifo_push(db_q);
+			fifo_push(eng_q);
 			buf_pos <= buf_pos + 1'd1;
 			if (buf_pos + 1'd1 >= buf_limit && !buf_disk) phase <= PHASE_ST;
 			esp_irq(25'd1);

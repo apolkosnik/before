@@ -33,7 +33,8 @@ NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_timer.sv $RTL/next_video.sv $RTL/next_vram.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
          $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_enet_dma.sv \
-         $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_rs.sv $RTL/dpram.v"
+         $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_rs.sv \
+         $RTL/next_floppy.sv $RTL/dpram.v"
 
 echo "== converting boot ROM =="
 python3 rom2hex.py "$ROM" "$WORK/rom.hex"
@@ -51,6 +52,7 @@ echo "== verilating benches =="
 vbuild tb_next_rtc       tb_next_rtc.sv $RTL/next_scr.sv
 vbuild tb_next_scc       tb_next_scc.sv $RTL/next_scc.sv
 vbuild tb_next_esp       tb_next_esp.sv $RTL/next_scsi.sv
+vbuild tb_next_floppy    tb_next_floppy.sv $RTL/next_floppy.sv
 vbuild tb_next_scsi      tb_next_scsi.sv $RTL/next_scsi.sv
 vbuild tb_next_enet      tb_next_enet.sv $RTL/next_enet_dma.sv
 vbuild tb_next_bridge    tb_next_bridge.sv $RTL/next_enet_dma.sv $RTL/next_enet_bridge.sv
@@ -77,6 +79,7 @@ run tb_rtc       "$WORK/vl_tb_next_rtc/tb_next_rtc"
 run tb_scc       "$WORK/vl_tb_next_scc/tb_next_scc"
 run tb_esp       "$WORK/vl_tb_next_esp/tb_next_esp"
 run tb_scsi      "$WORK/vl_tb_next_scsi/tb_next_scsi"
+run tb_floppy    "$WORK/vl_tb_next_floppy/tb_next_floppy"
 run tb_enet      "$WORK/vl_tb_next_enet/tb_next_enet"
 run tb_bridge    "$WORK/vl_tb_next_bridge/tb_next_bridge"
 run tb_rs        "$WORK/vl_tb_next_rs/tb_next_rs"

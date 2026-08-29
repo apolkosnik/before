@@ -65,6 +65,7 @@ localparam CONF_STR = {
 	"NeXT;;",
 	"F1,BINROM,Boot ROM;",
 	"S0,VHDIMG,SCSI Disk;",
+	"S1,IMGIMAFLPVFD,Floppy;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
@@ -88,7 +89,14 @@ wire        ioctl_wr;
 wire [26:0] ioctl_addr;
 wire  [7:0] ioctl_dout;
 
-wire        img_mounted;
+wire  [1:0] img_mounted_v, sd_ack_v;
+wire        img_mounted   = img_mounted_v[0];
+wire        fimg_mounted  = img_mounted_v[1];
+wire        sd_ack        = sd_ack_v[0];
+wire        fsd_ack       = sd_ack_v[1];
+wire [31:0] fsd_lba;
+wire        fsd_rd, fsd_wr, fsd_buff_wr;
+wire  [7:0] fsd_buff_din;
 wire        img_readonly;
 wire [63:0] img_size;
 wire [31:0] sd_lba;
@@ -97,7 +105,7 @@ wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_dout, sd_buff_din;
 wire        sd_buff_wr;
 
-hps_io #(.CONF_STR(CONF_STR)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(2)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -116,16 +124,16 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ioctl_addr(ioctl_addr),
 	.ioctl_dout(ioctl_dout),
 
-	.img_mounted(img_mounted),
+	.img_mounted(img_mounted_v),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
-	.sd_lba('{sd_lba}),
-	.sd_rd(sd_rd),
-	.sd_wr(sd_wr),
-	.sd_ack(sd_ack),
+	.sd_lba('{sd_lba, fsd_lba}),
+	.sd_rd({fsd_rd, sd_rd}),
+	.sd_wr({fsd_wr, sd_wr}),
+	.sd_ack(sd_ack_v),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
-	.sd_buff_din('{sd_buff_din}),
+	.sd_buff_din('{sd_buff_din, fsd_buff_din}),
 	.sd_buff_wr(sd_buff_wr),
 
 	.RTC(hps_rtc),
@@ -193,6 +201,18 @@ next_system #(
 	.ps2_key(ps2_key),
 	.boot_sel(status[56:55]),
 	.hps_rtc(hps_rtc),
+
+	.fimg_mounted(fimg_mounted),
+	.fimg_readonly(img_readonly),
+	.fimg_size(img_size),
+	.fsd_lba(fsd_lba),
+	.fsd_rd(fsd_rd),
+	.fsd_wr(fsd_wr),
+	.fsd_ack(fsd_ack),
+	.fsd_buff_addr(sd_buff_addr[8:0]),
+	.fsd_buff_dout(sd_buff_dout),
+	.fsd_buff_din(fsd_buff_din),
+	.fsd_buff_wr(sd_buff_wr),
 
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),

@@ -58,6 +58,19 @@ module next_system #(
 	// host time of day (hps_io RTC port)
 	input  [64:0] hps_rtc,
 
+	// floppy image (MiSTer SD block interface, slot 1)
+	input         fimg_mounted,
+	input         fimg_readonly,
+	input  [63:0] fimg_size,
+	output [31:0] fsd_lba,
+	output        fsd_rd,
+	output        fsd_wr,
+	input         fsd_ack,
+	input   [8:0] fsd_buff_addr,
+	input   [7:0] fsd_buff_dout,
+	output  [7:0] fsd_buff_din,
+	input         fsd_buff_wr,
+
 	// SCSI disk image (MiSTer SD block interface)
 	input         img_mounted,
 	input         img_readonly,
@@ -532,10 +545,12 @@ wire io_scr2  = sel_io && (io_off[16:11] == 6'h1A);             // 0x0d000-0x0d7
 wire io_timer = sel_io && (io_off[16:12] == 5'h16);             // 0x16000-0x16fff
 wire io_scc   = sel_io && (io_off[16:3]  == 14'h3000);          // 0x18000-0x18007
 wire io_esp   = sel_io && (io_off[16:6]  == 11'h500);           // 0x14000-0x1403f
+wire io_flp   = sel_io && (io_off[16:4]  == 13'h1410);          // 0x14100-0x1410f
 wire io_evt   = sel_io && (io_off[16:12] == 5'h1a);             // 0x1a000-0x1afff
 wire io_scr   = io_scr1 | io_sid | io_scr2;
 
 wire [15:0] scr_rdata, intc_rdata, timer_rdata, dma_rdata, scc_rdata, esp_rdata, enet_rdata, mo_rdata, snd_rdata;
+wire [15:0] flp_rdata;
 
 // event counter: 20-bit microsecond counter, latched when its first byte
 // is read, reset by a write (System_Timer_Read/Write in Previous
@@ -572,6 +587,7 @@ assign io_rdata = io_enet  ? enet_rdata :
                   io_timer ? timer_rdata :
                   io_scc   ? scc_rdata :
                   io_esp   ? esp_rdata :
+                  io_flp   ? flp_rdata :
                   io_evt   ? evt_rdata : 16'h0000;
 
 // system control registers and RTC
@@ -730,6 +746,47 @@ next_kms_snd #(.CLK_HZ(CLK_HZ)) kms_snd
 	.int_keymouse(int_keymouse)
 );
 
+// Floppy drive: an 82077 whose sector data rides the SCSI DMA channel
+wire        int_floppy, flp_select;
+wire        flp_req, flp_wr, flp_bwe, flp_done;
+wire [10:0] flp_len;
+wire  [9:0] flp_addr;
+wire  [7:0] flp_bwdata, flp_bq;
+
+next_floppy #(.CLK_HZ(CLK_HZ)) floppy
+(
+	.clk(clk),
+	.reset(dev_reset),
+	.sel(io_flp),
+	.addr(io_off[3:0]),
+	.we(is_write),
+	.be(lanes),
+	.wdata(cpu_dout),
+	.rdata(flp_rdata),
+	.int_floppy(int_floppy),
+	.flp_select(flp_select),
+	.mo_gpo(1'b0),
+	.buf_addr(flp_addr),
+	.buf_we(flp_bwe),
+	.buf_wdata(flp_bwdata),
+	.buf_q(flp_bq),
+	.buf_len(flp_len),
+	.dma_req(flp_req),
+	.dma_wr(flp_wr),
+	.dma_done(flp_done),
+	.img_mounted(fimg_mounted),
+	.img_readonly(fimg_readonly),
+	.img_size(fimg_size),
+	.sd_lba(fsd_lba),
+	.sd_rd(fsd_rd),
+	.sd_wr(fsd_wr),
+	.sd_ack(fsd_ack),
+	.sd_buff_addr(fsd_buff_addr),
+	.sd_buff_dout(fsd_buff_dout),
+	.sd_buff_din(fsd_buff_din),
+	.sd_buff_wr(fsd_buff_wr)
+);
+
 // SCSI controller, disk target and DMA channel
 wire esp_int_scsi, int_scsi_dma;
 
@@ -754,6 +811,15 @@ next_scsi #(.CLK_HZ(CLK_HZ)) scsi
 	.m_din(sc_m_din),
 	.m_dout(ram_dout),
 	.m_ack(sc_m_ack),
+	.flp_select(flp_select),
+	.flp_req(flp_req),
+	.flp_wr(flp_wr),
+	.flp_len(flp_len),
+	.flp_addr(flp_addr),
+	.flp_bwe(flp_bwe),
+	.flp_bwdata(flp_bwdata),
+	.flp_bq(flp_bq),
+	.flp_done(flp_done),
 	.int_scsi(esp_int_scsi),
 	.int_scsi_dma(int_scsi_dma),
 	.img_mounted(img_mounted),
@@ -797,13 +863,14 @@ next_bmap bmap
 );
 
 // interrupt controller
-reg soft1_d, soft2_d, scsi_d;
+reg soft1_d, soft2_d, scsi_d, flp_d;
 reg entx_d, enrx_d, entxd_d, enrxd_d, disk_d, diskd_d, sndo_d, sndd_d, km_d;
 reg scsid_d;
 always @(posedge clk) begin
 	soft1_d <= softint1;
 	soft2_d <= softint2;
 	scsi_d  <= esp_int_scsi;
+	flp_d   <= int_floppy;
 	scsid_d <= int_scsi_dma;
 	entx_d  <= int_en_tx;
 	enrx_d  <= int_en_rx;
@@ -821,6 +888,7 @@ wire [31:0] int_set =
 	({31'd0, softint2 & ~soft2_d} << 1) |
 	({31'd0, int_keymouse & ~km_d} << 3) |
 	({31'd0, vid_int_set} << 5) |
+	({31'd0, int_floppy & ~flp_d} << 7) |
 	({31'd0, int_snd_ovrun & ~sndo_d} << 8) |
 	({31'd0, int_en_rx & ~enrx_d} << 9) |
 	({31'd0, int_en_tx & ~entx_d} << 10) |
@@ -838,6 +906,7 @@ wire [31:0] int_clr =
 	({31'd0, ~softint2 & soft2_d} << 1) |
 	({31'd0, ~int_keymouse & km_d} << 3) |
 	({31'd0, vid_int_clr} << 5) |
+	({31'd0, ~int_floppy & flp_d} << 7) |
 	({31'd0, ~int_snd_ovrun & sndo_d} << 8) |
 	({31'd0, ~int_en_rx & enrx_d} << 9) |
 	({31'd0, ~int_en_tx & entx_d} << 10) |

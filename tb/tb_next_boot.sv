@@ -59,6 +59,11 @@ next_system #(
 	.ps2_key(11'd0),
 	.boot_sel(bootsd ? 2'd1 : 2'd0),
 	.hps_rtc(hps_rtc),
+	.fimg_mounted(1'b0), .fimg_readonly(1'b0), .fimg_size(64'd0),
+	.fsd_lba(), .fsd_rd(), .fsd_wr(), .fsd_ack(1'b0),
+	.fsd_buff_addr(9'd0), .fsd_buff_dout(8'd0), .fsd_buff_din(),
+	.fsd_buff_wr(1'b0),
+
 	.img_mounted(img_mounted),
 	.img_readonly(1'b0),
 	.img_size(img_bytes),
