@@ -457,6 +457,77 @@ initial begin
 		if (cart[2*MO_SECT + i] !== dbyte(2*MO_SECT + i)) ok = 0;
 	check(ok, "erase: the sector after it is untouched");
 
+	//------------------------------------------------------------
+	// Write a sector out of memory, the way a driver stages one: the
+	// buffer is filled by an explicit ECC Write, then the formatter
+	// commits it when the sector comes round.  Sector 5 starts 6480
+	// bytes in, part way through a block as ever.  What lands on the
+	// disk is the buffer, so that is what it is checked against - the
+	// codec has had its say by then.
+	//------------------------------------------------------------
+	osp_wr8(5'h08, 8'h5A); osp_wr8(5'h09, 8'h00);   // spiral off
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h10); osp_wr8(5'h09, 8'h00);   // recalibrate
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'hA0); osp_wr8(5'h09, 8'h01);   // high order seek 1
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h00); osp_wr8(5'h09, 8'h00);   // seek -> track 0x1000
+	repeat (200) @(posedge clk);
+
+	for (i = 0; i < MO_SECT; i = i + 1)
+		ram_set_byte(DST2 + i, 8'hC3 ^ i[7:0] ^ {i[10:8], 5'd0});
+
+	osp_wr8(5'h07, 8'h00);            // formatter reset
+	osp_wr8(5'h06, 8'h60);            // ECC_DIS | ECC_MODE: 1296 bytes
+	ptr_wr32(5'h00, DST2);
+	ptr_wr32(5'h04, DST2 + MO_SECT);
+	csr_cmd(8'h11);                   // RESET | SETENABLE
+	osp_wr8(5'h07, 8'h40);            // FMT_ECC_WRITE: stage the sector
+	repeat (100) @(posedge clk);      // let the engine pick the command up
+	waited = 0;
+	while (dut.ecc_state != 3'd0 && waited < 900000) begin
+		@(posedge clk);
+		waited = waited + 1;
+	end
+	check(dut.ecc_state == 3'd0, "write: the sector is staged in the buffer");
+
+	osp_wr8(5'h08, 8'h43); osp_wr8(5'h09, 8'h00);   // select write head
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h00, 8'h10);            // track high
+	osp_wr8(5'h01, 8'h00);            // track low
+	osp_wr8(5'h02, 8'h05);            // sector 5
+	osp_wr8(5'h03, 8'h01);            // one sector
+	osp_wr8(5'h04, 8'hFF);            // clear the interrupt status
+	osp_wr8(5'h08, 8'h59); osp_wr8(5'h09, 8'h00);   // spiral on
+	repeat (100) @(posedge clk);
+	osp_wr8(5'h07, 8'h01);            // FMT_WRITE
+
+	waited = 0;
+	v = 0;
+	while (!v[2] && waited < 400000) begin
+		osp_rd8(5'h04, v);
+		waited = waited + 1;
+	end
+	check(v[2], "write: the operation completes");
+	$display("  cartridge blocks: %0d read, %0d written", osd_reads, osd_writes);
+
+	ok = 1;
+	for (i = 0; i < MO_SECT; i = i + 1)
+		if (cart[5*MO_SECT + i] !== dut.eccbuf[i]) begin
+			if (ok) $display("  byte %0d: disk %02x buffer %02x",
+			                 i, cart[5*MO_SECT + i], dut.eccbuf[i]);
+			ok = 0;
+		end
+	check(ok, "write: the sector on the disk is the buffer that was committed");
+	ok = 1;
+	for (i = 0; i < MO_SECT; i = i + 1)
+		if (cart[4*MO_SECT + i] !== dbyte(4*MO_SECT + i)) ok = 0;
+	check(ok, "write: the sector before it is untouched");
+	ok = 1;
+	for (i = 0; i < MO_SECT; i = i + 1)
+		if (cart[6*MO_SECT + i] !== dbyte(6*MO_SECT + i)) ok = 0;
+	check(ok, "write: the sector after it is untouched");
+
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);
 	$finish;

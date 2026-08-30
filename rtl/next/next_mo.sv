@@ -309,7 +309,12 @@ reg  [10:0] mo_addr;
 reg   [7:0] mo_wdata;
 reg         mo_we;
 
-wire [10:0] ecc_addr = dsk_active ? dsk_addr  : rs_active ? rs_addr  : mo_addr;
+// While a block goes back to the card the buffer must answer in step
+// with the byte being asked for: registering the address as well as
+// the data would put it two cycles behind, and zeroes go out instead.
+wire [10:0] dsk_wr_addr = wgidx[10:0] - {2'd0, dsk_skip};
+wire [10:0] ecc_addr = (dsk_active && dsk_is_wr) ? dsk_wr_addr :
+                       dsk_active ? dsk_addr : rs_active ? rs_addr : mo_addr;
 wire  [7:0] ecc_wd   = dsk_active ? dsk_wdata : rs_active ? rs_wdata : mo_wdata;
 wire        ecc_we   = dsk_active ? dsk_we    : rs_active ? rs_we    : mo_we;
 
@@ -730,14 +735,21 @@ always @(posedge clk) begin
 						end
 						else dsk_start(sector_id, 1'b1, 1'b0);
 					end
-					else begin
-						write_timing <= 1;
+					else if (!write_timing && d_csr[0] && d_next < d_limit) begin
+						// the reference's note that the first sector
+						// must miss is about pre-filling the buffer:
+						// fill it once here, and again after each
+						// sector is committed.  Re-arming it on every
+						// miss instead drains the channel dry and
+						// stalls before a matching sector ever comes.
 						ecc_size  <= 0;
 						ecc_limit <= SECT_DATA;
 						ecc_is_read <= 0;
 						ecc_repeat <= |(csr2 & MOCSR2_ECC_BLOCKS);
 						ecc_state <= ECC_FILL;
+						write_timing <= 1;
 					end
+					else write_timing <= 1;
 				end
 				FM_ERASE: if (match) begin
 					if (drv_wp[dnum]) begin
@@ -830,9 +842,6 @@ always @(posedge clk) begin
 		default: dst <= D_IDLE;
 		endcase
 
-		// while a block is being written back, point the buffer at the
-		// byte the card is asking for
-		if (dsk_active && dsk_is_wr) dsk_addr <= wgidx - {1'd0, dsk_skip};
 
 		//------------------------------------------------------------
 		// ECC engine
@@ -849,7 +858,11 @@ always @(posedge clk) begin
 			end
 			else if (d_csr[0] && d_next < d_limit) begin
 				case (mst)
-				M_IDLE: if (tick) mst <= M_REQ;
+				// The 50 us step paces the standalone ECC commands.  A
+				// sector driven by the drive cannot afford it: at a byte
+				// per step a sector takes forty sector times, and the
+				// head is tracks away before it could be committed.
+				M_IDLE: if (tick || fmt_mode != FM_IDLE) mst <= M_REQ;
 				M_REQ: begin
 					m_req <= 1;
 					m_we <= 0;
