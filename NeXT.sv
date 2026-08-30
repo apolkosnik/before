@@ -65,8 +65,8 @@ localparam CONF_STR = {
 	"NeXT;;",
 	"F1,BINROM,Boot ROM;",
 	"S0,VHDIMG,SCSI Disk 0;",
-	"S1,IMGIMAFLPVFD,Floppy;",
 	"S2,VHDIMG,SCSI Disk 1;",
+	"S1,IMGIMAFLPVFD,Floppy 0;",
 	"S3,IMGIMAFLPVFD,Floppy 1;",
 	"S4,IMGMO,Optical 0;",
 	"S5,IMGMO,Optical 1;",
@@ -92,8 +92,8 @@ wire        ioctl_wr;
 wire [26:0] ioctl_addr;
 wire  [7:0] ioctl_dout;
 
-// Slot 0 is SCSI target 0, slot 1 the floppy, slot 2 SCSI target 1.
-// The order keeps a saved configuration's existing mounts in place.
+// Slots run in device order: the two SCSI targets, then the two
+// floppy drives, then the two optical drives.
 wire  [5:0] img_mounted_v, sd_ack_v;
 wire  [1:0] oimg_mounted  = {img_mounted_v[5], img_mounted_v[4]};
 wire        osd_unit;
@@ -101,12 +101,12 @@ wire [31:0] osd_lba;
 wire        osd_rd, osd_wr;
 wire  [7:0] osd_buff_din;
 wire        osd_ack       = osd_unit ? sd_ack_v[5] : sd_ack_v[4];
-wire  [1:0] img_mounted   = {img_mounted_v[2], img_mounted_v[0]};
-wire  [1:0] fimg_mounted  = {img_mounted_v[3], img_mounted_v[1]};
+wire  [1:0] img_mounted   = {img_mounted_v[1], img_mounted_v[0]};
+wire  [1:0] fimg_mounted  = {img_mounted_v[3], img_mounted_v[2]};
 wire        sd_unit, fsd_unit;
 // one engine, two targets: its SD request goes to the slot it names
-wire        sd_ack        = sd_unit ? sd_ack_v[2] : sd_ack_v[0];
-wire        fsd_ack       = fsd_unit ? sd_ack_v[3] : sd_ack_v[1];
+wire        sd_ack        = sd_unit ? sd_ack_v[1] : sd_ack_v[0];
+wire        fsd_ack       = fsd_unit ? sd_ack_v[3] : sd_ack_v[2];
 wire [31:0] fsd_lba;
 wire        fsd_rd, fsd_wr, fsd_buff_wr;
 wire  [7:0] fsd_buff_din;
@@ -140,15 +140,15 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(6)) hps_io
 	.img_mounted(img_mounted_v),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
-	.sd_lba('{sd_lba, fsd_lba, sd_lba, fsd_lba, osd_lba, osd_lba}),
+	.sd_lba('{sd_lba, sd_lba, fsd_lba, fsd_lba, osd_lba, osd_lba}),
 	.sd_rd({osd_rd & osd_unit, osd_rd & ~osd_unit,
-	        fsd_rd & fsd_unit, sd_rd & sd_unit, fsd_rd & ~fsd_unit, sd_rd & ~sd_unit}),
+	        fsd_rd & fsd_unit, fsd_rd & ~fsd_unit, sd_rd & sd_unit, sd_rd & ~sd_unit}),
 	.sd_wr({osd_wr & osd_unit, osd_wr & ~osd_unit,
-	        fsd_wr & fsd_unit, sd_wr & sd_unit, fsd_wr & ~fsd_unit, sd_wr & ~sd_unit}),
+	        fsd_wr & fsd_unit, fsd_wr & ~fsd_unit, sd_wr & sd_unit, sd_wr & ~sd_unit}),
 	.sd_ack(sd_ack_v),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
-	.sd_buff_din('{sd_buff_din, fsd_buff_din, sd_buff_din, fsd_buff_din, osd_buff_din, osd_buff_din}),
+	.sd_buff_din('{sd_buff_din, sd_buff_din, fsd_buff_din, fsd_buff_din, osd_buff_din, osd_buff_din}),
 	.sd_buff_wr(sd_buff_wr),
 
 	.ps2_key(ps2_key)
