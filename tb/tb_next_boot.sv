@@ -63,7 +63,7 @@ next_system #(
 	.fsd_lba(fsd_lba), .fsd_rd(fsd_rd), .fsd_wr(fsd_wr), .fsd_ack(fsd_ack),
 	.fsd_buff_addr(fsd_buff_addr), .fsd_buff_dout(fsd_buff_dout),
 	.fsd_buff_din(fsd_buff_din), .fsd_buff_wr(fsd_buff_wr),
-	.img_mounted({1'b0, img_mounted}),
+	.img_mounted({5'b00000, img_mounted}),
 	.sd_unit(),
 	.img_readonly(1'b0),
 	.img_size(img_bytes),

@@ -89,7 +89,7 @@ next_scsi #(.CLK_HZ(1000000)) scsi
 	.flp_len(flp_len), .flp_addr(flp_addr), .flp_bwe(flp_bwe),
 	.flp_bwdata(flp_bwdata), .flp_bq(flp_bq), .flp_done(flp_done),
 	.int_scsi(), .int_scsi_dma(),
-	.img_mounted(2'b00), .img_readonly(1'b0), .img_size(64'd0),
+	.img_mounted(6'b000000), .img_readonly(1'b0), .img_size(64'd0),
 	.sd_unit(),
 	.sd_lba(), .sd_rd(), .sd_wr(), .sd_ack(1'b0),
 	.sd_buff_addr(9'd0), .sd_buff_dout(8'd0), .sd_buff_din(),

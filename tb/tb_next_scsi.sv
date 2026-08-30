@@ -84,7 +84,7 @@ next_scsi #(.CLK_HZ(1000000)) dut
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
 	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
 	.int_scsi(int_scsi), .int_scsi_dma(int_scsi_dma),
-	.img_mounted({img_mounted2, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
+	.img_mounted({4'b0000, img_mounted2, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
 	.sd_unit(),
 	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
@@ -164,7 +164,7 @@ always @(posedge clk) begin
 	else if (sd_ack && sd_rd_active) begin
 		// one byte every other cycle
 		if (!sd_buff_wr && sd_buff_addr <= 9'd511) begin
-			sd_buff_dout <= dut.sd_unit
+			sd_buff_dout <= (dut.sd_unit == 3'd1)
 			              ? disk2[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}]
 			              : disk [{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}];
 			sd_buff_wr <= 1;
@@ -181,7 +181,7 @@ always @(posedge clk) begin
 	else if (sd_ack && sd_wr_active) begin
 		// read a byte every other cycle (registered buffer read)
 		if (rd_phase) begin
-			if (dut.sd_unit)
+			if (dut.sd_unit == 3'd1)
 				disk2[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
 			else
 				disk [{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
@@ -819,7 +819,7 @@ initial begin
 	wait_irq;
 	read_intr(intr);
 	check(intr != 8'h20, "target 1: selected, not a selection timeout");
-	check(dut.sd_unit == 1'b1, "target 1: the SD request names slot 1");
+	check(dut.sd_unit == 3'd1, "target 1: the SD request names slot 1");
 	ptr_wr32(6'h10, 32'h00006000);
 	ptr_wr32(6'h14, 32'h00006200);
 	csr_cmd(8'h11);

@@ -81,10 +81,10 @@ module next_system #(
 	input         fsd_buff_wr,
 
 	// SCSI disk image (MiSTer SD block interface)
-	input   [1:0] img_mounted,     // one per SCSI target (0 and 1)
+	input   [5:0] img_mounted,     // one per SCSI target (0..5)
 	input         img_readonly,
 	input  [63:0] img_size,
-	output        sd_unit,         // which target's slot sd_* addresses
+	output  [2:0] sd_unit,         // which target's slot sd_* addresses
 	output [31:0] sd_lba,
 	output        sd_rd,
 	output        sd_wr,
