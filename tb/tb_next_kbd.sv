@@ -108,7 +108,7 @@ integer errors = 0;
 
 task check;
 	input cond;
-	input [255:0] name;
+	input [639:0] name;
 	begin
 		if (cond) $display("PASS: %0s", name);
 		else begin $display("FAIL: %0s", name); errors = errors + 1; end

@@ -102,11 +102,28 @@ reg [31:0] ram [0:16383];
 reg        ack_r = 0;
 assign m_ack = ack_r;
 
+// The kernel's dma_bytes_moved() derives its byte count from the
+// channel's next pointer.  Two faults make it cry overflow: a write
+// landing outside the buffer the driver programmed, and a next pointer
+// carried past limit.  Watch for both continuously, not at the end.
+wire [31:0] m_byte = {6'd0, m_addr, 2'b00};
+reg  [31:0] win_lo = 0, win_hi = 32'hFFFFFFFF;
+integer     stray_wr = 0, overrun = 0;
+
+// Only an armed channel makes a claim about its pointers: while the
+// driver is still programming them in 16-bit halves, next and limit
+// disagree by construction.
+always @(posedge clk)
+	if (!reset && scsi.d_csr[0] && scsi.d_next > scsi.d_limit)
+		overrun = overrun + 1;
+
 always @(posedge clk) begin
 	if (reset) ack_r <= 0;
 	else if (!m_req) ack_r <= 0;
 	else if (!ack_r) begin
 		if (m_we) begin
+			if (m_byte < win_lo || m_byte >= win_hi)
+				stray_wr = stray_wr + 1;
 			if (m_be[3]) ram[m_addr[13:0]][31:24] <= m_din[31:24];
 			if (m_be[2]) ram[m_addr[13:0]][23:16] <= m_din[23:16];
 			if (m_be[1]) ram[m_addr[13:0]][15:8]  <= m_din[15:8];
@@ -226,7 +243,7 @@ integer errors = 0;
 
 task check;
 	input cond;
-	input [255:0] name;
+	input [639:0] name;
 	begin
 		if (cond) $display("PASS: %0s", name);
 		else begin $display("FAIL: %0s", name); errors = errors + 1; end
@@ -234,6 +251,20 @@ task check;
 endtask
 
 localparam BUF = 32'h00002000;
+
+task hard_reset;
+	begin
+		reset = 1;
+		repeat (10) @(posedge clk);
+		reset = 0;
+		repeat (10) @(posedge clk);
+		fimg_size = BLOCKS*512;
+		fimg_mounted = 1;
+		@(posedge clk);
+		fimg_mounted = 0;
+		repeat (20) @(posedge clk);
+	end
+endtask
 
 integer i, s, bad;
 reg [7:0] v;
@@ -315,6 +346,66 @@ initial begin
 				bad = bad + 1;
 			end
 	check(bad == 0, "every sector of the track reached memory in order");
+
+	//--------------------------------------------------------------
+	// A buffer shorter than the transfer.  The driver programs the
+	// channel over what it has; the drive is told to read a whole
+	// track.  The channel must stop dead at limit: it may leave the
+	// drive waiting, but it may not write past the buffer, and it may
+	// not carry next beyond limit for the kernel to subtract.
+	//--------------------------------------------------------------
+	hard_reset;
+	win_lo = BUF; win_hi = BUF + 32'd4*512;
+	stray_wr = 0; overrun = 0;
+	ptr_wr32(6'h10, BUF);
+	ptr_wr32(6'h14, BUF + 32'd4*512);
+	csr_cmd(8'h11);
+	fwr(4'h8, 8'h40);
+	fwr(4'h2, 8'h1C);
+	fwr(4'h5, 8'h46);
+	fwr(4'h5, 8'h00); fwr(4'h5, 8'h00); fwr(4'h5, 8'h00);
+	fwr(4'h5, 8'h01); fwr(4'h5, 8'h02); fwr(4'h5, 8'd18);
+	fwr(4'h5, 8'h1B); fwr(4'h5, 8'hFF);
+
+	waited = 0;
+	while (!int_floppy && waited < 3000000) begin
+		@(posedge clk);
+		waited = waited + 1;
+	end
+	$display("  short buffer: next=%08x limit=%08x stray=%0d overrun=%0d",
+	         scsi.d_next, scsi.d_limit, stray_wr, overrun);
+	check(stray_wr == 0, "a short buffer is never written past its limit");
+	check(overrun == 0,  "next never walks past limit on a short buffer");
+
+	//--------------------------------------------------------------
+	// A limit that is not a whole number of words above next.  The
+	// channel issues while next < limit but only completes on
+	// next + 4 == limit, so an odd tail can step over that equality
+	// and leave next above limit - which is exactly the subtraction
+	// the kernel reports as a buffer overflow.
+	//--------------------------------------------------------------
+	hard_reset;
+	win_lo = BUF; win_hi = BUF + 32'd1022;
+	stray_wr = 0; overrun = 0;
+	ptr_wr32(6'h10, BUF);
+	ptr_wr32(6'h14, BUF + 32'd1022);
+	csr_cmd(8'h11);
+	fwr(4'h8, 8'h40);
+	fwr(4'h2, 8'h1C);
+	fwr(4'h5, 8'h46);
+	fwr(4'h5, 8'h00); fwr(4'h5, 8'h00); fwr(4'h5, 8'h00);
+	fwr(4'h5, 8'h01); fwr(4'h5, 8'h02); fwr(4'h5, 8'd03);
+	fwr(4'h5, 8'h1B); fwr(4'h5, 8'hFF);
+
+	waited = 0;
+	while (!int_floppy && waited < 3000000) begin
+		@(posedge clk);
+		waited = waited + 1;
+	end
+	$display("  unaligned limit: next=%08x limit=%08x stray=%0d overrun=%0d",
+	         scsi.d_next, scsi.d_limit, stray_wr, overrun);
+	check(stray_wr == 0, "an unaligned limit is never written past");
+	check(overrun == 0,  "next never walks past an unaligned limit");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

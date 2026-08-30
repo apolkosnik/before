@@ -1137,12 +1137,17 @@ always @(posedge clk) begin
 			end
 			else if (m_ack) begin
 				m_req <= 0;
-				d_next <= d_next + 3'd4;
+				// A limit that is not a whole number of words above next
+				// is a programming error - the reference aborts on it - but
+				// it must not leave next above limit, because the driver
+				// subtracts the two to count the bytes moved and calls the
+				// difference a buffer overflow.  Stop on the limit instead.
+				d_next <= (d_next + 3'd4 > d_limit) ? d_limit : (d_next + 3'd4);
 				word_cnt <= 0;
 				// dma_interrupt(CHANNEL_SCSI): the pause before data
 				// flows into the swapped buffer is the driver's window
 				// to program the next chain segment
-				if (d_next + 3'd4 == d_limit) begin
+				if (d_next + 3'd4 >= d_limit) begin
 					d_csr[3] <= 1;
 					gap_us <= GAP_US;
 					if (d_csr[1]) begin
@@ -1198,8 +1203,8 @@ always @(posedge clk) begin
 				m_req <= 0;
 				word_buf <= m_dout;
 				do_rem <= 3'd4;
-				d_next <= d_next + 3'd4;
-				if (d_next + 3'd4 == d_limit) begin
+				d_next <= (d_next + 3'd4 > d_limit) ? d_limit : (d_next + 3'd4);
+				if (d_next + 3'd4 >= d_limit) begin
 					d_csr[3] <= 1;
 					gap_us <= GAP_US;
 					if (d_csr[1]) begin
