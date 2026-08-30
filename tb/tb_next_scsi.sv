@@ -368,7 +368,7 @@ endtask
 localparam BUF = 32'h00002000;
 localparam BUF2 = 32'h00003000;
 
-integer i;
+integer i, s;
 reg [7:0] v, sts;
 reg [31:0] d;
 reg [7:0] intr;
@@ -552,6 +552,80 @@ initial begin
 	check(ok, "chained read: no DMA write outside the programmed windows");
 	finish_command(sts);
 	check(sts == 8'h00, "chained read: good status");
+
+	//------------------------------------------------------------
+	// chained WRITE(10), four blocks, the way fsck repairs a
+	// filesystem: a ten byte CDB and a double buffered channel.
+	// The modelled disk is 8 blocks, so this writes 2..5 and keeps
+	// 1 and 6 as canaries.  Only
+	// a single block WRITE(6) had ever been tested, so neither the
+	// ten byte command nor a segment boundary in the data-out
+	// direction had been driven at all.  A write that lands short, or
+	// in the wrong block, is what turns a repair into corruption.
+	//------------------------------------------------------------
+	for (s = 0; s < 4; s = s + 1)
+		for (i = 0; i < 512; i = i + 1) begin
+			case (i[1:0])
+				0: ram[((32'h00003000 + s*1024 + i) >> 2)][31:24] = ~pat(2+s, i);
+				1: ram[((32'h00003000 + s*1024 + i) >> 2)][23:16] = ~pat(2+s, i);
+				2: ram[((32'h00003000 + s*1024 + i) >> 2)][15:8]  = ~pat(2+s, i);
+				3: ram[((32'h00003000 + s*1024 + i) >> 2)][7:0]   = ~pat(2+s, i);
+			endcase
+		end
+
+	// WRITE(10) of 4 blocks at LBA 10
+	select_atn10(8'h2A, 8'h00, 8'h00, 8'h00, 8'h00, 8'd2,
+	             8'h00, 8'h00, 8'd4, 8'h00);
+	wait_irq;
+	read_intr(intr);
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd0, "chained write: data out phase");
+
+	ptr_wr32(6'h10, 32'h00003000);           // segment A
+	ptr_wr32(6'h14, 32'h00003200);
+	ptr_wr32(6'h18, 32'h00003400);           // segment B armed
+	ptr_wr32(6'h1C, 32'h00003600);
+	csr_cmd(8'h13);                          // SETENABLE | SETSUPDATE
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h08);                   // 2048 bytes
+	esp_wr8(6'h03, 8'h90);                   // transfer info, DMA
+
+	wait_dma_complete;
+	csr_cmd(8'h08);
+	ptr_wr32(6'h18, 32'h00003800);           // segment C
+	ptr_wr32(6'h1C, 32'h00003A00);
+	csr_cmd(8'h02);
+	wait_dma_complete;
+	csr_cmd(8'h08);
+	ptr_wr32(6'h18, 32'h00003C00);           // segment D
+	ptr_wr32(6'h1C, 32'h00003E00);
+	csr_cmd(8'h02);
+	wait_dma_complete;
+	csr_cmd(8'h08);
+
+	wait_irq;
+	read_intr(intr);
+	check(intr == 8'h08, "chained write: function complete");
+
+	ok = 1;
+	for (s = 0; s < 4; s = s + 1)
+		for (i = 0; i < 512; i = i + 1)
+			if (disk[(2+s)*512 + i] !== (~pat(2+s, i) & 8'hFF)) begin
+				if (ok) $display("  block %0d byte %0d: got %02x want %02x",
+				                 2+s, i, disk[(2+s)*512 + i],
+				                 ~pat(2+s, i) & 8'hFF);
+				ok = 0;
+			end
+	check(ok, "chained write: all four blocks landed byte exact");
+
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1) begin
+		if (disk[1*512 + i] !== pat(1, i)) ok = 0;
+		if (disk[6*512 + i] !== pat(6, i)) ok = 0;
+	end
+	check(ok, "chained write: neighbouring blocks untouched");
+	finish_command(sts);
+	check(sts == 8'h00, "chained write: good status");
 
 	//------------------------------------------------------------
 	// selection timeout on target 1 (no disk there)
