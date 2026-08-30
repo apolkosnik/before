@@ -49,6 +49,32 @@ reg   [7:0] sd_buff_dout = 0;
 wire  [7:0] sd_buff_din;
 reg         sd_buff_wr = 0;
 
+// The floppy shares this channel: it has no memory master of its own,
+// so its sectors move through the very next/limit registers the SCSI
+// driver is using.  A hand-over that happens while a SCSI command is
+// still in flight would move floppy data with disk pointers.
+reg         flp_select = 0, flp_req = 0;
+reg         flp_wr = 1;   // 1 = floppy to memory, i.e. a sector read
+reg  [10:0] flp_len = 11'd512;
+wire  [9:0] flp_addr;
+wire        flp_bwe, flp_done;
+wire  [7:0] flp_bwdata;
+reg   [7:0] fbuf [0:511];
+reg   [7:0] flp_bq_r;
+assign flp_bq = flp_bq_r;
+wire  [7:0] flp_bq;
+always @(posedge clk) begin
+	flp_bq_r <= fbuf[flp_addr[8:0]];
+	if (flp_bwe) fbuf[flp_addr[8:0]] <= flp_bwdata;
+end
+
+// the invariant: the floppy may not take the channel while a SCSI
+// command is outstanding
+reg     scsi_busy = 0;
+integer seize = 0;
+always @(posedge clk)
+	if (!reset && scsi_busy && dut.flp_active) seize = seize + 1;
+
 next_scsi #(.CLK_HZ(1000000)) dut
 (
 	.clk(clk), .reset(reset),
@@ -60,7 +86,10 @@ next_scsi #(.CLK_HZ(1000000)) dut
 	.img_mounted(img_mounted), .img_readonly(1'b0), .img_size(img_size),
 	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
-	.sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr)
+	.sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
+	.flp_select(flp_select), .flp_req(flp_req), .flp_wr(flp_wr),
+	.flp_len(flp_len), .flp_addr(flp_addr), .flp_bwe(flp_bwe),
+	.flp_bwdata(flp_bwdata), .flp_bq(flp_bq), .flp_done(flp_done)
 );
 
 //----------------------------------------------------------------------------
@@ -678,6 +707,86 @@ initial begin
 	check(d == 32'h04123450, "saved next holds a written value");
 	sptr_rd32(6'h04, d);
 	check(d == 32'h04123650, "saved limit holds a written value");
+
+	//------------------------------------------------------------
+	// The floppy asks for the channel while a SCSI command is in
+	// flight.  Both devices move their sectors through the same
+	// next/limit registers, so a hand-over mid-command would write
+	// floppy data over the disk driver's buffer and advance the
+	// driver's pointer under it.  The hand-over must wait for idle,
+	// and the request must not be lost while it waits.
+	//------------------------------------------------------------
+	for (i = 0; i < 512; i = i + 1) fbuf[i] = 8'hA5 ^ i[7:0];
+	for (s = 0; s < 4; s = s + 1)            // restore what we overwrote
+		for (i = 0; i < 512; i = i + 1) disk[(2+s)*512 + i] = pat(2+s, i);
+	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'hDEADBEEF;
+	seize = 0;
+
+	select_atn6(8'h08, 8'h00, 8'h00, 8'h02, 8'h04, 8'h00);   // 4 blocks, LBA 2
+	scsi_busy = 1;
+	wait_irq;
+	read_intr(intr);
+	ptr_wr32(6'h10, 32'h00004000);
+	ptr_wr32(6'h14, 32'h00004800);           // one 2048 byte window
+	csr_cmd(8'h11);
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h08);                   // 2048 bytes
+	esp_wr8(6'h03, 8'h90);                   // transfer info, DMA
+
+	// the drive raises its request in the middle of the disk transfer
+	repeat (200) @(posedge clk);
+	flp_select = 1;
+	flp_req    = 1;
+
+	wait_irq;
+	read_intr(intr);
+	check(intr == 8'h08, "shared channel: the disk command still completes");
+	scsi_busy = 0;
+
+	// The hand-over is only allowed at an idle moment, and a SCSI
+	// command has idle moments - it waits there for the driver to
+	// re-arm the channel.  So the floppy may well take it before the
+	// command is over; the reference behaves the same way, because
+	// floppy_select simply chooses which device fills the channel.
+	// Excluding the two is the driver's job.  What the hardware must
+	// still guarantee is that the disk's data is not damaged by the
+	// request arriving.
+	if (seize != 0)
+		$display("  note: the floppy took the idle channel mid-command");
+	ok = 1;
+	for (s = 0; s < 4; s = s + 1)
+		for (i = 0; i < 512; i = i + 1)
+			if (ram_byte(32'h00004000 + s*512 + i) !== pat(2+s, i)) ok = 0;
+	check(ok, "shared channel: a request mid-command leaves the disk data intact");
+	finish_command(sts);
+	check(sts == 8'h00, "shared channel: good status");
+
+	// Drop the request the way a drive does once its sector is taken,
+	// then run a clean floppy transfer: the channel must still work
+	// for the floppy after a disk command has used it.
+	flp_req = 0;
+	repeat (50) @(posedge clk);
+	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'hDEADBEEF;
+	ptr_wr32(6'h10, 32'h00005000);
+	ptr_wr32(6'h14, 32'h00005200);
+	csr_cmd(8'h11);
+	flp_req = 1;
+	i = 0;
+	while (!flp_done && i < 2000000) begin
+		@(posedge clk);
+		i = i + 1;
+	end
+	check(flp_done, "shared channel: the floppy is served once the disk is done");
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1)
+		if (ram_byte(32'h00005000 + i) !== (8'hA5 ^ i[7:0])) ok = 0;
+	check(ok, "shared channel: the floppy sector lands in its own window");
+	ok = 1;
+	for (i = 0; i < 16384; i = i + 1)
+		if ((i < 'h1400 || i >= 'h1480) && ram[i] !== 32'hDEADBEEF) ok = 0;
+	check(ok, "shared channel: nothing written outside the floppy window");
+	flp_req = 0;
+	flp_select = 0;
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

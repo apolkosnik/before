@@ -198,6 +198,7 @@ reg [31:0] word_buf;
 reg  [2:0] do_rem;               // bytes left to unpack from a DMA word
 
 reg        flp_active;         // a floppy sector is in flight
+reg        cmd_busy;           // a SCSI command is connected
 reg        flp_req_d;          // for the rising edge of a sector request
 reg        flp_pend;           // a request seen but not yet taken
 reg [24:0] dly_us;               // interrupt delay countdown
@@ -546,6 +547,7 @@ endtask
 
 task automatic hard_reset;
 	begin
+		cmd_busy <= 0;
 		// esp_reset_hard() + esp_reset_soft() in esp.c
 		clockconv <= 8'h02;
 		configuration <= configuration & 8'h07;
@@ -620,6 +622,7 @@ task automatic reg_write;
 					7'h01: fifo_clear;   // flush FIFO
 					7'h02: hard_reset;   // reset chip
 					7'h03: begin         // reset SCSI bus
+						cmd_busy <= 0;
 						mode_dma <= 0;
 						counter <= 0;
 						seqstep <= 8'h00;
@@ -650,6 +653,7 @@ task automatic reg_write;
 					end
 					7'h11: xst <= X_ICCS1;    // initiator command complete
 					7'h12: begin              // message accepted
+						cmd_busy <= 0;
 						phase <= PHASE_ST;
 						intstatus <= INTR_BS;
 						dly_us <= ESP_DELAY_US;
@@ -674,11 +678,15 @@ task automatic reg_write;
 						if (!disk_present || (selectbusid[2:0] != 3'd0)) begin
 							// no disk at this target: selection timeout
 							intstatus <= INTR_DC;
+							cmd_busy <= 0;
 							phase <= PHASE_ST;
 							dly_us <= seltout_us;
 							xst <= X_INT_WAIT;
 						end
-						else xst <= v[1] ? X_SEL_MSG : X_SEL_CDB;
+						else begin
+							cmd_busy <= 1;
+							xst <= v[1] ? X_SEL_MSG : X_SEL_CDB;
+						end
 					end
 					7'h44: ;             // enable selection: no reselections
 					default: begin       // unimplemented: illegal command
@@ -744,6 +752,7 @@ always @(posedge clk) begin
 		rd_ret <= 0; sd_ret <= 0; pad_mode <= 0;
 		gap_us <= 0;
 		flp_active <= 0;
+		cmd_busy <= 0;
 		flp_req_d <= 0;
 		flp_pend <= 0;
 		flp_done <= 0;
@@ -772,7 +781,15 @@ always @(posedge clk) begin
 		flp_req_d <= flp_req;
 		if (!flp_req) flp_pend <= 0;
 
-		if (flp_select && flp_pend && !flp_active && (xst == X_IDLE)) begin
+		// X_IDLE alone is not the channel being free: a connected SCSI
+		// command sits in X_IDLE whenever it waits for the driver to
+		// re-arm the channel.  Taking it there overwrote the command's
+		// counter, phase and buffer, and the command then resumed and
+		// abandoned the floppy transfer with flp_active still set -
+		// after which the channel was closed to the floppy for good.
+		// Hand over only between commands.
+		if (flp_select && flp_pend && !flp_active && !cmd_busy &&
+		    (xst == X_IDLE)) begin
 			flp_pend <= 0;
 			flp_active <= 1;
 			buf_pos    <= 0;
