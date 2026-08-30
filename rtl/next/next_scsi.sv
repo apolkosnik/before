@@ -58,10 +58,14 @@ module next_scsi #(parameter CLK_HZ = 50000000)
 	output        int_scsi,      // level, for INT_SCSI
 	output        int_scsi_dma,  // level, for INT_SCSI_DMA
 
-	// MiSTer SD block interface (image slot 0)
-	input         img_mounted,
+	// MiSTer SD block interface: one slot per SCSI target (0 and 1).
+	// The engine talks to one target at a time, so a single set of SD
+	// signals is routed to the mounted slot the connected command
+	// addresses; sd_unit says which.
+	input   [1:0] img_mounted,
 	input         img_readonly,
 	input  [63:0] img_size,
+	output        sd_unit,
 	output [31:0] sd_lba,
 	output reg    sd_rd,
 	output reg    sd_wr,
@@ -118,9 +122,17 @@ assign int_scsi = dma_control[5] & status[7];   // ESPCTRL_ENABLE_INT & STAT_INT
 // SCSI disk target state
 //----------------------------------------------------------------------------
 
-reg        disk_present = 0;
-reg        disk_ro = 0;
-reg [31:0] img_blocks = 0;       // disk size in 512 byte blocks
+reg  [1:0] disk_present_v = 0;
+reg  [1:0] disk_ro_v = 0;
+reg [31:0] img_blocks_v [0:1];   // disk size in 512 byte blocks
+reg        t_unit = 0;           // target the connected command addresses
+assign sd_unit = t_unit;
+
+// The engine was written for one disk; keeping these names as views of
+// the connected target leaves every user of them unchanged.
+wire        disk_present = disk_present_v[t_unit];
+wire        disk_ro      = disk_ro_v[t_unit];
+wire [31:0] img_blocks   = img_blocks_v[t_unit];
 
 reg  [7:0] t_status;             // status byte for ICCS
 reg  [7:0] t_message;            // message byte for ICCS
@@ -135,7 +147,11 @@ reg [15:0] blockcounter;
 
 // disk geometry for mode sense page 4 (cylinders = blocks / (16*63),
 // rounded up; the head/sector fallback geometry of SCSI_GuessGeometry)
-reg [23:0] geo_cyl = 0;
+reg [23:0] geo_cyl_v [0:1];
+wire [23:0] geo_cyl = geo_cyl_v[t_unit];
+reg  [1:0] mnt_pend = 0;
+reg [31:0] mnt_size [0:1];
+reg        g_slot = 0;
 reg [31:0] g_num = 0;
 reg [31:0] g_rem = 0;
 reg [23:0] g_quot = 0;
@@ -226,11 +242,30 @@ assign sd_lba = sd_lba_r;
 //----------------------------------------------------------------------------
 
 always @(posedge clk) begin
-	if (img_mounted) begin
-		disk_present <= (img_size != 0);
-		disk_ro <= img_readonly;
-		img_blocks <= img_size[40:9];
-		g_num <= img_size[40:9];
+	if (img_mounted[0]) begin
+		disk_present_v[0] <= (img_size != 0);
+		disk_ro_v[0] <= img_readonly;
+		img_blocks_v[0] <= img_size[40:9];
+		mnt_size[0] <= img_size[40:9];
+		mnt_pend[0] <= 1;
+	end
+	if (img_mounted[1]) begin
+		disk_present_v[1] <= (img_size != 0);
+		disk_ro_v[1] <= img_readonly;
+		img_blocks_v[1] <= img_size[40:9];
+		mnt_size[1] <= img_size[40:9];
+		mnt_pend[1] <= 1;
+	end
+
+	// one geometry divider, run for each mounted slot in turn: two
+	// mounts arriving close together must not share a division
+	if (!g_run && mnt_pend != 0) begin
+		if (mnt_pend[0]) begin
+			g_slot <= 1'b0; g_num <= mnt_size[0]; mnt_pend[0] <= 0;
+		end
+		else begin
+			g_slot <= 1'b1; g_num <= mnt_size[1]; mnt_pend[1] <= 0;
+		end
 		g_rem <= 0;
 		g_quot <= 0;
 		g_step <= 6'd32;
@@ -252,7 +287,7 @@ always @(posedge clk) begin
 			g_step <= g_step - 1'd1;
 		end
 		else begin
-			geo_cyl <= (g_rem != 0) ? g_quot + 24'd1 : g_quot;
+			geo_cyl_v[g_slot] <= (g_rem != 0) ? g_quot + 24'd1 : g_quot;
 			g_run <= 0;
 		end
 	end
@@ -675,7 +710,8 @@ task automatic reg_write;
 						seqstep <= 8'h00;
 						sel_atn <= v[1];
 						cdb_n <= 0;
-						if (!disk_present || (selectbusid[2:0] != 3'd0)) begin
+						if ((selectbusid[2:0] > 3'd1) ||
+						    !disk_present_v[selectbusid[0]]) begin
 							// no disk at this target: selection timeout
 							intstatus <= INTR_DC;
 							cmd_busy <= 0;
@@ -685,6 +721,7 @@ task automatic reg_write;
 						end
 						else begin
 							cmd_busy <= 1;
+							t_unit <= selectbusid[0];
 							xst <= v[1] ? X_SEL_MSG : X_SEL_CDB;
 						end
 					end

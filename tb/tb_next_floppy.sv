@@ -59,7 +59,8 @@ next_floppy #(.CLK_HZ(1000000)) dut
 	.buf_addr(buf_addr), .buf_we(buf_we), .buf_wdata(buf_wdata),
 	.buf_q(buf_q), .buf_len(buf_len),
 	.dma_req(dma_req), .dma_wr(dma_wr), .dma_done(dma_done),
-	.img_mounted(img_mounted), .img_readonly(1'b0), .img_size(img_size),
+	.img_mounted({1'b0, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
+	.sd_unit(),
 	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr)

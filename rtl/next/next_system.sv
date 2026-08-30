@@ -56,9 +56,10 @@ module next_system #(
 
 
 	// floppy image (MiSTer SD block interface, slot 1)
-	input         fimg_mounted,
+	input   [1:0] fimg_mounted,    // one per floppy drive (fd0, fd1)
 	input         fimg_readonly,
 	input  [63:0] fimg_size,
+	output        fsd_unit,
 	output [31:0] fsd_lba,
 	output        fsd_rd,
 	output        fsd_wr,
@@ -69,9 +70,10 @@ module next_system #(
 	input         fsd_buff_wr,
 
 	// SCSI disk image (MiSTer SD block interface)
-	input         img_mounted,
+	input   [1:0] img_mounted,     // one per SCSI target (0 and 1)
 	input         img_readonly,
 	input  [63:0] img_size,
+	output        sd_unit,         // which target's slot sd_* addresses
 	output [31:0] sd_lba,
 	output        sd_rd,
 	output        sd_wr,
@@ -593,10 +595,10 @@ wire timer_ipl7, softint1, softint2;
 // survives reset: the mount pulse fires once at OSD time, usually
 // before the user resets into the new configuration
 reg disk_mounted = 0;
-always @(posedge clk) if (img_mounted) disk_mounted <= (img_size != 0);
+always @(posedge clk) if (|img_mounted) disk_mounted <= (img_size != 0);
 
 reg floppy_mounted = 0;
-always @(posedge clk) if (fimg_mounted) floppy_mounted <= (fimg_size != 0);
+always @(posedge clk) if (|fimg_mounted) floppy_mounted <= (fimg_size != 0);
 
 next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 (
@@ -777,6 +779,7 @@ next_floppy #(.CLK_HZ(CLK_HZ)) floppy
 	.img_mounted(fimg_mounted),
 	.img_readonly(fimg_readonly),
 	.img_size(fimg_size),
+	.sd_unit(fsd_unit),
 	.sd_lba(fsd_lba),
 	.sd_rd(fsd_rd),
 	.sd_wr(fsd_wr),
@@ -825,6 +828,7 @@ next_scsi #(.CLK_HZ(CLK_HZ)) scsi
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
+	.sd_unit(sd_unit),
 	.sd_lba(sd_lba),
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),

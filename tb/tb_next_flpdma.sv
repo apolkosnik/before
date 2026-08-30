@@ -70,7 +70,8 @@ next_floppy #(.CLK_HZ(1000000)) floppy
 	.buf_addr(flp_addr), .buf_we(flp_bwe), .buf_wdata(flp_bwdata),
 	.buf_q(flp_bq), .buf_len(flp_len),
 	.dma_req(flp_req), .dma_wr(flp_wr), .dma_done(flp_done),
-	.img_mounted(fimg_mounted), .img_readonly(1'b0), .img_size(fimg_size),
+	.img_mounted({1'b0, fimg_mounted}), .img_readonly(1'b0), .img_size(fimg_size),
+	.sd_unit(),
 	.sd_lba(fsd_lba), .sd_rd(fsd_rd), .sd_wr(fsd_wr), .sd_ack(fsd_ack),
 	.sd_buff_addr(fsd_buff_addr), .sd_buff_dout(fsd_buff_dout),
 	.sd_buff_din(fsd_buff_din), .sd_buff_wr(fsd_buff_wr)
@@ -88,7 +89,8 @@ next_scsi #(.CLK_HZ(1000000)) scsi
 	.flp_len(flp_len), .flp_addr(flp_addr), .flp_bwe(flp_bwe),
 	.flp_bwdata(flp_bwdata), .flp_bq(flp_bq), .flp_done(flp_done),
 	.int_scsi(), .int_scsi_dma(),
-	.img_mounted(1'b0), .img_readonly(1'b0), .img_size(64'd0),
+	.img_mounted(2'b00), .img_readonly(1'b0), .img_size(64'd0),
+	.sd_unit(),
 	.sd_lba(), .sd_rd(), .sd_wr(), .sd_ack(1'b0),
 	.sd_buff_addr(9'd0), .sd_buff_dout(8'd0), .sd_buff_din(),
 	.sd_buff_wr(1'b0)

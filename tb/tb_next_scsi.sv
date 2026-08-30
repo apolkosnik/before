@@ -41,6 +41,7 @@ wire int_scsi, int_scsi_dma;
 
 reg         img_mounted = 0;
 reg  [63:0] img_size = 0;
+reg         img_mounted2 = 0;
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
 reg         sd_ack = 0;
@@ -83,7 +84,8 @@ next_scsi #(.CLK_HZ(1000000)) dut
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
 	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
 	.int_scsi(int_scsi), .int_scsi_dma(int_scsi_dma),
-	.img_mounted(img_mounted), .img_readonly(1'b0), .img_size(img_size),
+	.img_mounted({img_mounted2, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
+	.sd_unit(),
 	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
@@ -132,7 +134,8 @@ endfunction
 
 localparam DISK_BLOCKS = 8;
 
-reg [7:0] disk [0:DISK_BLOCKS*512-1];
+reg [7:0] disk  [0:DISK_BLOCKS*512-1];
+reg [7:0] disk2 [0:DISK_BLOCKS*512-1];   // SCSI target 1
 
 // disk byte pattern: block ^ offset, distinct per position
 function [7:0] pat;
@@ -145,8 +148,10 @@ endfunction
 
 integer sdi;
 initial begin
-	for (sdi = 0; sdi < DISK_BLOCKS*512; sdi = sdi + 1)
-		disk[sdi] = pat(sdi / 512, sdi % 512);
+	for (sdi = 0; sdi < DISK_BLOCKS*512; sdi = sdi + 1) begin
+		disk[sdi]  = pat(sdi / 512, sdi % 512);
+		disk2[sdi] = ~pat(sdi / 512, sdi % 512);   // the other disk
+	end
 end
 
 // serve sd_rd / sd_wr with the hps_io handshake
@@ -159,7 +164,9 @@ always @(posedge clk) begin
 	else if (sd_ack && sd_rd_active) begin
 		// one byte every other cycle
 		if (!sd_buff_wr && sd_buff_addr <= 9'd511) begin
-			sd_buff_dout <= disk[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}];
+			sd_buff_dout <= dut.sd_unit
+			              ? disk2[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}]
+			              : disk [{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}];
 			sd_buff_wr <= 1;
 		end
 		else begin
@@ -174,7 +181,10 @@ always @(posedge clk) begin
 	else if (sd_ack && sd_wr_active) begin
 		// read a byte every other cycle (registered buffer read)
 		if (rd_phase) begin
-			disk[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
+			if (dut.sd_unit)
+				disk2[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
+			else
+				disk [{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
 			rd_phase <= 0;
 			if (sd_buff_addr == 9'd511) begin
 				sd_ack <= 0;
@@ -787,6 +797,43 @@ initial begin
 	check(ok, "shared channel: nothing written outside the floppy window");
 	flp_req = 0;
 	flp_select = 0;
+
+	//------------------------------------------------------------
+	// A second disk on target 1.  One engine serves both, so the
+	// image it reads has to follow the target the command selected,
+	// not the last one mounted.
+	//------------------------------------------------------------
+	img_size = DISK_BLOCKS*512;
+	img_mounted2 = 1;
+	@(posedge clk);
+	img_mounted2 = 0;
+	repeat (400) @(posedge clk);       // let the geometry divider run
+
+	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'hDEADBEEF;
+	esp_wr8(6'h04, 8'h01);             // select bus id 1
+	esp_wr8(6'h02, 8'h80);
+	esp_wr8(6'h02, 8'h08); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h03);
+	esp_wr8(6'h02, 8'h01); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h03, 8'h42);             // select with ATN
+	wait_irq;
+	read_intr(intr);
+	check(intr != 8'h20, "target 1: selected, not a selection timeout");
+	check(dut.sd_unit == 1'b1, "target 1: the SD request names slot 1");
+	ptr_wr32(6'h10, 32'h00006000);
+	ptr_wr32(6'h14, 32'h00006200);
+	csr_cmd(8'h11);
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h02);
+	esp_wr8(6'h03, 8'h90);
+	wait_irq;
+	read_intr(intr);
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1)
+		if (ram_byte(32'h00006000 + i) !== (~pat(3, i) & 8'hFF)) ok = 0;
+	check(ok, "target 1: the block comes from the second image");
+	finish_command(sts);
+	check(sts == 8'h00, "target 1: good status");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

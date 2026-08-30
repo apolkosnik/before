@@ -52,9 +52,10 @@ module next_floppy #(parameter CLK_HZ = 50000000)
 	input         dma_done,      // the channel moved buf_len bytes
 
 	// MiSTer SD block interface (image slot 1)
-	input         img_mounted,
+	input   [1:0] img_mounted,     // one per drive (fd0, fd1)
 	input         img_readonly,
 	input  [63:0] img_size,
+	output        sd_unit,         // which drive's slot sd_* addresses
 	output [31:0] sd_lba,
 	output reg    sd_rd,
 	output reg    sd_wr,
@@ -92,23 +93,35 @@ reg  [7:0] ccr;              // configuration control (data rate)
 reg        sel_82077;        // written at +8, selects the DMA channel
 reg  [7:0] ctrl_st;          // read at +8: drive and media status
 reg  [7:0] st0, st1, st2;
-reg  [7:0] pcn;              // present cylinder
+reg  [7:0] pcn_v [0:1];      // present cylinder, per drive
+wire [7:0] pcn = pcn_v[ds];
 reg        eis;              // implied seek enabled
 reg        int_pend;
 
 reg  [7:0] cyl, head, sector;
 reg  [2:0] blocksize;        // 0x80 << blocksize
 
-reg        present;          // an image is mounted
-reg        readonly;
-reg [31:0] img_bytes;
-reg  [7:0] spt;              // sectors per track, from the image size
+// The controller takes two drives, as the reference does
+// (FLP_MAX_DRIVES 2).  The DOR's drive select says which one the
+// registers, the medium and the sector addressing refer to, so
+// per-drive state behind a selected view leaves their users unchanged.
+reg  [1:0] present_v;        // an image is mounted
+reg  [1:0] readonly_v;
+reg [31:0] img_bytes_v [0:1];
+reg  [7:0] spt_v [0:1];      // sectors per track, from the image size
+
+wire        ds        = dor[0];          // DOR drive select
+wire        present   = present_v[ds];
+wire        readonly  = readonly_v[ds];
+wire [31:0] img_bytes = img_bytes_v[ds];
+wire  [7:0] spt       = spt_v[ds];
+assign      sd_unit   = ds;
 
 assign int_floppy = int_pend;
 assign flp_select = sel_82077 | mo_gpo;    // CTRL_82077 or the MO's GPO
 
 wire [7:0] sra = (int_pend ? SRA_INT : 8'h00) |
-                 SRA_DRV1_N |                       // only drive 0 exists
+                 (present_v[1] ? 8'h00 : SRA_DRV1_N) |  // drive 1 fitted?
                  ((cyl == 0) ? 8'h00 : SRA_TRK0_N) |
                  (readonly ? 8'h00 : SRA_WP_N);
 wire [7:0] srb = 8'hC0;
@@ -275,7 +288,8 @@ always @(posedge clk) begin
 		sel_82077 <= 1'b0;
 		ctrl_st <= 8'h04;        // no drive selected yet
 		st0 <= 0; st1 <= 0; st2 <= 0;
-		pcn <= 0;
+		pcn_v[0] <= 0;
+		pcn_v[1] <= 0;
 		eis <= 0;
 		int_pend <= 0;
 		cyl <= 0; head <= 0; sector <= 1;
@@ -295,18 +309,27 @@ always @(posedge clk) begin
 		//------------------------------------------------------------
 		// medium
 		//------------------------------------------------------------
-		if (img_mounted) begin
+		if (img_mounted[0]) begin
 			// Only the three formats the drive takes are a medium at
 			// all; anything else has no geometry to report, and the
 			// reference calls that an empty drive rather than guessing
 			// at 1.44 MB.
-			present  <= (img_size == 32'd737280) ||
-			            (img_size == 32'd1474560) ||
-			            (img_size == 32'd2949120);
-			readonly <= img_readonly;
-			img_bytes <= img_size[31:0];
-			spt <= (img_size == 32'd737280)  ? 8'd9  :
-			       (img_size == 32'd2949120) ? 8'd36 : 8'd18;
+			present_v[0] <= (img_size == 32'd737280) ||
+			                (img_size == 32'd1474560) ||
+			                (img_size == 32'd2949120);
+			readonly_v[0] <= img_readonly;
+			img_bytes_v[0] <= img_size[31:0];
+			spt_v[0] <= (img_size == 32'd737280)  ? 8'd9  :
+			            (img_size == 32'd2949120) ? 8'd36 : 8'd18;
+		end
+		if (img_mounted[1]) begin
+			present_v[1] <= (img_size == 32'd737280) ||
+			                (img_size == 32'd1474560) ||
+			                (img_size == 32'd2949120);
+			readonly_v[1] <= img_readonly;
+			img_bytes_v[1] <= img_size[31:0];
+			spt_v[1] <= (img_size == 32'd737280)  ? 8'd9  :
+			            (img_size == 32'd2949120) ? 8'd36 : 8'd18;
 		end
 
 		//------------------------------------------------------------
@@ -449,7 +472,7 @@ always @(posedge clk) begin
 					4'h8: begin
 						// a command, not a stored value
 						sel_82077 <= v[6];
-						if (v[7]) present <= 0;   // eject
+						if (v[7]) present_v[ds] <= 0;   // eject
 					end
 					4'h5: begin : fifo_wr
 						// command or parameter byte
@@ -504,7 +527,7 @@ always @(posedge clk) begin
 								5'h12, 5'h14: msr <= STAT_RQM;   // perpendicular, lock
 								5'h07: begin      // recalibrate
 									cyl <= 0;
-									pcn <= 0;
+									pcn_v[ds] <= 0;
 									st0 <= IC_NORMAL | ST0_SE;
 									st1 <= 0; st2 <= 0;
 									// the drive is busy seeking; the
@@ -515,7 +538,7 @@ always @(posedge clk) begin
 								end
 								5'h0F: begin      // seek
 									cyl <= (v > CYLS-1) ? CYLS-8'd1 : v;
-									pcn <= (v > CYLS-1) ? CYLS-8'd1 : v;
+									pcn_v[ds] <= (v > CYLS-1) ? CYLS-8'd1 : v;
 									head <= {7'd0, cmd_data[0][2]};
 									st0 <= IC_NORMAL | ST0_SE;
 									msr <= STAT_RQM | 8'h01;

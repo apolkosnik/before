@@ -64,8 +64,10 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 localparam CONF_STR = {
 	"NeXT;;",
 	"F1,BINROM,Boot ROM;",
-	"S0,VHDIMG,SCSI Disk;",
+	"S0,VHDIMG,SCSI Disk 0;",
 	"S1,IMGIMAFLPVFD,Floppy;",
+	"S2,VHDIMG,SCSI Disk 1;",
+	"S3,IMGIMAFLPVFD,Floppy 1;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
@@ -88,11 +90,15 @@ wire        ioctl_wr;
 wire [26:0] ioctl_addr;
 wire  [7:0] ioctl_dout;
 
-wire  [1:0] img_mounted_v, sd_ack_v;
-wire        img_mounted   = img_mounted_v[0];
-wire        fimg_mounted  = img_mounted_v[1];
-wire        sd_ack        = sd_ack_v[0];
-wire        fsd_ack       = sd_ack_v[1];
+// Slot 0 is SCSI target 0, slot 1 the floppy, slot 2 SCSI target 1.
+// The order keeps a saved configuration's existing mounts in place.
+wire  [3:0] img_mounted_v, sd_ack_v;
+wire  [1:0] img_mounted   = {img_mounted_v[2], img_mounted_v[0]};
+wire  [1:0] fimg_mounted  = {img_mounted_v[3], img_mounted_v[1]};
+wire        sd_unit, fsd_unit;
+// one engine, two targets: its SD request goes to the slot it names
+wire        sd_ack        = sd_unit ? sd_ack_v[2] : sd_ack_v[0];
+wire        fsd_ack       = fsd_unit ? sd_ack_v[3] : sd_ack_v[1];
 wire [31:0] fsd_lba;
 wire        fsd_rd, fsd_wr, fsd_buff_wr;
 wire  [7:0] fsd_buff_din;
@@ -104,7 +110,7 @@ wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_dout, sd_buff_din;
 wire        sd_buff_wr;
 
-hps_io #(.CONF_STR(CONF_STR), .VDNUM(2)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(4)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -126,13 +132,13 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(2)) hps_io
 	.img_mounted(img_mounted_v),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
-	.sd_lba('{sd_lba, fsd_lba}),
-	.sd_rd({fsd_rd, sd_rd}),
-	.sd_wr({fsd_wr, sd_wr}),
+	.sd_lba('{sd_lba, fsd_lba, sd_lba, fsd_lba}),
+	.sd_rd({fsd_rd & fsd_unit, sd_rd & sd_unit, fsd_rd & ~fsd_unit, sd_rd & ~sd_unit}),
+	.sd_wr({fsd_wr & fsd_unit, sd_wr & sd_unit, fsd_wr & ~fsd_unit, sd_wr & ~sd_unit}),
 	.sd_ack(sd_ack_v),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
-	.sd_buff_din('{sd_buff_din, fsd_buff_din}),
+	.sd_buff_din('{sd_buff_din, fsd_buff_din, sd_buff_din, fsd_buff_din}),
 	.sd_buff_wr(sd_buff_wr),
 
 	.ps2_key(ps2_key)
@@ -200,6 +206,7 @@ next_system #(
 	.boot_sel(status[57:55]),
 
 	.fimg_mounted(fimg_mounted),
+	.fsd_unit(fsd_unit),
 	.fimg_readonly(img_readonly),
 	.fimg_size(img_size),
 	.fsd_lba(fsd_lba),
@@ -214,6 +221,7 @@ next_system #(
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
+	.sd_unit(sd_unit),
 	.sd_lba(sd_lba),
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
