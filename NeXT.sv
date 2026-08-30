@@ -68,12 +68,9 @@ localparam CONF_STR = {
 	"S1,VHDIMG,SCSI Disk 1;",
 	"S2,VHDIMG,SCSI Disk 2;",
 	"S3,VHDIMG,SCSI Disk 3;",
-	"S4,VHDIMG,SCSI Disk 4;",
-	"S5,VHDIMG,SCSI Disk 5;",
-	"S6,IMGIMAFLPVFD,Floppy 0;",
-	"S7,IMGIMAFLPVFD,Floppy 1;",
-	"S8,IMGMO,Optical 0;",
-	"S9,IMGMO,Optical 1;",
+	"S4,IMGIMAFLPVFD,Floppy;",
+	"S5,IMGMO,Optical 0;",
+	"S6,IMGMO,Optical 1;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
@@ -96,22 +93,31 @@ wire        ioctl_wr;
 wire [26:0] ioctl_addr;
 wire  [7:0] ioctl_dout;
 
-// Ten slots, in device order: six SCSI targets, two floppy drives,
-// two optical drives.  Ten is the ceiling - hps_io takes VDNUM up to
-// 10 and the menu parser reads a single digit for the slot.
-wire  [9:0] img_mounted_v, sd_ack_v;
-wire  [1:0] oimg_mounted  = {img_mounted_v[9], img_mounted_v[8]};
+// Seven slots is the ceiling, and it is the host that sets it, not
+// hps_io's VDNUM: the mount is announced in a single byte,
+// (1 << slot) | (read only ? 0x80), and hps_io reads bit 7 of that
+// byte as the read-only flag.  Slot 7 collides with it, and slots 8
+// and 9 shift clean out of the byte - leaving a mask of zero, which
+// hps_io treats as "no slot given" and turns into slot 0.  An optical
+// image mounted at S8 therefore arrived as a mount of SCSI target 0,
+// carrying the wrong size.  With VDNUM 7 the mask is bits 0..6 and
+// bit 7 is only ever the flag.
+//
+// Four SCSI targets, one floppy - the machine has one drive - and the
+// two optical drives NeXTSTEP probes as od0 and od1.
+wire  [6:0] img_mounted_v, sd_ack_v;
+wire  [1:0] oimg_mounted  = {img_mounted_v[6], img_mounted_v[5]};
 wire        osd_unit;
 wire [31:0] osd_lba;
 wire        osd_rd, osd_wr;
 wire  [7:0] osd_buff_din;
-wire        osd_ack       = osd_unit ? sd_ack_v[9] : sd_ack_v[8];
-wire  [5:0] img_mounted   = img_mounted_v[5:0];
-wire  [1:0] fimg_mounted  = {img_mounted_v[7], img_mounted_v[6]};
+wire        osd_ack       = osd_unit ? sd_ack_v[6] : sd_ack_v[5];
+wire  [5:0] img_mounted   = {2'b00, img_mounted_v[3:0]};
+wire  [1:0] fimg_mounted  = {1'b0, img_mounted_v[4]};
 wire        sd_unit, fsd_unit;
 // one engine, two targets: its SD request goes to the slot it names
 wire        sd_ack        = sd_ack_v[sd_unit];
-wire        fsd_ack       = fsd_unit ? sd_ack_v[7] : sd_ack_v[6];
+wire        fsd_ack       = sd_ack_v[4];
 // the engine serves one target at a time: its request goes to that slot
 wire  [5:0] scsi_onehot   = 6'd1 << sd_unit;
 wire [31:0] fsd_lba;
@@ -125,7 +131,7 @@ wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_dout, sd_buff_din;
 wire        sd_buff_wr;
 
-hps_io #(.CONF_STR(CONF_STR), .VDNUM(10)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -147,20 +153,16 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(10)) hps_io
 	.img_mounted(img_mounted_v),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
-	.sd_lba('{sd_lba, sd_lba, sd_lba, sd_lba, sd_lba, sd_lba,
-	          fsd_lba, fsd_lba, osd_lba, osd_lba}),
-	.sd_rd({osd_rd & osd_unit, osd_rd & ~osd_unit,
-	        fsd_rd & fsd_unit, fsd_rd & ~fsd_unit,
-	        {6{sd_rd}} & scsi_onehot}),
-	.sd_wr({osd_wr & osd_unit, osd_wr & ~osd_unit,
-	        fsd_wr & fsd_unit, fsd_wr & ~fsd_unit,
-	        {6{sd_wr}} & scsi_onehot}),
+	.sd_lba('{sd_lba, sd_lba, sd_lba, sd_lba, fsd_lba, osd_lba, osd_lba}),
+	.sd_rd({osd_rd & osd_unit, osd_rd & ~osd_unit, fsd_rd,
+	        {4{sd_rd}} & scsi_onehot[3:0]}),
+	.sd_wr({osd_wr & osd_unit, osd_wr & ~osd_unit, fsd_wr,
+	        {4{sd_wr}} & scsi_onehot[3:0]}),
 	.sd_ack(sd_ack_v),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din('{sd_buff_din, sd_buff_din, sd_buff_din, sd_buff_din,
-	               sd_buff_din, sd_buff_din, fsd_buff_din, fsd_buff_din,
-	               osd_buff_din, osd_buff_din}),
+	               fsd_buff_din, osd_buff_din, osd_buff_din}),
 	.sd_buff_wr(sd_buff_wr),
 
 	.ps2_key(ps2_key)
