@@ -43,8 +43,60 @@ next_mo #(.CLK_HZ(1000000)) dut
 	.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
 	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
-	.int_disk(int_disk), .int_disk_dma(int_disk_dma)
+	.int_disk(int_disk), .int_disk_dma(int_disk_dma),
+	.img_mounted(oimg_mounted), .img_readonly(1'b0), .img_size(oimg_size),
+	.sd_unit(osd_unit), .sd_lba(osd_lba), .sd_rd(osd_rd), .sd_wr(osd_wr),
+	.sd_ack(osd_ack), .sd_buff_addr(osd_buff_addr),
+	.sd_buff_dout(osd_buff_dout), .sd_buff_din(), .sd_buff_wr(osd_buff_wr)
 );
+
+//----------------------------------------------------------------------------
+// An optical cartridge.  The image holds the encoded 1296 byte sectors
+// the formatter reads, so a sector straddles the card's 512 byte
+// blocks - which is the part worth testing.
+//----------------------------------------------------------------------------
+localparam MO_SECT = 1296;
+localparam MO_TRACKS_MODELLED = 4;      // enough for a few sectors
+reg  [1:0] oimg_mounted = 0;
+reg [63:0] oimg_size = 0;
+wire       osd_unit, osd_rd, osd_wr;
+wire [31:0] osd_lba;
+reg        osd_ack = 0;
+reg  [8:0] osd_buff_addr = 0;
+reg  [7:0] osd_buff_dout = 0;
+reg        osd_buff_wr = 0;
+
+// a byte of the disk, derived from its absolute offset
+function [7:0] dbyte;
+	input [31:0] off;
+	dbyte = off[7:0] ^ off[15:8] ^ 8'h5A;
+endfunction
+
+integer osd_reads = 0;
+reg     osd_active = 0;
+
+always @(posedge clk) begin
+	osd_buff_wr <= 0;
+	if (osd_rd && !osd_ack && !osd_active) begin
+		osd_ack <= 1;
+		osd_active <= 1;
+		osd_buff_addr <= 0;
+		osd_reads = osd_reads + 1;
+	end
+	else if (osd_ack && osd_active) begin
+		if (!osd_buff_wr) begin
+			osd_buff_dout <= dbyte({osd_lba, 9'd0} + {23'd0, osd_buff_addr});
+			osd_buff_wr <= 1;
+		end
+		else begin
+			if (osd_buff_addr == 9'd511) begin
+				osd_ack <= 0;
+				osd_active <= 0;
+			end
+			else osd_buff_addr <= osd_buff_addr + 1'd1;
+		end
+	end
+end
 
 localparam SRC  = 32'h04002000;
 localparam DST  = 32'h04003000;
@@ -178,7 +230,7 @@ task check;
 endtask
 
 integer i;
-reg [7:0] v;
+reg [7:0] v, v2;
 reg ok;
 
 
@@ -274,6 +326,61 @@ initial begin
 	for (i = 0; i < 1024; i = i + 1)
 		if (ram_byte(DST2 + i) != i[7:0]) ok = 0;
 	check(ok, "corrected data matches the original pattern");
+
+	//------------------------------------------------------------
+	// The drive.  Nothing here worked before: the controller answered
+	// every status request with "no drive attached".
+	//------------------------------------------------------------
+	osp_wr8(5'h06, 8'h00);            // CSR2: select drive 0
+	osp_wr8(5'h04, 8'hFF);            // clear the interrupt status
+	osp_wr8(5'h08, 8'h20); osp_wr8(5'h09, 8'h00);   // DRV_RDS
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h04, v);
+	check(!v[0], "empty slot: no command completion at all");
+	// the formatter's own status request always answers
+	osp_wr8(5'h07, 8'h20);            // FMT_RD_STAT
+	repeat (20) @(posedge clk);
+	osp_rd8(5'h08, v);
+	check(v[6], "empty slot: the formatter reports no cartridge");
+
+	oimg_size = MO_TRACKS_MODELLED * 16 * MO_SECT;
+	oimg_mounted = 2'b01;
+	@(posedge clk);
+	oimg_mounted = 2'b00;
+	repeat (20) @(posedge clk);
+
+	osp_wr8(5'h08, 8'h20); osp_wr8(5'h09, 8'h00);   // DRV_RDS
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h08, v);
+	osp_rd8(5'h09, v2);
+	check(!v[6], "cartridge in: no longer empty");
+	check(v2[2], "cartridge in: load completed");
+	check(v[1], "cartridge in: still stopped");
+
+	osp_wr8(5'h08, 8'h53); osp_wr8(5'h09, 8'h00);   // DRV_STM, start motor
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h20); osp_wr8(5'h09, 8'h00);   // DRV_RDS
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h08, v);
+	check(!v[1], "motor started: no longer stopped");
+
+	osp_rd8(5'h04, v);
+	check(v[0], "the drive signals command complete");
+
+	// seek, then ask where the head is
+	osp_wr8(5'h08, 8'h01); osp_wr8(5'h09, 8'h23);   // seek track 0x123
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h22); osp_wr8(5'h09, 8'h00);   // DRV_RCA
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h08, v);
+	osp_rd8(5'h09, v2);
+	check({v, v2} == 16'h0123, "seek: the drive returns the track it moved to");
+
+	osp_wr8(5'h08, 8'h3F); osp_wr8(5'h09, 8'h00);   // DRV_RVI
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h08, v);
+	osp_rd8(5'h09, v2);
+	check({v, v2} == 16'h0880, "the drive returns its version");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

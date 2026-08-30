@@ -56,6 +56,17 @@ module next_system #(
 
 
 	// floppy image (MiSTer SD block interface, slot 1)
+	// optical drives (od0, od1)
+	input   [1:0] oimg_mounted,
+	input         oimg_readonly,
+	input  [63:0] oimg_size,
+	output        osd_unit,
+	output [31:0] osd_lba,
+	output        osd_rd,
+	output        osd_wr,
+	input         osd_ack,
+	output  [7:0] osd_buff_din,
+
 	input   [1:0] fimg_mounted,    // one per floppy drive (fd0, fd1)
 	input         fimg_readonly,
 	input  [63:0] fimg_size,
@@ -717,7 +728,19 @@ next_mo #(.CLK_HZ(CLK_HZ)) mo
 	.m_dout(ram_dout),
 	.m_ack(mo_m_ack),
 	.int_disk(int_disk),
-	.int_disk_dma(int_disk_dma)
+	.int_disk_dma(int_disk_dma),
+	.img_mounted(oimg_mounted),
+	.img_readonly(oimg_readonly),
+	.img_size(oimg_size),
+	.sd_unit(osd_unit),
+	.sd_lba(osd_lba),
+	.sd_rd(osd_rd),
+	.sd_wr(osd_wr),
+	.sd_ack(osd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din(osd_buff_din),
+	.sd_buff_wr(sd_buff_wr)
 );
 
 // KMS and sound out DMA (a RAM bus master)
