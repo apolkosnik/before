@@ -4,8 +4,10 @@
 # Everything here runs the real RTL: the real AP68040 core (rtl/AP68040
 # submodule), the real next_* modules, and the real NeXTcube 68040 boot
 # ROM image (Rev 2.5 v66) from the Previous submodule
-# (reference/previous).  The only modeled component is the main RAM
-# behind the ram_* port, which is DDR3 on hardware.
+# (reference/previous).  The boot bench runs the real next_ddram and
+# next_ddram_arb, and the real mailbox bridge on the arbiter's port B,
+# against a DDR3 model that throttles and starts the mailbox as
+# rubbish: the only modeled component is the DDR3 device itself.
 #
 #   ./run_tests.sh         device suites plus a 3 ms boot smoke test
 #   ./run_tests.sh bootsd  additionally boots with a mounted disk image
@@ -34,7 +36,8 @@ NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
          $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_enet_dma.sv \
          $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_rs.sv \
-         $RTL/next_floppy.sv $RTL/dpram.v"
+         $RTL/next_floppy.sv $RTL/next_ddram.sv $RTL/next_ddram_arb.sv \
+         $RTL/next_enet_bridge.sv $RTL/dpram.v"
 
 echo "== converting boot ROM =="
 python3 rom2hex.py "$ROM" "$WORK/rom.hex"
@@ -106,6 +109,7 @@ run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"
 run tb_video     "$WORK/vl_tb_next_video/tb_next_video"
 run tb_boot      "$WORK/vl_tb_next_boot/tb_next_boot"
+run tb_boot_noet "$WORK/vl_tb_next_boot/tb_next_boot" +netoff
 
 if [ "${1:-}" = "post" ]; then
 	echo "--- full power-on system test (about 5 minutes) ---"
