@@ -147,6 +147,8 @@ reg  [1:0] drv_spiraling = 0;
 reg  [1:0] drv_attn = 0;
 reg  [1:0] drv_compl = 0;
 reg [15:0] head_pos [0:1];       // current track
+reg  [3:0] ho_pos [0:1];         // high order seek, applied by the next seek
+reg  [1:0] drv_seeking = 0;      // a seeking drive presents no sectors
 reg  [2:0] drv_head [0:1];
 reg [31:0] drv_bytes [0:1];      // image size, for the sector bound
 // The disk's side of the ECC buffer.  A sector is 1296 bytes and the
@@ -157,14 +159,35 @@ reg   [7:0] dsk_wdata = 0;
 reg         dsk_we = 0;
 reg         dsk_active = 0;
 reg  [31:0] dsk_lba_r = 0;
-reg   [1:0] dsk_blk = 0;
+reg   [2:0] dsk_blk = 0;
 reg   [2:0] dsk_nblk = 0;
 reg   [8:0] dsk_skip = 0;
-localparam [2:0] D_IDLE = 3'd0, D_GO = 3'd1, D_ACK = 3'd2, D_NEXT = 3'd3;
+localparam [2:0] D_IDLE = 3'd0, D_RGO = 3'd1, D_RACK = 3'd2,
+                 D_WGO = 3'd3, D_WACK = 3'd4, D_NEXT = 3'd5;
 reg   [2:0] dst = D_IDLE;
+reg         dsk_is_wr = 0;       // the run puts a sector back
+reg         dsk_erase = 0;       // ... as 0xFF rather than the buffer
+
+// A sector covers its first and last block only in part, so putting one
+// back means reading each block, replacing the window inside it, and
+// writing it whole again.
+reg   [7:0] stage [0:511];
+reg   [7:0] stage_q;
+reg         win_q;
+wire [11:0] wgidx = {1'd0, dsk_blk, 8'd0, 1'd0} + {3'd0, sd_buff_addr};
+wire        wgin  = (wgidx >= {3'd0, dsk_skip}) &&
+                    ((wgidx - {3'd0, dsk_skip}) < SECT_DISK);
+always @(posedge clk) begin
+	if (dsk_active && !dsk_is_wr && sd_buff_wr) stage[sd_buff_addr] <= sd_buff_dout;
+	if (dsk_active &&  dsk_is_wr && sd_buff_wr) stage[sd_buff_addr] <= sd_buff_dout;
+	stage_q <= stage[sd_buff_addr];
+	win_q   <= wgin;
+end
 reg         sec_tick = 0;
 assign sd_lba = dsk_lba_r;
-assign sd_buff_din = 8'h00;      // reads only, for now
+// what the card takes back: the sector's own bytes inside the window,
+// the block's original bytes outside it
+assign sd_buff_din = win_q ? (dsk_erase ? 8'hFF : ecc_q) : stage_q;
 
 reg  [3:0] sec_offset [0:1];     // sector under the head
 reg [20:0] sec_timer = 0;
@@ -354,6 +377,8 @@ endtask
 // outside the disk is a formatter timeout, not an access.
 task automatic dsk_start;
 	input [23:0] sid;
+	input        is_wr;
+	input        is_erase;
 	reg [31:0] lsec;
 	reg [31:0] boff;
 	reg [11:0] span;
@@ -367,13 +392,15 @@ task automatic dsk_start;
 			lsec = (({16'd0, sid[23:8]} - {16'd0, MO_TRACK_OFFSET}) << 4)
 			     + {28'd0, sid[3:0]};
 			boff = (lsec << 10) + (lsec << 8) + (lsec << 4);   // 1296 each
-			span = {3'd0, boff[8:0]} + {4'd0, SECT_DISK[7:0]} + 12'd511;
+			span = {3'd0, boff[8:0]} + SECT_DISK + 12'd511;
 			dsk_lba_r  <= boff[31:9];
 			dsk_skip   <= boff[8:0];
 			dsk_blk    <= 0;
 			dsk_nblk   <= span[11:9];
 			dsk_active <= 1;
-			dst        <= D_GO;
+			dsk_is_wr  <= is_wr;
+			dsk_erase  <= is_erase;
+			dst        <= D_RGO;
 		end
 	end
 endtask
@@ -412,11 +439,13 @@ always @(posedge clk) begin
 		drv_head[0] <= NO_HEAD; drv_head[1] <= NO_HEAD;
 		drv_bytes[0] <= 0; drv_bytes[1] <= 0;
 		drv_cmd_pend <= 0; drv_busy <= 0; drv_dly <= 0;
+		ho_pos[0] <= 0; ho_pos[1] <= 0; drv_seeking <= 0;
 		sd_rd <= 0; sd_wr <= 0;
 		sec_offset[0] <= 0; sec_offset[1] <= 0;
 		sec_timer <= 0; sec_tick <= 0;
 		fmt_mode <= FM_IDLE; sector_counter <= 0; write_timing <= 0;
 		dst <= D_IDLE; dsk_active <= 0; dsk_we <= 0;
+		dsk_is_wr <= 0; dsk_erase <= 0;
 		dsk_lba_r <= 0; dsk_blk <= 0; dsk_nblk <= 0; dsk_skip <= 0;
 		rs_start_enc <= 0;
 		rs_start_dec <= 0;
@@ -429,9 +458,9 @@ always @(posedge clk) begin
 		dsk_we <= 0;
 
 		// place the streamed byte if it falls inside the sector window
-		if (dsk_active && sd_buff_wr) begin : place
+		if (dsk_active && !dsk_is_wr && sd_buff_wr) begin : place
 			reg [11:0] gidx;
-			gidx = {2'd0, dsk_blk, 9'd0} + {3'd0, sd_buff_addr};
+			gidx = {1'd0, dsk_blk, 8'd0, 1'd0} + {3'd0, sd_buff_addr};
 			if (gidx >= {3'd0, dsk_skip} &&
 			    (gidx - {3'd0, dsk_skip}) < SECT_DISK) begin
 				dsk_addr  <= (gidx - {3'd0, dsk_skip});
@@ -565,8 +594,9 @@ always @(posedge clk) begin
 				drv_dly  <= CMD_DELAY;
 				drv_busy <= 1;
 				casez (drv_cmd)
-				16'b1010_0000_0000_????:            // high order seek
-					head_pos[dnum] <= {drv_cmd[3:0], cur_track[11:0]};
+				16'b1010_0000_0000_????:            // high order seek:
+					// it only arms the top bits; the next seek applies them
+					ho_pos[dnum] <= drv_cmd[3:0];
 				16'b0101_0001_????_????: begin      // relative jump
 					case (drv_cmd[6:4])
 					3'd1: drv_head[dnum] <= READ_HEAD;
@@ -577,12 +607,19 @@ always @(posedge clk) begin
 					endcase
 					head_pos[dnum] <= cur_track +
 					                  {{12{drv_cmd[3]}}, drv_cmd[3:0]};
+					sec_offset[dnum] <= 0;
 				end
-				16'b0000_????_????_????:            // seek
-					head_pos[dnum] <= {4'd0, drv_cmd[11:0]};
+				16'b0000_????_????_????: begin      // seek
+					head_pos[dnum] <= {ho_pos[dnum], drv_cmd[11:0]};
+					drv_seeking[dnum] <= 1;
+				end
 				default: begin
 					case (drv_cmd)
-					DRV_REC: head_pos[dnum] <= 0;
+					DRV_REC: begin
+						head_pos[dnum] <= 0;
+						sec_offset[dnum] <= 0;
+						drv_seeking[dnum] <= 1;
+					end
 					DRV_RDS: begin csrh <= drv_dstat[15:8]; csrl <= drv_dstat[7:0]; end
 					DRV_RCA: begin csrh <= cur_track[15:8]; csrl <= cur_track[7:0]; end
 					DRV_RES: begin csrh <= 8'h00; csrl <= 8'h00; end
@@ -616,6 +653,7 @@ always @(posedge clk) begin
 			if (drv_dly == 0) begin
 				drv_busy <= 0;
 				drv_compl[dnum] <= 1;
+				drv_seeking[dnum] <= 0;
 			end
 			else drv_dly <= drv_dly - 1'd1;
 		end
@@ -666,7 +704,7 @@ always @(posedge clk) begin
 			      ? (sector_id[23:8] == fmt_id[23:8])
 			      : (sector_id == fmt_id);
 
-			if (drv_spinning[dnum] && drv_spiraling[dnum] &&
+			if (drv_spinning[dnum] && drv_spiraling[dnum] && !drv_seeking[dnum] &&
 			    (dst == D_IDLE) && (ecc_state == ECC_DONE)) begin
 				case (fmt_mode)
 				FM_READ_ID: begin
@@ -679,23 +717,49 @@ always @(posedge clk) begin
 				FM_READ: if (match) begin
 					// fetch the sector into the buffer; the drain to
 					// memory follows when the run completes
-					dsk_start(sector_id);
+					dsk_start(sector_id, 1'b0, 1'b0);
 				end
-				FM_ERASE: if (match) fmt_sector_done;
-				FM_VERIFY: if (match) fmt_sector_done;
+				FM_WRITE: begin
+					// The first sector under the head only fills the
+					// buffer - there is nothing to put back yet.  A
+					// write to a protected cartridge is refused.
+					if (match && write_timing) begin
+						if (drv_wp[dnum]) begin
+							fmt_mode <= FM_IDLE;
+							intstatus <= intstatus | MOINT_TIMEOUT;
+						end
+						else dsk_start(sector_id, 1'b1, 1'b0);
+					end
+					else begin
+						write_timing <= 1;
+						ecc_size  <= 0;
+						ecc_limit <= SECT_DATA;
+						ecc_is_read <= 0;
+						ecc_repeat <= |(csr2 & MOCSR2_ECC_BLOCKS);
+						ecc_state <= ECC_FILL;
+					end
+				end
+				FM_ERASE: if (match) begin
+					if (drv_wp[dnum]) begin
+						fmt_mode <= FM_IDLE;
+						intstatus <= intstatus | MOINT_TIMEOUT;
+					end
+					else dsk_start(sector_id, 1'b1, 1'b1);
+				end
+				FM_VERIFY: if (match) dsk_start(sector_id, 1'b0, 1'b0);
 				default: ;
 				endcase
 			end
 
 			// keep spiraling regardless of what the formatter wanted
-			if (drv_spiraling[0]) begin
+			if (drv_spiraling[0] && !drv_seeking[0]) begin
 				if (sec_offset[0] == MO_SEC_PER_TRACK[3:0] - 1'd1) begin
 					sec_offset[0] <= 0;
 					head_pos[0] <= head_pos[0] + 1'd1;
 				end
 				else sec_offset[0] <= sec_offset[0] + 1'd1;
 			end
-			if (drv_spiraling[1]) begin
+			if (drv_spiraling[1] && !drv_seeking[1]) begin
 				if (sec_offset[1] == MO_SEC_PER_TRACK[3:0] - 1'd1) begin
 					sec_offset[1] <= 0;
 					head_pos[1] <= head_pos[1] + 1'd1;
@@ -709,37 +773,66 @@ always @(posedge clk) begin
 		//------------------------------------------------------------
 		case (dst)
 		D_IDLE: ;
-		D_GO: begin
+		D_RGO: begin
 			sd_rd <= 1;
 			if (sd_ack) begin
 				sd_rd <= 0;
-				dst <= D_ACK;
+				dst <= D_RACK;
 			end
 		end
-		D_ACK: begin
+		D_RACK: begin
+			if (!sd_ack) dst <= dsk_is_wr ? D_WGO : D_NEXT;
+		end
+		D_WGO: begin
+			sd_wr <= 1;
+			if (sd_ack) begin
+				sd_wr <= 0;
+				dst <= D_WACK;
+			end
+		end
+		D_WACK: begin
 			if (!sd_ack) dst <= D_NEXT;
 		end
 		D_NEXT: begin
 			if (dsk_blk + 1'd1 >= dsk_nblk) begin
-				// the whole sector is in the buffer: hand it to the
-				// ECC engine, which drains it to memory (ecc_read)
 				dsk_active <= 0;
+				dsk_erase  <= 0;
 				dst <= D_IDLE;
-				ecc_size <= 0;
-				ecc_limit <= SECT_DISK;
-				ecc_is_read <= 1;
-				ecc_repeat <= |(csr2 & MOCSR2_ECC_BLOCKS);
-				ecc_state <= ECC_ECCING;
-				fmt_sector_done;
+				if (dsk_is_wr) begin
+					// the sector is on the disk; step on and start
+					// gathering the next one from memory (ecc_write)
+					fmt_sector_done;
+					if (!dsk_erase) begin
+						ecc_size  <= 0;
+						ecc_limit <= SECT_DATA;
+						ecc_is_read <= 0;
+						ecc_repeat <= |(csr2 & MOCSR2_ECC_BLOCKS);
+						ecc_state <= ECC_FILL;
+					end
+				end
+				else begin
+					// the whole sector is in the buffer: hand it to the
+					// ECC engine, which drains it to memory (ecc_read)
+					ecc_size <= 0;
+					ecc_limit <= SECT_DISK;
+					ecc_is_read <= 1;
+					ecc_repeat <= |(csr2 & MOCSR2_ECC_BLOCKS);
+					ecc_state <= ECC_ECCING;
+					fmt_sector_done;
+				end
 			end
 			else begin
 				dsk_blk <= dsk_blk + 1'd1;
 				dsk_lba_r <= dsk_lba_r + 1'd1;
-				dst <= D_GO;
+				dst <= D_RGO;
 			end
 		end
 		default: dst <= D_IDLE;
 		endcase
+
+		// while a block is being written back, point the buffer at the
+		// byte the card is asking for
+		if (dsk_active && dsk_is_wr) dsk_addr <= wgidx - {1'd0, dsk_skip};
 
 		//------------------------------------------------------------
 		// ECC engine

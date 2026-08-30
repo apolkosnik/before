@@ -47,7 +47,7 @@ next_mo #(.CLK_HZ(1000000)) dut
 	.img_mounted(oimg_mounted), .img_readonly(1'b0), .img_size(oimg_size),
 	.sd_unit(osd_unit), .sd_lba(osd_lba), .sd_rd(osd_rd), .sd_wr(osd_wr),
 	.sd_ack(osd_ack), .sd_buff_addr(osd_buff_addr),
-	.sd_buff_dout(osd_buff_dout), .sd_buff_din(), .sd_buff_wr(osd_buff_wr)
+	.sd_buff_dout(osd_buff_dout), .sd_buff_din(osd_buff_din_w), .sd_buff_wr(osd_buff_wr)
 );
 
 //----------------------------------------------------------------------------
@@ -65,6 +65,7 @@ reg        osd_ack = 0;
 reg  [8:0] osd_buff_addr = 0;
 reg  [7:0] osd_buff_dout = 0;
 reg        osd_buff_wr = 0;
+wire [7:0] osd_buff_din_w;
 
 // a byte of the disk, derived from its absolute offset
 function [7:0] dbyte;
@@ -72,20 +73,34 @@ function [7:0] dbyte;
 	dbyte = off[7:0] ^ off[15:8] ^ 8'h5A;
 endfunction
 
-integer osd_reads = 0;
-reg     osd_active = 0;
+localparam CART_BYTES = MO_TRACKS_MODELLED * 16 * MO_SECT;
+reg [7:0] cart [0:CART_BYTES-1];
+integer ci;
+initial for (ci = 0; ci < CART_BYTES; ci = ci + 1) cart[ci] = dbyte(ci);
 
+integer osd_reads = 0, osd_writes = 0;
+reg     osd_active = 0, osd_wact = 0, osd_rdph = 0;
+
+// The card reads and writes whole blocks; a sector straddles them, so
+// putting one back has to leave the bytes around it alone.
 always @(posedge clk) begin
 	osd_buff_wr <= 0;
-	if (osd_rd && !osd_ack && !osd_active) begin
+	if (osd_rd && !osd_ack && !osd_active && !osd_wact) begin
 		osd_ack <= 1;
 		osd_active <= 1;
 		osd_buff_addr <= 0;
 		osd_reads = osd_reads + 1;
 	end
+	else if (osd_wr && !osd_ack && !osd_active && !osd_wact) begin
+		osd_ack <= 1;
+		osd_wact <= 1;
+		osd_buff_addr <= 0;
+		osd_rdph <= 0;
+		osd_writes = osd_writes + 1;
+	end
 	else if (osd_ack && osd_active) begin
 		if (!osd_buff_wr) begin
-			osd_buff_dout <= dbyte({osd_lba, 9'd0} + {23'd0, osd_buff_addr});
+			osd_buff_dout <= cart[{osd_lba, 9'd0} + {23'd0, osd_buff_addr}];
 			osd_buff_wr <= 1;
 		end
 		else begin
@@ -95,6 +110,19 @@ always @(posedge clk) begin
 			end
 			else osd_buff_addr <= osd_buff_addr + 1'd1;
 		end
+	end
+	else if (osd_ack && osd_wact) begin
+		// one byte every other cycle: the buffer read is registered
+		if (osd_rdph) begin
+			cart[{osd_lba, 9'd0} + {23'd0, osd_buff_addr}] <= osd_buff_din_w;
+			osd_rdph <= 0;
+			if (osd_buff_addr == 9'd511) begin
+				osd_ack <= 0;
+				osd_wact <= 0;
+			end
+			else osd_buff_addr <= osd_buff_addr + 1'd1;
+		end
+		else osd_rdph <= 1;
 	end
 end
 
@@ -229,7 +257,7 @@ task check;
 	end
 endtask
 
-integer i;
+integer i, waited;
 reg [7:0] v, v2;
 reg ok;
 
@@ -381,6 +409,53 @@ initial begin
 	osp_rd8(5'h08, v);
 	osp_rd8(5'h09, v2);
 	check({v, v2} == 16'h0880, "the drive returns its version");
+
+	//------------------------------------------------------------
+	// Erase a sector.  Sector 1 of the first track starts 1296 bytes
+	// in, so it begins part way through a block and ends part way
+	// through another: the bytes around it must survive.
+	//------------------------------------------------------------
+	osp_wr8(5'h08, 8'h10); osp_wr8(5'h09, 8'h00);   // recalibrate
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'hA0); osp_wr8(5'h09, 8'h01);   // high order seek, 1
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h00); osp_wr8(5'h09, 8'h00);   // seek -> track 0x1000
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h22); osp_wr8(5'h09, 8'h00);   // DRV_RCA
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h08, v); osp_rd8(5'h09, v2);
+	check({v, v2} == 16'h1000, "high order seek reaches the first real track");
+
+	osp_wr8(5'h00, 8'h10);            // track high
+	osp_wr8(5'h01, 8'h00);            // track low
+	osp_wr8(5'h02, 8'h01);            // sector 1, increment 0
+	osp_wr8(5'h03, 8'h01);            // one sector
+	osp_wr8(5'h04, 8'hFF);            // clear the interrupt status
+	osp_wr8(5'h08, 8'h59); osp_wr8(5'h09, 8'h00);   // spiral on
+	repeat (100) @(posedge clk);
+	osp_wr8(5'h07, 8'h04);            // FMT_ERASE
+
+	waited = 0;
+	v = 0;
+	while (!v[2] && waited < 400000) begin
+		osp_rd8(5'h04, v);
+		waited = waited + 1;
+	end
+	check(v[2], "erase: the operation completes");
+	$display("  cartridge blocks: %0d read, %0d written", osd_reads, osd_writes);
+
+	ok = 1;
+	for (i = 0; i < MO_SECT; i = i + 1)
+		if (cart[MO_SECT + i] !== 8'hFF) ok = 0;
+	check(ok, "erase: the whole sector is erased");
+	ok = 1;
+	for (i = 0; i < MO_SECT; i = i + 1)
+		if (cart[i] !== dbyte(i)) ok = 0;
+	check(ok, "erase: the sector before it is untouched");
+	ok = 1;
+	for (i = 0; i < MO_SECT; i = i + 1)
+		if (cart[2*MO_SECT + i] !== dbyte(2*MO_SECT + i)) ok = 0;
+	check(ok, "erase: the sector after it is untouched");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);
