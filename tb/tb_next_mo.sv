@@ -376,6 +376,24 @@ initial begin
 	osp_rd8(5'h08, v);
 	check(v[6], "the formatter reports no cartridge too");
 
+	// A seek with no cartridge must not move the head.  Carrying on
+	// regardless leaves the drive reporting a track nobody asked for,
+	// and the driver reads that back as the drive's position.
+	osp_wr8(5'h08, 8'hA0); osp_wr8(5'h09, 8'h01);   // high order seek 1
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h00); osp_wr8(5'h09, 8'h00);   // seek -> track 0x1000
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h22); osp_wr8(5'h09, 8'h00);   // DRV_RCA
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h08, v); osp_rd8(5'h09, v2);
+	check({v, v2} == 16'h0000, "an empty drive does not move its head");
+	osp_rd8(5'h04, v);
+	check(v[1], "an empty drive raises attention");
+	osp_wr8(5'h08, 8'h50); osp_wr8(5'h09, 8'h00);   // DRV_RID
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h04, v);
+	check(!v[1], "reset attention clears it");
+
 	oimg_size = MO_TRACKS_MODELLED * 16 * MO_SECT;
 	oimg_mounted = 2'b01;
 	@(posedge clk);

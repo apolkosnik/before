@@ -217,9 +217,26 @@ wire  [2:0] cur_head  = drv_head[dnum];
 
 // The status word the drive returns: empty until an image is mounted,
 // stopped until the motor is started.
-wire [15:0] drv_dstat = (drv_ins[dnum] ? DS_INSERT : DS_EMPTY) |
+// The status the drive returns is sticky: faults accumulate in it
+// until the attention is reset, and the live bits are added on top.
+reg [15:0] dstat_v [0:1];
+reg        attn_pend = 0;        // this command ends with an attention
+wire [15:0] drv_dstat = dstat_v[dnum] |
+                        (drv_ins[dnum] ? DS_INSERT : DS_EMPTY) |
                         (drv_wp[dnum] ? DS_WP : 16'h0000) |
                         (drv_spinning[dnum] ? 16'h0000 : DS_STOPPED);
+
+// mo_drive_empty(): a command that needs a cartridge does not run
+// without one.  It sets DS_EMPTY, answers with a completion and an
+// attention, and leaves the head where it was - carrying on regardless
+// walks the head to a track that was never asked for, and the driver
+// reads that back as the drive's position.
+wire cmd_needs_media = (drv_cmd[15:12] == 4'h0)                  ||
+                       ((drv_cmd & 16'hFFF0) == 16'hA000)        ||
+                       ((drv_cmd & 16'hFF00) == 16'h5100)        ||
+                       (drv_cmd == DRV_REC) || (drv_cmd == DRV_SPM) ||
+                       (drv_cmd == DRV_STM) || (drv_cmd == DRV_SOO) ||
+                       (drv_cmd == DRV_SOF);
 
 wire [7:0] intstatus_eff = (intstatus & ~(MOINT_CMD_COMPL | MOINT_ATTN)) |
                            (drv_compl[dnum] ? MOINT_CMD_COMPL : 8'h00) |
@@ -446,6 +463,7 @@ always @(posedge clk) begin
 		m_req <= 0;
 		mo_we <= 0;
 		drv_ins <= 0; drv_wp <= 0;
+		dstat_v[0] <= 0; dstat_v[1] <= 0; attn_pend <= 0;
 		drv_spinning <= 0; drv_spiraling <= 0;
 		drv_attn <= 0; drv_compl <= 2'b11;   // MO_Init: complete, no attn
 		head_pos[0] <= 0; head_pos[1] <= 0;
@@ -606,6 +624,12 @@ always @(posedge clk) begin
 				drv_compl[dnum] <= 0;
 				drv_dly  <= CMD_DELAY;
 				drv_busy <= 1;
+			end
+			if (drv_conn[dnum] && cmd_needs_media && !drv_ins[dnum]) begin
+				dstat_v[dnum] <= dstat_v[dnum] | DS_EMPTY;
+				attn_pend <= 1;
+			end
+			else if (drv_conn[dnum]) begin
 				casez (drv_cmd)
 				16'b1010_0000_0000_????:            // high order seek:
 					// it only arms the top bits; the next seek applies them
@@ -644,7 +668,10 @@ always @(posedge clk) begin
 					DRV_SWH: drv_head[dnum] <= WRITE_HEAD;
 					DRV_SEH: drv_head[dnum] <= ERASE_HEAD;
 					DRV_SFH: drv_head[dnum] <= RF_HEAD;
-					DRV_RID: drv_attn[dnum] <= 0;
+					DRV_RID: begin      // reset attention and status
+						drv_attn[dnum] <= 0;
+						dstat_v[dnum]  <= 0;
+					end
 					DRV_SPM: drv_spinning[dnum] <= 0;
 					DRV_STM: drv_spinning[dnum] <= 1;
 					DRV_SOO: drv_spiraling[dnum] <= 1;
@@ -667,6 +694,10 @@ always @(posedge clk) begin
 				drv_busy <= 0;
 				drv_compl[dnum] <= 1;
 				drv_seeking[dnum] <= 0;
+				if (attn_pend) begin
+					drv_attn[dnum] <= 1;
+					attn_pend <= 0;
+				end
 			end
 			else drv_dly <= drv_dly - 1'd1;
 		end
