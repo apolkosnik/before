@@ -143,6 +143,33 @@ initial begin
 	rd_km_data(d);
 	check(d == 32'h1000_80B9, "key up event carries the up bit");
 
+	// The arrow keys arrive as extended scancodes, and share their
+	// second byte with the keypad digits: 0x75 is kp 8 without the
+	// E0 prefix and up arrow with it.  Reading the prefix wrongly
+	// makes the arrows type numbers, or nothing at all.
+	key(1, 1, 8'h6B);            // left
+	rd_km_data(d);
+	check(d == 32'h1000_8009, "left arrow is keycode 0x09");
+	key(1, 1, 8'h74);            // right
+	rd_km_data(d);
+	check(d == 32'h1000_8010, "right arrow is keycode 0x10");
+	key(1, 1, 8'h75);            // up
+	rd_km_data(d);
+	check(d == 32'h1000_8016, "up arrow is keycode 0x16");
+	key(1, 1, 8'h72);            // down
+	rd_km_data(d);
+	check(d == 32'h1000_800F, "down arrow is keycode 0x0f");
+	key(0, 1, 8'h72);            // down, released
+	rd_km_data(d);
+	check(d == 32'h1000_808F, "arrow release carries the up bit");
+
+	// the same codes without the prefix are the keypad digits
+	key(1, 0, 8'h75);            // kp 8
+	rd_km_data(d);
+	check(d == 32'h1000_8022, "kp 8 without the prefix is keycode 0x22");
+	key(0, 0, 8'h75);
+	rd_km_data(d);
+
 	// shift modifier travels in the event
 	key(1, 0, 8'h12);            // left shift down
 	rd_km_data(d);
