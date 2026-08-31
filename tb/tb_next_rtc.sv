@@ -291,6 +291,13 @@ initial begin
 	check(c18 == "f" && c19 == "d", "Auto with only a floppy: boot command fd");
 	floppy_mounted = 0;
 
+	// Optical.  nvram_init() in the reference spells it od, alongside
+	// sd, fd and en; without it the menu could not ask the ROM to
+	// boot from a drive the machine has.
+	boot_variant(3'd5, 1'b0);
+	check(c18 == "o" && c19 == "d", "Optical: boot command od");
+	check(b30 == 8'h71 && b31 == 8'h8B, "Optical: checksum");
+
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);
 	$finish;

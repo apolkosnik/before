@@ -227,6 +227,21 @@ initial begin
 	img_mounted = 0;
 	repeat (20) @(posedge clk);
 
+	// Putting a disk in has to show in the status register straight
+	// away.  The ROM may look before it next writes the DOR, and
+	// would otherwise be told the drive is still empty.
+	rd8(4'h8, v);
+	check(!v[2] && v[1:0] == 2'd2, "a disk put in is reported at once");
+
+	// and it survives the RESET instruction, which reaches every
+	// device: the reference never clears this register on a reset
+	reset = 1;
+	repeat (4) @(posedge clk);
+	reset = 0;
+	repeat (10) @(posedge clk);
+	rd8(4'h8, v);
+	check(!v[2] && v[1:0] == 2'd2, "the medium survives a device reset");
+
 	rd8(4'h4, msr);
 	check(msr[7] && !msr[6], "reset leaves the controller ready for a command");
 

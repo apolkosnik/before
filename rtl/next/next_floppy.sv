@@ -91,7 +91,7 @@ reg  [7:0] ccr;              // configuration control (data rate)
 // Keeping one register for both let a channel-select write erase the
 // media ID and leave the ROM seeing an empty drive.
 reg        sel_82077;        // written at +8, selects the DMA channel
-reg  [7:0] ctrl_st;          // read at +8: drive and media status
+reg  [7:0] ctrl_st = 8'h00;  // read at +8: drive and media status
 reg  [7:0] st0, st1, st2;
 reg  [7:0] pcn_v [0:1];      // present cylinder, per drive
 wire [7:0] pcn = pcn_v[ds];
@@ -295,10 +295,11 @@ always @(posedge clk) begin
 		msr <= STAT_RQM;
 		ccr <= 8'h00;
 		sel_82077 <= 1'b0;
-		// flp.ctrl starts at zero in the reference: the drive is
-		// connected and there is no medium in it.  Coming up with
-		// CTRL_DRV_ID set says the machine has no floppy drive.
-		ctrl_st <= 8'h00;
+		// flp.ctrl is not touched by a controller reset in the
+		// reference, and the 68040's RESET instruction reaches every
+		// device here - clearing it there loses the medium every time
+		// the ROM resets the machine.  It powers up at zero: drive
+		// connected, nothing in it.
 		st0 <= 0; st1 <= 0; st2 <= 0;
 		pcn_v[0] <= 0;
 		pcn_v[1] <= 0;
@@ -326,6 +327,17 @@ always @(posedge clk) begin
 			// all; anything else has no geometry to report, and the
 			// reference calls that an empty drive rather than guessing
 			// at 1.44 MB.
+			// A disk put in while the machine is running has to show
+			// up in the status register: the ROM may look before it
+			// next writes the DOR, and would be told the drive is
+			// empty.  This is the drive noticing the medium.
+			if (ds == 1'b0) begin
+				ctrl_st[2]   <= 1'b0;
+				ctrl_st[1:0] <= (img_size == 32'd737280)  ? MEDIA_720  :
+				                (img_size == 32'd2949120) ? MEDIA_2880 :
+				                (img_size == 32'd1474560) ? MEDIA_1440 :
+				                                            MEDIA_NONE;
+			end
 			present_v[0] <= (img_size == 32'd737280) ||
 			                (img_size == 32'd1474560) ||
 			                (img_size == 32'd2949120);
@@ -335,6 +347,13 @@ always @(posedge clk) begin
 			            (img_size == 32'd2949120) ? 8'd36 : 8'd18;
 		end
 		if (img_mounted[1]) begin
+			if (ds == 1'b1) begin
+				ctrl_st[2]   <= 1'b0;
+				ctrl_st[1:0] <= (img_size == 32'd737280)  ? MEDIA_720  :
+				                (img_size == 32'd2949120) ? MEDIA_2880 :
+				                (img_size == 32'd1474560) ? MEDIA_1440 :
+				                                            MEDIA_NONE;
+			end
 			present_v[1] <= (img_size == 32'd737280) ||
 			                (img_size == 32'd1474560) ||
 			                (img_size == 32'd2949120);

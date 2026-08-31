@@ -155,7 +155,10 @@ reg [2:0] bootdev_d = 3'd7;   // no real selection: forces the first load
 // effective boot device: 1 = SCSI disk ("sd"), 2 = ethernet ("en"),
 // 3 = empty boot command (the ROM walks its device table, network
 // first).  Auto picks the disk exactly when an image is mounted.
-// 0 = Auto, 1 = Disk, 2 = Floppy, 3 = Network, 4 = ROM Default.  Auto
+// 0 = Auto, 1 = Disk, 2 = Floppy, 3 = Network, 4 = ROM Default,
+// 5 = Optical.  The numbering is append-only so a saved setting
+// keeps its meaning.  nvram_init() in the reference spells the
+// devices sd, fd, en and od, with an empty command for the ROM.  Auto
 // prefers a mounted SCSI disk, then a mounted floppy, and otherwise
 // leaves the command empty for the ROM's own device order.
 wire [2:0] bootdev = (boot_sel == 3'd0)
@@ -177,16 +180,20 @@ function automatic [7:0] nv_init;
 			5'd14: nv_init = 8'h4B;
 			5'd18: nv_init = (dev == 3'd1) ? "s" :
 			                 (dev == 3'd2) ? "f" :
-			                 (dev == 3'd3) ? "e" : 8'h00;
+			                 (dev == 3'd3) ? "e" :
+			                 (dev == 3'd5) ? "o" : 8'h00;
 			5'd19: nv_init = (dev == 3'd1) ? "d" :
 			                 (dev == 3'd2) ? "d" :
-			                 (dev == 3'd3) ? "n" : 8'h00;
+			                 (dev == 3'd3) ? "n" :
+			                 (dev == 3'd5) ? "d" : 8'h00;
 			5'd30: nv_init = (dev == 3'd1) ? 8'h6D :
 			                 (dev == 3'd2) ? 8'h7A :
-			                 (dev == 3'd3) ? 8'h7B : 8'hE0;
+			                 (dev == 3'd3) ? 8'h7B :
+			                 (dev == 3'd5) ? 8'h71 : 8'hE0;
 			5'd31: nv_init = (dev == 3'd1) ? 8'h8B :
 			                 (dev == 3'd2) ? 8'h8B :
-			                 (dev == 3'd3) ? 8'h81 : 8'hEF;
+			                 (dev == 3'd3) ? 8'h81 :
+			                 (dev == 3'd5) ? 8'h8B : 8'hEF;
 			default: nv_init = 8'h00;
 		endcase
 	end

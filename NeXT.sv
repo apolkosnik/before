@@ -74,7 +74,7 @@ localparam CONF_STR = {
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
-	"O[57:55],Boot device,Auto,Disk,Floppy,Network,ROM Default;",
+	"O[57:55],Boot device,Auto,Disk,Floppy,Network,ROM Default,Optical;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
