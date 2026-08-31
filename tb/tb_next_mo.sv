@@ -408,6 +408,19 @@ initial begin
 	check(v2[2], "cartridge in: load completed");
 	check(v[1], "cartridge in: still stopped");
 
+	// The cartridge is not ejected by a reset: dev_reset carries the
+	// RESET instruction the ROM runs during start-up, and a drive
+	// emptied there is empty for every boot that follows.
+	reset = 1;
+	repeat (4) @(posedge clk);
+	reset = 0;
+	repeat (20) @(posedge clk);
+	osp_wr8(5'h06, 8'h00);
+	osp_wr8(5'h08, 8'h20); osp_wr8(5'h09, 8'h00);   // DRV_RDS
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h08, v);
+	check(!v[6], "the cartridge survives a device reset");
+
 	osp_wr8(5'h08, 8'h53); osp_wr8(5'h09, 8'h00);   // DRV_STM, start motor
 	repeat (200) @(posedge clk);
 	osp_wr8(5'h08, 8'h20); osp_wr8(5'h09, 8'h00);   // DRV_RDS

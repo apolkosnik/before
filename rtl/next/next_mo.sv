@@ -462,13 +462,17 @@ always @(posedge clk) begin
 		mst <= M_IDLE;
 		m_req <= 0;
 		mo_we <= 0;
-		drv_ins <= 0; drv_wp <= 0;
+		// The cartridge is not ejected by a reset.  dev_reset here
+		// carries the 68040's RESET instruction, which the ROM runs
+		// during start-up, so clearing the media state here takes the
+		// disk out of the drive before the machine has finished
+		// testing itself - and every boot then finds an empty drive.
+		// Only what the controller owns is reset.
 		dstat_v[0] <= 0; dstat_v[1] <= 0; attn_pend <= 0;
 		drv_spinning <= 0; drv_spiraling <= 0;
 		drv_attn <= 0; drv_compl <= 2'b11;   // MO_Init: complete, no attn
 		head_pos[0] <= 0; head_pos[1] <= 0;
 		drv_head[0] <= NO_HEAD; drv_head[1] <= NO_HEAD;
-		drv_bytes[0] <= 0; drv_bytes[1] <= 0;
 		drv_cmd_pend <= 0; drv_busy <= 0; drv_dly <= 0;
 		ho_pos[0] <= 0; ho_pos[1] <= 0; drv_seeking <= 0;
 		sd_rd <= 0; sd_wr <= 0;
