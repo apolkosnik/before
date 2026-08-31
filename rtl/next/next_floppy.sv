@@ -140,6 +140,15 @@ localparam [1:0] MEDIA_NONE = 2'd0, MEDIA_2880 = 2'd1,
 // only for a drive that is not there at all.  Drive 0 is always there.
 wire [1:0] drv_connected = {present_v[1], 1'b1};
 
+// What this register reports is physical: the drive is either fitted
+// or it is not, and the media ID comes off the disk's density sense
+// holes.  Neither depends on the motor, or on when the driver last
+// wrote the DOR - the reference recomputes it only on that write, and
+// flags its own doubt about clearing the ID when the motor stops.
+// Reporting the drive as it is removes the ordering entirely: a disk
+// put in is seen by the next read, whenever that comes.
+wire [7:0] ctrl_rd = {ctrl_st[7:3], ~drv_connected[ds], media_of(ds)};
+
 function [1:0] media_of;
 	input d;
 	media_of = !present_v[d]        ? MEDIA_NONE :
@@ -203,7 +212,7 @@ wire [3:0] a_odd  = {addr[3:1], 1'b1};
 	((a) == 4'h4) ? msr : \
 	((a) == 4'h5) ? res[0] : \
 	((a) == 4'h7) ? dir : \
-	((a) == 4'h8) ? ctrl_st : 8'h00 )
+	((a) == 4'h8) ? ctrl_rd : 8'h00 )
 
 assign rdata = {`FLP_READ(a_even), `FLP_READ(a_odd)};
 

@@ -205,6 +205,7 @@ task check;
 endtask
 
 reg [7:0] v, msr;
+wire dor_written = (dut.dor != 8'h00);
 integer i, bad;
 
 initial begin
@@ -232,6 +233,10 @@ initial begin
 	// would otherwise be told the drive is still empty.
 	rd8(4'h8, v);
 	check(!v[2] && v[1:0] == 2'd2, "a disk put in is reported at once");
+
+	// ... without the driver having written the DOR, and without the
+	// motor running: the media ID is off the disk, not off the motor
+	check(dor_written == 1'b0, "no DOR write was needed to see the disk");
 
 	// and it survives the RESET instruction, which reaches every
 	// device: the reference never clears this register on a reset
@@ -270,9 +275,13 @@ initial begin
 	check(v[1:0] == 2'd0, "an absent drive reports no medium");
 	wr8(4'h2, 8'h1C);            // back to drive 0
 
+	// The medium is still there with the motor stopped.  The
+	// reference clears the ID when the motor stops and marks that
+	// doubtful in a comment of its own; the ID comes off the disk's
+	// density sense holes, which do not care whether it is spinning.
 	wr8(4'h2, 8'h0C);            // motor off
 	rd8(4'h8, v);
-	check(v[1:0] == 2'd0, "no media id while the motor is stopped");
+	check(v[1:0] == 2'd2, "the medium is still reported with the motor off");
 	wr8(4'h2, 8'h1C);            // motor back on for the rest of the test
 
 	// SPECIFY: two parameters, no result
