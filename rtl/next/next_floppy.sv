@@ -134,9 +134,18 @@ wire [7:0] srb = 8'hC0;
 localparam [1:0] MEDIA_NONE = 2'd0, MEDIA_2880 = 2'd1,
                  MEDIA_1440 = 2'd2, MEDIA_720  = 2'd3;
 
-wire [1:0] media_id = !present            ? MEDIA_NONE :
-                      (spt == 8'd9)       ? MEDIA_720  :
-                      (spt == 8'd36)      ? MEDIA_2880 : MEDIA_1440;
+// The drive is a fixture of the machine; the medium comes and goes.
+// The reference keeps them apart - connected is configuration, and
+// inserted is whether there is a disk in it - and reports "no drive"
+// only for a drive that is not there at all.  Drive 0 is always there.
+wire [1:0] drv_connected = {present_v[1], 1'b1};
+
+function [1:0] media_of;
+	input d;
+	media_of = !present_v[d]        ? MEDIA_NONE :
+	           (spt_v[d] == 8'd9)   ? MEDIA_720  :
+	           (spt_v[d] == 8'd36)  ? MEDIA_2880 : MEDIA_1440;
+endfunction
 wire [7:0] dir = present ? 8'h00 : 8'h80;  // disk change when empty
 
 //----------------------------------------------------------------------------
@@ -286,7 +295,10 @@ always @(posedge clk) begin
 		msr <= STAT_RQM;
 		ccr <= 8'h00;
 		sel_82077 <= 1'b0;
-		ctrl_st <= 8'h04;        // no drive selected yet
+		// flp.ctrl starts at zero in the reference: the drive is
+		// connected and there is no medium in it.  Coming up with
+		// CTRL_DRV_ID set says the machine has no floppy drive.
+		ctrl_st <= 8'h00;
 		st0 <= 0; st1 <= 0; st2 <= 0;
 		pcn_v[0] <= 0;
 		pcn_v[1] <= 0;
@@ -454,13 +466,14 @@ always @(posedge clk) begin
 					4'h2: begin
 						dor <= v;
 						// floppy_dor_write(): the status published is
-						// that of the drive the write selects, and only
-						// drive 0 exists here, so selecting any other
-						// reports no drive at all.  The medium appears
-						// when that drive's motor is running.
-						if (v[1:0] == 2'd0) begin
+						// that of the drive this write selects - taken
+						// from the value being written, not the one it
+						// replaces - and the medium appears only while
+						// that drive's motor is running (0x10 << sel).
+						if (!v[1] && drv_connected[v[0]]) begin
 							ctrl_st[2]   <= 1'b0;
-							ctrl_st[1:0] <= v[4] ? media_id : MEDIA_NONE;
+							ctrl_st[1:0] <= (v[0] ? v[5] : v[4])
+							                ? media_of(v[0]) : MEDIA_NONE;
 						end
 						else begin
 							ctrl_st[2]   <= 1'b1;   // no such drive

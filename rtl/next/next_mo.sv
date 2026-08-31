@@ -140,7 +140,15 @@ reg [7:0] flag0, flag1, flag2, flag3, flag4, flag5, flag6;
 // The drives.  Everything the OSP asks about a drive is per drive, and
 // the selected one comes from CSR2's drive select bit.
 //----------------------------------------------------------------------------
-reg  [1:0] drv_conn = 0;         // an image is mounted
+// The drives are fitted to the machine; the cartridges come and go.
+// The reference keeps them apart - connected is configuration, set at
+// init along with complete and a cleared attention, while inserted is
+// whether there is a cartridge in the drive.  A connected drive with
+// no cartridge still answers, and says it is empty; an unconnected one
+// does not answer at all, which is how a machine with no optical
+// drive looks.  NeXTSTEP probes od0 and od1, so both are fitted.
+wire [1:0] drv_conn = 2'b11;     // both drives are fitted
+reg  [1:0] drv_ins = 0;          // a cartridge is in the drive
 reg  [1:0] drv_wp = 0;           // mounted read only
 reg  [1:0] drv_spinning = 0;
 reg  [1:0] drv_spiraling = 0;
@@ -209,7 +217,7 @@ wire  [2:0] cur_head  = drv_head[dnum];
 
 // The status word the drive returns: empty until an image is mounted,
 // stopped until the motor is started.
-wire [15:0] drv_dstat = (drv_conn[dnum] ? DS_INSERT : DS_EMPTY) |
+wire [15:0] drv_dstat = (drv_ins[dnum] ? DS_INSERT : DS_EMPTY) |
                         (drv_wp[dnum] ? DS_WP : 16'h0000) |
                         (drv_spinning[dnum] ? 16'h0000 : DS_STOPPED);
 
@@ -437,9 +445,9 @@ always @(posedge clk) begin
 		mst <= M_IDLE;
 		m_req <= 0;
 		mo_we <= 0;
-		drv_conn <= 0; drv_wp <= 0;
+		drv_ins <= 0; drv_wp <= 0;
 		drv_spinning <= 0; drv_spiraling <= 0;
-		drv_attn <= 0; drv_compl <= 0;
+		drv_attn <= 0; drv_compl <= 2'b11;   // MO_Init: complete, no attn
 		head_pos[0] <= 0; head_pos[1] <= 0;
 		drv_head[0] <= NO_HEAD; drv_head[1] <= NO_HEAD;
 		drv_bytes[0] <= 0; drv_bytes[1] <= 0;
@@ -575,13 +583,13 @@ always @(posedge clk) begin
 		// gets the OSP's attention
 		//------------------------------------------------------------
 		if (img_mounted[0]) begin
-			drv_conn[0]  <= (img_size != 0);
+			drv_ins[0]   <= (img_size != 0);
 			drv_wp[0]    <= img_readonly;
 			drv_bytes[0] <= img_size[31:0];
 			drv_attn[0]  <= 1;
 		end
 		if (img_mounted[1]) begin
-			drv_conn[1]  <= (img_size != 0);
+			drv_ins[1]   <= (img_size != 0);
 			drv_wp[1]    <= img_readonly;
 			drv_bytes[1] <= img_size[31:0];
 			drv_attn[1]  <= 1;
@@ -642,7 +650,7 @@ always @(posedge clk) begin
 					DRV_SOO: drv_spiraling[dnum] <= 1;
 					DRV_SOF: drv_spiraling[dnum] <= 0;
 					DRV_EC:  begin
-						drv_conn[dnum] <= 0;
+						drv_ins[dnum] <= 0;
 						drv_spinning[dnum] <= 0;
 						drv_attn[dnum] <= 1;
 					end
@@ -709,7 +717,8 @@ always @(posedge clk) begin
 			      ? (sector_id[23:8] == fmt_id[23:8])
 			      : (sector_id == fmt_id);
 
-			if (drv_spinning[dnum] && drv_spiraling[dnum] && !drv_seeking[dnum] &&
+			if (drv_ins[dnum] && drv_spinning[dnum] &&
+			    drv_spiraling[dnum] && !drv_seeking[dnum] &&
 			    (dst == D_IDLE) && (ecc_state == ECC_DONE)) begin
 				case (fmt_mode)
 				FM_READ_ID: begin

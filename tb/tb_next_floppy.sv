@@ -212,6 +212,15 @@ initial begin
 	reset = 0;
 	repeat (10) @(posedge clk);
 
+	// Before anything is mounted the machine still has a drive.  The
+	// reference's control register starts at zero: CTRL_DRV_ID clear
+	// says the drive is there, and the media bits say it is empty.
+	// Coming up with CTRL_DRV_ID set tells the ROM the machine has no
+	// floppy drive at all, and no disk will ever be found in it.
+	rd8(4'h8, v);
+	check(!v[2], "an empty machine still reports a floppy drive");
+	check(v[1:0] == 2'd0, "an empty drive reports no medium");
+
 	img_size = BLOCKS*512;          // 1.44 MB
 	img_mounted = 1;
 	@(posedge clk);

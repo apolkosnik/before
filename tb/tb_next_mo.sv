@@ -359,17 +359,22 @@ initial begin
 	// The drive.  Nothing here worked before: the controller answered
 	// every status request with "no drive attached".
 	//------------------------------------------------------------
+	// The drive is fitted whether or not a cartridge is in it.  An
+	// empty drive still answers - and says it is empty; a drive that
+	// is not there answers nothing at all.  Reading the command byte
+	// back unchanged is what "did not answer" looks like, so the
+	// status has to replace it: DS_EMPTY | DS_STOPPED.
 	osp_wr8(5'h06, 8'h00);            // CSR2: select drive 0
 	osp_wr8(5'h04, 8'hFF);            // clear the interrupt status
 	osp_wr8(5'h08, 8'h20); osp_wr8(5'h09, 8'h00);   // DRV_RDS
 	repeat (200) @(posedge clk);
-	osp_rd8(5'h04, v);
-	check(!v[0], "empty slot: no command completion at all");
-	// the formatter's own status request always answers
+	osp_rd8(5'h08, v);
+	check(v == 8'h42, "an empty drive answers, and reports no cartridge");
+	// the formatter's own status request agrees
 	osp_wr8(5'h07, 8'h20);            // FMT_RD_STAT
 	repeat (20) @(posedge clk);
 	osp_rd8(5'h08, v);
-	check(v[6], "empty slot: the formatter reports no cartridge");
+	check(v[6], "the formatter reports no cartridge too");
 
 	oimg_size = MO_TRACKS_MODELLED * 16 * MO_SECT;
 	oimg_mounted = 2'b01;
