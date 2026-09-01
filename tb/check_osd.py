@@ -52,9 +52,31 @@ if not m:
 vdnum = int(m.group(1))
 
 # the menu's own slot entries, "S<n>,<extensions>,<label>;"
-slots = [(int(n), label) for n, label in re.findall(r'"S(\d),[^,]*,([^;"]*);"', src)]
-if not slots:
+entries = re.findall(r'"S(\d),([^,]*),([^;"]*);"', src)
+if not entries:
     fail("no S entries found in CONF_STR")
+slots = [(int(n), label) for n, _, label in entries]
+
+# The host reads the extension list in three character groups, padding
+# the whole string out with spaces to reach a multiple of three.  A two
+# letter extension therefore carries its own trailing space, and one
+# written without it swallows the first letter of the next - or falls
+# off the end.  A file whose extension is missing from the list is not
+# hidden with a warning; it simply does not appear in the browser, and
+# the drive looks empty for a reason nothing on the machine can show.
+NATIVE = [("floppy", "FD "), ("optical", "OD ")]
+
+for n, ext, label in entries:
+    if len(ext) % 3:
+        fail(f'S{n} ("{label.strip()}") lists extensions "{ext}", which is '
+             f"not a whole number of three character groups; the host pads "
+             f"the end and every group after the short one shifts")
+    groups = [ext[i:i + 3] for i in range(0, len(ext), 3)]
+    for kind, want in NATIVE:
+        if kind in label.lower() and want not in groups:
+            fail(f'S{n} ("{label.strip()}") is the {kind} but its extensions '
+                 f'{groups} do not include "{want}" - a NeXT {kind} image is '
+                 f'.{want.strip().lower()} and would not be listed at all')
 
 nums = [n for n, _ in slots]
 
