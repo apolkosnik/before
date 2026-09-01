@@ -73,6 +73,9 @@ vbuild tb_next_boot      -I"$CPU" tb_next_boot.sv $NEXTSRC $CPUSRC
 # declaration or a mistyped port there costs a forty minute build to
 # discover.  Lint it here: module resolution is not the point, the
 # file's own declarations are, so MODMISSING is filtered out.
+echo "== checking the OSD image slots =="
+python3 check_osd.py || exit 1
+
 echo "== linting the emu top =="
 if verilator --lint-only -Wno-fatal -I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC 2>&1 \
      | grep -E "^%Error" | grep -vE "MODMISSING|Exiting due to" | grep -q .; then
