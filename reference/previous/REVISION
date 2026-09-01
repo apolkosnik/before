@@ -1,0 +1,17 @@
+Previous, the NeXT emulator, used here as the hardware behaviour
+reference and as the source of the Rev 2.5 v66 boot ROM the
+testbenches execute.
+
+  upstream:  https://svn.code.sf.net/p/previous/code/trunk
+  revision:  r1850 (last change r1847, 2026-07-06)
+  taken:     2026-08-31
+
+This is a plain source export rather than a submodule.  The GitHub
+mirror the submodule used to point at (probonopd/previous) stopped at
+2017-12-12, which left every behaviour question being answered against
+nine year old code; upstream is Subversion, which git submodules
+cannot track.  The disks/ directory of blank images is not included.
+
+The v66 ROM is byte identical to the one the mirror carried
+(md5 7430f6efc82ba849d79de4f0d274793b), so the testbenches see exactly
+the same machine as before.

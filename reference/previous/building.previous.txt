@@ -1,0 +1,156 @@
+ Compiling Previous on macOS
+ ---------------------------
+
+Previous can be compiled on any UNIX-like operating system including macOS. 
+These instructions also apply to building on Linux except that a different 
+package manager will be used. macOS comes with some packages pre-installed. On 
+other platforms you might need to also install libpcap, readline and zlib.
+
+1. Install macports:
+   Follow the instructions on https://www.macports.org/ to download and install 
+   the macports package manager. If not already installed this includes to also 
+   install Xcode developer tools.
+
+2. Installing required packages:
+   Download the latest runtime binary of SDL3 from https://www.libsdl.org/ and 
+   copy SDL3.framework to /Library/Frameworks.
+
+   From the command line use the command "port install <package_name>" to 
+   install the following packages:
+      cmake
+      libpng
+
+3. Compiling Previous:
+   From the command line change the directory to the location of Previous' 
+   source tree and run these commands:
+      mkdir build
+      cd build
+      cmake ..
+      make
+
+4. Installing Previous:
+   Copy Previous.app from build/src to any target directory. It should now be 
+   possible to start and use Previous.app.
+
+
+ Special notes for Linux
+ -----------------------
+
+1. It seems that on some distributions of Linux rendering has to be done from 
+   the main thread. Therefore it is not recommended to enable rendering threads 
+   on Linux. If you still want to experiment with rendering threads, you can 
+   enable them at compile time using the following option:
+      ./configure --enable-rendering-thread
+      make
+
+2. Some Linux distributions have pre-installed outdated versions of SDL3. You 
+   might have to build an up-to-date version yourself. To compile against your 
+   own build of SDL3 you have to set an environment variable:
+      setenv SDL3_DIR /path/to/custom/SDL3 ; ./configure
+      make
+
+
+ Building a distributable application bundle on macOS
+ ----------------------------------------------------
+
+These are special instructions on how to build an application bundle that can 
+be distributed and run on any macOS version >= deployment target. If you want 
+to build a distributable package skip step 3 from the above instructions and 
+replace with these steps:
+
+1. Build png.framework:
+   a Download source code from http://libpng.org/pub/png/libpng.html
+   b Go to the source directory and build an Xcode project:
+        cmake -G Xcode . -DPNG_HARDWARE_OPTIMIZATIONS=OFF
+   c Open the Xcode project and select "libpng" in left side bar
+   d Select "Targets > png_framework" in middle sector
+   e Set "Architectures" to "Standard Architectures (Apple Silicon, Intel)"
+   f Set "Build Active Architecture Only" to "No"
+   g Set "macOS Deployment Target" to "macOS 10.13" or oldest available
+   h Set "Framework Version" to "A"
+   i Set "Compatibility Version" to "1.0.0"
+   j Set "Current Library Version" to the actual version of libpng
+   k Select "png_framework > Any Mac" in title bar and go to "Edit Scheme ..."
+   l Set "Build Configuration" to "Release"
+   m Select "Product > Build" from the menu bar
+   n Using Terminal go to bundle directory, change loader path and sign code:
+        install_name_tool -change /opt/local/lib/libz.1.dylib /usr/lib/libz.1.dylib png
+        codesign --force -s - png
+   o Copy the framework to /Library/Frameworks and make sure no other versions
+     of libpng are installed (if applicable remove macports version of libpng)
+
+2. From the command line go to Previous' source directory and build Previous 
+   using this command from the command line:
+      cmake .
+      make
+
+3. Add SDL3.framework and png.framework to the application bundle:
+   The application bundle Previous.app is located in the src directory of the 
+   source tree. Go inside the application bundle and go to the Contents folder.
+   Copy SDL3.framework and png.framework into the "Frameworks" folder.
+
+4. Sign the application binary:
+   Using Terminal go to the MacOS directory inside the application bundle and
+   run this command from the command line:
+      codesign --force -s - Previous
+
+5. Make a package for distribution:
+   Create a folder named "Previous <version>" and copy Previous.app into it. 
+   Copy the following files and folders to the same folder:
+      disks
+      gpl.txt
+      readme.previous.txt
+      networking.howto.txt
+      filesharing.howto.txt
+      netboot.howto.txt
+
+   Archive the folder using the Compress option from the Finder context menu.
+
+
+ Compiling Previous on Windows
+ -----------------------------
+
+Previous can be compiled on Windows using the MinGW64 compiler on the MSYS2 
+platform. The code won't compile with Visual Studio (MSVC) because it relies on 
+POSIX functions that are not supported by MSVC.
+
+1. Install MSYS2 64-bit:
+   Follow the instructions on https://www.msys2.org/ to download and install the 
+   MinGW compiler.
+
+2. Installing required packages:
+   Open the MinGW command prompt from the Start menu (MSYS2 MinGW x64) and 
+   install the following packages using the command: "pacman -S <package_name>":
+      mingw-w64-x86_64-SDL3
+      mingw-w64-x86_64-readline
+      mingw-w64-x86_64-zlib
+      mingw-w64-x86_64-libpng
+      mingw-w64-x86_64-libpcap
+      mingw-w64-x86_64-cmake
+      mingw-w64-x86_64-ninja   (optional, but recommended)
+
+3. Compiling Previous:
+   On the MSYS2 MinGW x64 prompt change the directory to the location of 
+   Previous' source tree and run these commands:
+      mkdir build
+      cd build
+      cmake ..
+      cmake --build . && strip src/Previous.exe
+
+4. Installing Previous:
+   Copy Previous.exe from build/src to any target directory and copy the files 
+   listed below from <MSYS2_installation_dir>/mingw64/bin to the same location 
+   as Previous.exe:
+      libcrypto-1_1-x64.dll
+      libgcc_s_seh-1.dll
+      libpcap.dll
+      libpng16-16.dll
+      libreadline8.dll
+      libssl-1_1-x64.dll
+      libstdc++-6.dll
+      libtermcap-0.dll
+      libwinpthread-1.dll
+      SDL3.dll
+      zlib1.dll
+
+   It should now be possible to start and use Previous.exe.

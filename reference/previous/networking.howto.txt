@@ -1,0 +1,225 @@
+NOTE: This procedure is only valid when using SLiRP as network interface. If 
+      using PCAP as network interface, you have to configure with the values 
+      valid on your local network and instead of auto-configuration set most 
+      values manually. If your router does not support the Routing Information 
+      Protocol version 1 you have to statically configure the router address. If 
+      using PCAP or if you do not intend to use Previous' internal NFS server 
+      for filesharing or netbooting you may also choose your own hostname. 
+      Please note that it has to consist of a maximum of eight lower case 
+      letters.
+
+
+NOWTO: Setup networking on NeXTstep 3.3 and later:
+
+   Networking should work automatically without any setup.
+
+
+NOWTO: Setup networking on NeXTstep 1.0 through 3.2:
+
+1. On first boot you might be prompted to press 'c' or you might be dropped to 
+   the single user mode console. If prompted to press 'c' just do so or if on 
+   the single user mode console just type "exit" to continue booting.
+
+2. Open Terminal (you find it in /NextApps directory) and use these commands to 
+   copy the files that need to be modified to your home directory "/me":
+      touch /me/resolv.conf
+      cp /etc/hosts /me
+
+3. Open "/me/resolv.conf" and add these two lines to the file:
+      domain home
+      nameserver 10.0.2.3
+
+4. Open "/me/hosts" and append the following lines at the end of the file:
+      10.0.2.15 previous
+      10.0.2.254 nfs
+
+5. Use these commands from the command line (Terminal) to copy and load the 
+   edited files:
+      su
+      cp /me/resolv.conf /etc
+      cp /me/hosts /etc
+
+6. Open NetManager (you find it in /NextAdmin directory), go to "Local..." and 
+   configure with these values:
+   a  For "Network Type" select "NetInfo Network"
+   b  For "Yellow Pages Domain Name" select "None"
+   c  For "Hostname" select "Autoconfigure"
+   d  For "Address" select "Autoconfigure"
+   e  For "Router" select "Dynamic"
+   f  For "Broadcast Address" select "Default"
+   g  For "Netmask" select "Automatic"
+   h  Hit "OK" and confirm all messages. It will reboot. Done.
+
+NOTE: On NeXTstep 3.0 and later NetManager is called HostManager, "Network Type" 
+      is called "NetInfo Binding" and "NetInfo Network" is called "Bind to 
+      network NetInfo server".
+      On NeXTstep 2.0 and later "Yellow Pages Domain Name" is called "NIS Domain 
+      Name".
+
+
+NOWTO: Setup networking on NeXTstep 0.9:
+
+1. Make sure Ethernet is disconnected before the first boot. During the boot 
+   process you might be prompted to press 'c' or you might be dropped to the 
+   single user mode console. If prompted to press 'c' just do so or if on the 
+   single user mode console just type "exit" to continue booting.
+
+2. Open Preferences (you find it in /NextApps directory) and go to the 
+   "Password" preferences panel. Set a password for "me" (leave old password 
+   field empty) and log out. You will then get the log in panel. Log in as super 
+   user by entering "root" in the "name" field and leaving the password field 
+   empty (press Enter twice).
+
+3. Open NetManager (you find it in /NextDeveloper/Apps directory) and select 
+   "Local Configuration...". Set "Network Type" to "Non-NeXT Network" and click 
+   "Save". Confirm all messages until you are asked if you want to reboot. Skip 
+   reboot.
+
+4. Open Shell (you find it in /NextApps directory) to create, open and modify 
+   some files as follows:
+   a  Create and modify "/etc/resolv.conf" with these commands:
+         touch /etc/resolv.conf
+         open /etc/resolv.conf
+      Append these two lines to the file
+         domain home
+         nameserver 10.0.2.3
+      and save the changes by selecting Window > Save.
+   b  Modify "/etc/hostconfig" with these commands:
+         open /etc/hostconfig
+      Set the values as follows 
+         HOSTNAME=-AUTOMATIC-
+         INETADDR=-AUTOMATIC-
+         ROUTER=-ROUTED-
+         NETMASTER=-NO-
+         YPDOMAIN=-NO-
+         IPNETMASK=-AUTOMATIC-
+      and save the changes by selecting Window > Save. If a line does not 
+      already exist, just create it.
+   c  Modify "/etc/hosts" with these commands:
+         open /etc/hosts
+      Append these two lines to the file
+         10.0.2.15 previous
+         10.0.2.254 nfs
+      and save the changes by selecting Window > Save.
+
+5. Open NetInfo (you find it in /NextDeveloper/Apps directory) and go to 
+   "users" > "me". Double click the field right to "passwd" containing the 
+   encrypted password and delete the contents of the field. Press OK and quit 
+   NetInfo.
+
+6. Connect Ethernet and from Shell reboot using this command:
+      reboot
+   Done.
+
+NOTE: If you prefer to statically configure the router you have to modify the 
+      file "/etc/rc" by replacing the term
+         /usr/etc/route add default $ROUTER 0
+      with the term
+         /usr/etc/route add default $ROUTER 1
+
+
+NOWTO: Setup networking on NeXTstep 0.8:
+
+1. Open the file "/etc/hosts" and append the following lines to the file:
+      10.0.2.15 previous
+      10.0.2.254 nfs
+
+2. Open the file "/etc/resolv.conf" and append the following lines to the file:
+      domain home
+      nameserver 10.0.2.3
+
+3. Open Shell (you find it in /bootdisk/NeXT/Apps directory) and use these 
+   commands to write the hostname to the disk label and reboot:
+      su
+      disk -t XT-8760S-512 -H previous /dev/rsd0a
+      touch /bootdisk/fastboot
+      reboot
+
+4. You can now do some basic networking like telnet to a specific IP address or 
+   set up an NFS share. Note that resolving host names via DNS does not work.
+
+NOTE: The /etc/rc.boot script configures the network with this command:
+         ifconfig en0 10.0.2.15
+
+      The router can be statically configured by modifying the /etc/rc.local 
+      script. You need to replace the lines
+         if [ -f /etc/routed ]; then
+            /etc/routed &
+            (echo -n ' routed') >/dev/console
+         fi
+      with the lines
+         if [ -f /etc/route ]; then
+            (/etc/route add default 10.0.2.2 1) >/dev/console
+         fi
+
+NOTE: You can preserve the fastboot option permanently by modifying the /etc/rc
+      script. You need to replace the lines
+         if [ -r /bootdisk/fastboot ]
+         then
+            rm -f /bootdisk/fastboot
+         fi
+      with the lines
+         # if [ -r /bootdisk/fastboot ]
+         # then
+         #    rm -f /bootdisk/fastboot
+         # fi
+
+
+HOWTO: Reset network configuration:
+
+1. If you have a system that does not seem to be configured properly and you 
+   can't fix it by using the above instructions you can try resetting system 
+   configurations. Note that all configurations including passwords will be
+   reset.
+
+2. Boot into ROM Monitor and use the following command to boot into single user
+   mode (replace "bsd" with "bod" for Optical Disk):
+      bsd -s
+
+3. During the boot process you will be dropped to the single user mode console.
+   Use this command to restore "/private/etc" and continue booting:
+      (cd /usr/template/client/etc; tar cf - .)|(cd /private/etc; tar xpBf -)
+      exit
+
+
+NOWTO: Setup networking on Mac OS:
+
+   Open the control panel "MacTCP" and configure Ethernet using these values:
+      IP Address: 10.0.2.15
+      Obtain Address: Manually
+      Class: A
+      Net: 10
+      Subnet: 2
+      Node: 15
+      Subnet Mask: 255.255.255.0
+      Gateway/Router Address: 10.0.2.2
+      Domain Name Server Information: Domain home, IP Address 10.0.2.3
+
+
+NOWTO: Accessing the guest system from the host machine through TCP/IP:
+
+   When using SLiRP, the guest system is not directly visible or accessible
+   through its own IP address 10.0.2.2. Instead, Previous provides a number of
+   port redirects that allow you to access certain ports on the guest system:
+
+      Host Port              Internal Port          Service
+      ---------              -------------          -------
+      42320                  20                     FTP data
+      42321                  21                     FTP control
+      42322                  22                     SSH
+      42323                  23                     Telnet
+      42380                  80                     HTTP
+
+   If you want to telnet into the guest system, you can do so by running the 
+   following command on your host system:
+      telnet localhost 42323
+
+   In order to connect through SSH (if installed on the NeXT side), do
+      ssh me@localhost -p 42322
+
+   You can ftp into your emulated NeXT machine with
+      ncftp -P 42321 ftp://me@localhost
+
+NOTE: The guest system has to have these services running in order to actually 
+      connect to them. By default, NeXTstep and OPENSTEP do not include servers 
+      for SSH or HTTP.

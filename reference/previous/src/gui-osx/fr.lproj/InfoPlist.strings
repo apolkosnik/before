@@ -1,0 +1,5 @@
+/* Localized versions of Info.plist keys */
+
+NSHumanReadableCopyright = "Copyright © 2011-2026 Andreas Grabher, Simon Schubiger, Gilles Fétis et autres (voir readme.previous.txt)";﻿
+NSMicrophoneUsageDescription = "Previous a besoin d'accéder à votre microphone pour l'entrée sonore.";
+NSCameraUsageDescription = "Previous a besoin d'accéder à votre caméra pour l'entrée vidéo.";

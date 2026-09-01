@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>sd</string>
+			</array>
+			<key>CFBundleTypeName</key>
+			<string>SCSI disk image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.sourceforge.previous.sd</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>od</string>
+			</array>
+			<key>CFBundleTypeName</key>
+			<string>Magneto-optical disk image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.sourceforge.previous.od</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>fd</string>
+			</array>
+			<key>CFBundleTypeName</key>
+			<string>Floppy disk image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.sourceforge.previous.fd</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>bin</string>
+			</array>
+			<key>CFBundleTypeName</key>
+			<string>ROM image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.sourceforge.previous.bin</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>cfg</string>
+			</array>
+			<key>CFBundleTypeName</key>
+			<string>Config File</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.sourceforge.previous.cfg</string>
+			</array>
+			<key>LSTypeIsPackage</key>
+			<false/>
+			<key>NSPersistentStoreTypeKey</key>
+			<string>Binary</string>
+		</dict>
+	</array>
+	<key>CFBundleExecutable</key>
+	<string>Previous</string>
+	<key>CFBundleIconFile</key>
+	<string>Previous.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.sourceforge.previous</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Previous</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>4.4</string>
+	<key>CFBundleSignature</key>
+	<string>PREV</string>
+	<key>CFBundleVersion</key>
+	<string>4.4</string>
+	<key>Previous</key>
+	<string>SDL Cocoa App</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>10.13.0</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Previous needs access to your microphone for sound input.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Previous needs access to your camera for video input.</string>
+</dict>
+</plist>

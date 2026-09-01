@@ -1,0 +1,76 @@
+NOTE: This procedure is only valid when using SLiRP as network interface. PCAP 
+      cannot be used for netbooting. Netboot is only available on host systems 
+      that support extended file attributes via sys/xattr.h.
+
+      Images need to be extracted to case sensitive filesystems. It is not 
+      possible to extract images of magneto-optical disks using ditool. It is 
+      also not possible to extract images which have NeXTstep 0.8 installed. 
+
+      Netbooting NeXTstep 0.9 only works using ROM 0.8 and netbooting NeXTstep 
+      1.0 and later only works using ROM 1.0 and later.
+
+      Before you start you need these things:
+      a  ditool: This command line utility comes with Previous. It can extract 
+         files from raw disk images with NeXT (UFS) file systems to a directory 
+         and prepare it for netboot. To call ditool you have to specify the path 
+         and name of the utility, the input file and the output directory on the 
+         command line. 
+      b  image.dd: This is the raw disk image you want to extract to some 
+         directory. It contains a bootable NeXTstep system. To extract it you 
+         have to specify the name of the image including the path to it after 
+         the "-im" option when calling the ditool utility.
+      c  nfsdir: This is the directory you want to share with the guest system 
+         via NFS. It is recommended to start with an empty directory. The 
+         bootable raw disk image will be extracted to this directory. During 
+         netboot it will be mounted at / on the guest system. To copy the 
+         bootable system to it you have to specify the path to the directory 
+         after the "-out" option when calling the ditool utility.
+
+
+NOWTO: Setup netboot under NeXTstep 1.0 and later:
+
+1. From the command line on your host system use the following command to 
+   extract your image (add the path where ditool is located in front of its 
+   name, replace image.dd with the path and name of the image you want to 
+   extract and replace nfsdir with the path to the directory you want to use as 
+   root directory for your guest system):
+      ditool -im image.dd -out nfsdir -netboot
+
+2. You can now netboot by setting "NFS shared directory" in the "Network" 
+   options to nfsdir and "Boot device" from "Boot" options to "Ethernet".
+
+
+NOWTO: Setup netboot under NeXTstep 0.9:
+
+1. Prepare the image you want to use for netboot by setting up networking using 
+   the procedure from networking.howto.txt.
+
+2. From your guest system open Shell (you find it in /NextApps directory) and 
+   copy some files using these commands from the command line:
+      su
+      cp /sdmach /private/tftpboot/mach
+      cp /usr/standalone/boot /private/tftpboot
+      touch /me/fstab
+
+3. Open "/me/fstab" and add these two lines to the file:
+      nfs:/ / nfs rw,noauto 0 0
+      nfs:/private /private nfs rw,noauto 0 0
+
+4. Shut down the guest system and from the command line on your host system use 
+   the following command to extract your image (add the path where ditool is 
+   located in front of its name, replace image.dd with the path and name of the 
+   image you want to extract and replace nfsdir with the path to the directory 
+   you want to use for netboot):
+      ditool -im image.dd -out nfsdir
+
+5. Using your host system replace the file "fstab" located in the directory 
+   "nfsdir/private/etc" with the version located in the directory "nfsdir/me".
+
+6. You can now netboot by setting "NFS shared directory" in the "Network" 
+   options to nfsdir and "Boot device" from "Boot" options to "Ethernet".
+
+
+NOTE: The procedures in ditool's netboot preparation routines are derived from 
+      what the "newclient" script from NeXTstep does when called like this:
+         su
+         newclient -s nfs previous
