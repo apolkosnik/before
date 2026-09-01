@@ -48,7 +48,6 @@ assign AUDIO_L = 0;
 assign AUDIO_R = 0;
 assign AUDIO_MIX = 0;
 
-assign LED_DISK = 0;
 assign LED_POWER = 0;
 assign BUTTONS = 0;
 
@@ -304,7 +303,33 @@ next_system #(
 	.dbg_ipl()
 );
 
-assign LED_USER = led;
+//////////////////////////////   DRIVE LIGHTS   /////////////////////////////
+//
+//  A card access lasts a few hundred microseconds and no eye would
+//  catch it, so each light is held on for a moment after the last one -
+//  the way a drive's own lamp lingers rather than strobing.  The floppy
+//  keeps its own light, as it does on a real machine and as Minimig
+//  wires it; the disk light covers the SCSI targets and the optical
+//  drives together, which is what the front of a cube shows.
+//
+//  b[1] = 0 leaves the framework's own status OR'd in, per sys/.
+
+localparam [21:0] LED_HOLD = 22'd1400000;   // ~50 ms at 28 MHz
+
+reg [21:0] disk_lamp = 0;
+reg [21:0] flp_lamp  = 0;
+
+always @(posedge clk_sys) begin
+	if (sd_rd | sd_wr | osd_rd | osd_wr) disk_lamp <= LED_HOLD;
+	else if (disk_lamp != 0)             disk_lamp <= disk_lamp - 1'd1;
+
+	if (fsd_rd | fsd_wr)                 flp_lamp <= LED_HOLD;
+	else if (flp_lamp != 0)              flp_lamp <= flp_lamp - 1'd1;
+end
+
+// the machine drives its own light through SCR2; the drives add theirs
+assign LED_USER = led | (flp_lamp != 0);
+assign LED_DISK = {1'b0, disk_lamp != 0};
 
 ///////////////////////   DDR3 RAM   /////////////////////////////
 
