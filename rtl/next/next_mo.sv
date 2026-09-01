@@ -205,9 +205,10 @@ reg        write_timing = 0;
 
 reg [15:0] drv_cmd = 0;
 reg        drv_cmd_pend = 0;
-reg [15:0] drv_dly = 0;          // microseconds until the command completes
+reg [20:0] drv_dly = 0;          // microseconds until the command completes
 reg        drv_busy = 0;
-localparam [15:0] CMD_DELAY = 16'd40;
+localparam [20:0] CMD_DELAY = 21'd40;
+localparam [20:0] SPINUP_DELAY = 21'd1600000;   // 1.6 s, as the reference
 
 wire       dnum = csr2[0];       // MOCSR2_DRIVE_SEL
 assign     sd_unit = dnum;
@@ -226,17 +227,21 @@ wire [15:0] drv_dstat = dstat_v[dnum] |
                         (drv_wp[dnum] ? DS_WP : 16'h0000) |
                         (drv_spinning[dnum] ? 16'h0000 : DS_STOPPED);
 
-// mo_drive_empty(): a command that needs a cartridge does not run
-// without one.  It sets DS_EMPTY, answers with a completion and an
-// attention, and leaves the head where it was - carrying on regardless
-// walks the head to a track that was never asked for, and the driver
-// reads that back as the drive's position.
-wire cmd_needs_media = (drv_cmd[15:12] == 4'h0)                  ||
+// Two guards, as the reference has them.  Anything that moves the
+// head or the spiral needs the disk turning: refusing it is an
+// unimplemented command, DS_CMD, not an empty drive.  Only the motor
+// and the eject need a cartridge as such.  Both answer with a
+// completion and an attention, and neither does the work - carrying on
+// regardless walks the head to a track that was never asked for, and
+// the driver reads that back as the drive's position.
+wire cmd_needs_spin  = (drv_cmd[15:12] == 4'h0)                  ||
                        ((drv_cmd & 16'hFFF0) == 16'hA000)        ||
                        ((drv_cmd & 16'hFF00) == 16'h5100)        ||
-                       (drv_cmd == DRV_REC) || (drv_cmd == DRV_SPM) ||
-                       (drv_cmd == DRV_STM) || (drv_cmd == DRV_SOO) ||
-                       (drv_cmd == DRV_SOF);
+                       (drv_cmd == DRV_REC)                      ||
+                       (drv_cmd[15:12] == 4'h4)                  ||
+                       (drv_cmd == DRV_SOO) || (drv_cmd == DRV_SOF);
+wire cmd_needs_media = (drv_cmd == DRV_SPM) || (drv_cmd == DRV_STM) ||
+                       (drv_cmd == DRV_EC);
 
 wire [7:0] intstatus_eff = (intstatus & ~(MOINT_CMD_COMPL | MOINT_ATTN)) |
                            (drv_compl[dnum] ? MOINT_CMD_COMPL : 8'h00) |
@@ -633,6 +638,13 @@ always @(posedge clk) begin
 				dstat_v[dnum] <= dstat_v[dnum] | DS_EMPTY;
 				attn_pend <= 1;
 			end
+			else if (drv_conn[dnum] && cmd_needs_spin &&
+			         !drv_spinning[dnum]) begin
+				// mo_unimplemented_cmd(): the head cannot be moved
+				// against a disk that is not turning
+				dstat_v[dnum] <= dstat_v[dnum] | DS_CMD;
+				attn_pend <= 1;
+			end
 			else if (drv_conn[dnum]) begin
 				casez (drv_cmd)
 				16'b1010_0000_0000_????:            // high order seek:
@@ -677,7 +689,12 @@ always @(posedge clk) begin
 						dstat_v[dnum]  <= 0;
 					end
 					DRV_SPM: drv_spinning[dnum] <= 0;
-					DRV_STM: drv_spinning[dnum] <= 1;
+					DRV_STM: begin
+						// spinning a cartridge up takes real time,
+						// and the driver waits for the completion
+						drv_spinning[dnum] <= 1;
+						drv_dly <= SPINUP_DELAY;
+					end
 					DRV_SOO: drv_spiraling[dnum] <= 1;
 					DRV_SOF: drv_spiraling[dnum] <= 0;
 					DRV_EC:  begin
@@ -692,8 +709,14 @@ always @(posedge clk) begin
 			end
 		end
 
-		// the drive reports completion a while after it is asked
-		if (drv_busy && us_tick) begin
+		// The drive reports completion a while after it is asked.
+		// This runs after the command block, so its countdown must
+		// stand aside on the cycle a command loads a new delay -
+		// otherwise the decrement overwrites the load and the command
+		// inherits whatever was left of the last one.  Invisible while
+		// every command took the same time; a 1.6 second spin-up left
+		// the next command counting down from the rest of it.
+		if (drv_busy && us_tick && !drv_cmd_pend) begin
 			if (drv_dly == 0) begin
 				drv_busy <= 0;
 				drv_compl[dnum] <= 1;

@@ -421,7 +421,39 @@ initial begin
 	osp_rd8(5'h08, v);
 	check(!v[6], "the cartridge survives a device reset");
 
+	// The head cannot be moved against a disk that is not turning.
+	// The reference refuses it as an unimplemented command - DS_CMD,
+	// with a completion and an attention - rather than doing it.
+	osp_wr8(5'h08, 8'h50); osp_wr8(5'h09, 8'h00);   // DRV_RID: clear status
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h01); osp_wr8(5'h09, 8'h23);   // seek, motor stopped
+	repeat (200) @(posedge clk);
+	osp_wr8(5'h08, 8'h22); osp_wr8(5'h09, 8'h00);   // DRV_RCA
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h08, v); osp_rd8(5'h09, v2);
+	check({v, v2} == 16'h0000, "a stopped drive does not move its head");
+	osp_wr8(5'h08, 8'h20); osp_wr8(5'h09, 8'h00);   // DRV_RDS
+	repeat (200) @(posedge clk);
+	osp_rd8(5'h09, v2);
+	check(v2[5], "a seek with the disk stopped is an invalid command");
+	osp_wr8(5'h08, 8'h50); osp_wr8(5'h09, 8'h00);   // DRV_RID
+	repeat (200) @(posedge clk);
+
 	osp_wr8(5'h08, 8'h53); osp_wr8(5'h09, 8'h00);   // DRV_STM, start motor
+
+	// Spinning a cartridge up takes real time - the reference waits
+	// 1.6 seconds before answering - and the driver waits for that
+	// completion.  Answering at once says the disk is at speed when
+	// it is not.
+	repeat (2000) @(posedge clk);
+	osp_rd8(5'h04, v);
+	check(!v[0], "the motor does not report itself up at once");
+	while (!v[0]) begin
+		repeat (1000) @(posedge clk);
+		osp_rd8(5'h04, v);
+	end
+	check(v[0], "the motor reports up once it has spun");
+
 	repeat (200) @(posedge clk);
 	osp_wr8(5'h08, 8'h20); osp_wr8(5'h09, 8'h00);   // DRV_RDS
 	repeat (200) @(posedge clk);
