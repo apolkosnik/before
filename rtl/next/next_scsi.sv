@@ -340,7 +340,10 @@ assign rdata = sel_esp ? {`ESP_READ(a_even), `ESP_READ(a_odd)} :
 // data buffer port
 //----------------------------------------------------------------------------
 
-wire in_sd_rd = (xst == X_SD_RD_GO) || (xst == X_SD_RD_ACK);
+// The buffer bus from the host is one stream shared by every image
+// slot; only this device's ack says the bytes are for it.  Waiting is
+// not enough - while one device waits, another's sector streams past.
+wire in_sd_rd = ((xst == X_SD_RD_GO) || (xst == X_SD_RD_ACK)) && sd_ack;
 wire in_sd_wr = (xst == X_SD_WR_GO) || (xst == X_SD_WR_ACK);
 
 reg        eng_we;

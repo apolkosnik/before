@@ -225,7 +225,10 @@ reg  [7:0] sbuf_q;
 
 wire        in_sd  = (sd_rd | sd_wr | sd_ack);
 wire  [9:0] s_addr = in_sd ? {1'b0, sd_buff_addr} : buf_addr;
-wire        s_we   = in_sd ? (sd_buff_wr & sd_rd_act) : buf_we;
+// only this drive's acknowledged transfer may fill the buffer: the
+// host's buffer bus is shared, and the strobe alone says nothing
+// about whose sector is streaming
+wire        s_we   = in_sd ? (sd_buff_wr & sd_rd_act & sd_ack) : buf_we;
 wire  [7:0] s_wd   = in_sd ? sd_buff_dout : buf_wdata;
 
 always @(posedge clk) begin

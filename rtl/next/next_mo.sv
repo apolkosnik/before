@@ -186,8 +186,11 @@ wire [11:0] wgidx = {1'd0, dsk_blk, 8'd0, 1'd0} + {3'd0, sd_buff_addr};
 wire        wgin  = (wgidx >= {3'd0, dsk_skip}) &&
                     ((wgidx - {3'd0, dsk_skip}) < SECT_DISK);
 always @(posedge clk) begin
-	if (dsk_active && !dsk_is_wr && sd_buff_wr) stage[sd_buff_addr] <= sd_buff_dout;
-	if (dsk_active &&  dsk_is_wr && sd_buff_wr) stage[sd_buff_addr] <= sd_buff_dout;
+	// dsk_active spans the whole run, gaps included, and the host's
+	// buffer bus is shared: without the ack, another device's sector
+	// lands in the staging buffer and the write-back carries it into
+	// the cartridge.
+	if (dsk_active && sd_buff_wr && sd_ack) stage[sd_buff_addr] <= sd_buff_dout;
 	stage_q <= stage[sd_buff_addr];
 	win_q   <= wgin;
 end
@@ -498,7 +501,7 @@ always @(posedge clk) begin
 		dsk_we <= 0;
 
 		// place the streamed byte if it falls inside the sector window
-		if (dsk_active && !dsk_is_wr && sd_buff_wr) begin : place
+		if (dsk_active && !dsk_is_wr && sd_buff_wr && sd_ack) begin : place
 			reg [11:0] gidx;
 			gidx = {1'd0, dsk_blk, 8'd0, 1'd0} + {3'd0, sd_buff_addr};
 			if (gidx >= {3'd0, dsk_skip} &&
