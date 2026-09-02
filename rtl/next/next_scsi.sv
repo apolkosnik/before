@@ -89,8 +89,9 @@ localparam PHASE_DO = 3'd0, PHASE_DI = 3'd1, PHASE_CD = 3'd2,
 localparam STAT_GOOD = 8'h00, STAT_CHECK_COND = 8'h02;
 
 localparam SC_NO_ERROR      = 8'h00, SC_INVALID_CMD = 8'h20,
-           SC_INVALID_LBA   = 8'h21, SC_INVALID_LUN = 8'h25,
-           SC_WRITE_PROTECT = 8'h27;
+	       SC_INVALID_LBA   = 8'h21, SC_INVALID_LUN = 8'h25,
+	       SC_INVALID_CDB   = 8'h24, SC_SAVE_UNSUPP = 8'h39,
+	       SC_WRITE_PROTECT = 8'h27;
 
 //----------------------------------------------------------------------------
 // ESP registers
@@ -103,7 +104,8 @@ reg  [4:0] fifoflags;
 reg  [7:0] wr_tcl, wr_tch;       // write staging (not changed by reset)
 reg [16:0] counter;
 
-reg  [7:0] command0;
+reg  [7:0] command0, command1;
+reg        cmd_inprogress, cmd_waiting;
 reg  [7:0] status;
 reg  [7:0] intstatus;
 reg  [7:0] seqstep;
@@ -112,6 +114,11 @@ reg  [7:0] configuration, conf2;
 reg  [7:0] clockconv;
 reg  [7:0] selectbusid, selecttimeout;
 reg  [7:0] dma_control, dma_status;
+reg  [7:0] dma_buf [0:15];
+reg  [4:0] dma_buf_size;        // valid bytes still held by the channel
+reg  [4:0] dma_buf_limit;       // next fill position, including init offset
+wire [3:0] dma_buf_fill = dma_buf_limit[3:0];
+wire [4:0] dma_buf_head = dma_buf_limit - dma_buf_size;
 reg        mode_dma;
 
 reg  [2:0] phase;                // SCSIbus.phase, read in status[2:0]
@@ -124,6 +131,7 @@ assign int_scsi = dma_control[5] & status[7];   // ESPCTRL_ENABLE_INT & STAT_INT
 
 localparam SCSI_UNITS = 6;       // targets 0..5; the host is 7
 integer mk;                      // mount scan index
+integer sk;                      // reset scan index
 
 reg  [5:0] disk_present_v = 0;
 reg  [5:0] disk_ro_v = 0;
@@ -139,16 +147,15 @@ wire [31:0] img_blocks   = img_blocks_v[t_unit];
 
 reg  [7:0] t_status;             // status byte for ICCS
 reg  [7:0] t_message;            // message byte for ICCS
-reg  [7:0] sense_code;
-reg  [3:0] sense_key;
-reg        sense_valid;
-reg [31:0] sense_info;
+reg  [7:0] sense_code [0:SCSI_UNITS-1];
+reg        sense_valid [0:SCSI_UNITS-1];
+reg [31:0] sense_info [0:SCSI_UNITS-1];
 reg  [2:0] t_lun;
 
 reg [31:0] lba;
 reg [15:0] blockcounter;
 
-// disk geometry for mode sense page 4 (cylinders = blocks / (16*63),
+// disk geometry for mode sense page 4 (cylinders = blocks / (4*32),
 // rounded up; the head/sector fallback geometry of SCSI_GuessGeometry)
 reg [23:0] geo_cyl_v [0:SCSI_UNITS-1];
 wire [23:0] geo_cyl = geo_cyl_v[t_unit];
@@ -171,6 +178,10 @@ reg        g_run = 0;
 
 reg  [7:0] d_csr;
 reg [31:0] d_next, d_limit, d_start, d_stop;
+reg        d_dev2m;             // last DMA CSR write bit 2
+reg        dma_flush_pending;
+reg  [4:0] dma_flush_return;
+reg  [1:0] dma_irq_resume;      // 1: retained DI bytes, 2: retained DO bytes
 // saved registers: plain storage on the non-turbo board (the engine
 // never writes them, DMA_Saved_*_Read/Write in dma.c)
 reg [31:0] s_next, s_limit, s_start, s_stop;
@@ -205,8 +216,10 @@ localparam X_IDLE    = 5'd0,  X_SEL_MSG = 5'd1,  X_SEL_CDB = 5'd2,
            X_SD_RD_ACK=5'd9,  X_WR_SECT = 5'd10, X_SD_WR_GO= 5'd11,
            X_SD_WR_ACK=5'd12, X_DI_CHK  = 5'd13, X_DI_RD   = 5'd14,
            X_DI_GET  = 5'd15, X_DI_WR   = 5'd16, X_DO_CHK  = 5'd17,
-           X_DO_RD   = 5'd18, X_DO_PUT  = 5'd19, X_ICCS1   = 5'd20,
-           X_ICCS2   = 5'd21, X_PIO_RD  = 5'd22, X_PIO_GET = 5'd23;
+	           X_DO_RD   = 5'd18, X_DO_PUT  = 5'd19, X_ICCS1   = 5'd20,
+	           X_ICCS2   = 5'd21, X_PIO_RD  = 5'd22, X_PIO_GET = 5'd23,
+	           X_PIO_WAIT= 5'd24, X_FDI_CHK = 5'd25, X_FDI_WAIT= 5'd26,
+	           X_FDI_GET = 5'd27, X_FDO     = 5'd28;
 reg  [4:0] xst;
 
 reg        sel_atn;              // current select has an identify message
@@ -242,7 +255,7 @@ reg [31:0] sd_lba_r;
 assign sd_lba = sd_lba_r;
 
 //----------------------------------------------------------------------------
-// disk image mount and geometry (cylinders = blocks/1008, rounded up,
+// disk image mount and geometry (cylinders = blocks/128, rounded up,
 // by shift-subtract division).  Outside the reset: the mount pulse
 // fires once at OSD time, usually before the user resets the machine
 // into the new configuration.
@@ -275,8 +288,8 @@ always @(posedge clk) begin
 		top = {g_rem[30:0], g_num[31]};
 		if (g_step != 0) begin
 			g_num <= {g_num[30:0], 1'b0};
-			if (top >= 32'd1008) begin
-				g_rem <= top - 32'd1008;
+			if (top >= 32'd128) begin
+				g_rem <= top - 32'd128;
 				g_quot <= {g_quot[22:0], 1'b1};
 			end
 			else begin
@@ -319,6 +332,7 @@ wire [5:0] a_odd  = {addr[5:1], 1'b1};
 	((a) == 6'h07) ? {3'd0, fifoflags} : \
 	((a) == 6'h08) ? configuration : \
 	((a) == 6'h0B) ? conf2 : \
+	(((a) >= 6'h0C) && ((a) <= 6'h0F)) ? 8'h01 : \
 	((a) == 6'h20) ? dma_control : \
 	((a) == 6'h21) ? dma_status : 8'h00 )
 
@@ -379,18 +393,15 @@ function automatic [7:0] inq_byte;
 		case (i)
 			8'd00: inq_byte = (t_lun != 0) ? 8'h7F : 8'h00; // disk / not present
 			8'd02: inq_byte = 8'h01;   // ANSI SCSI-1
-			8'd03: inq_byte = 8'h02;   // response format
+			8'd03: inq_byte = 8'h01;   // SCSI-1 response format
 			8'd04: inq_byte = 8'h31;   // additional length
 			8'd07: inq_byte = 8'h1C;   // sync, linked
 			8'd08: inq_byte = "P"; 8'd09: inq_byte = "r"; 8'd10: inq_byte = "e";
 			8'd11: inq_byte = "v"; 8'd12: inq_byte = "i"; 8'd13: inq_byte = "o";
 			8'd14: inq_byte = "u"; 8'd15: inq_byte = "s";
 			8'd16: inq_byte = "H"; 8'd17: inq_byte = "D"; 8'd18: inq_byte = "D";
-			8'd32, 8'd33, 8'd34, 8'd35, 8'd36, 8'd37, 8'd38: inq_byte = "0";
-			8'd39: inq_byte = "1";
-			8'd40, 8'd41, 8'd42, 8'd43, 8'd44, 8'd45, 8'd46, 8'd47: inq_byte = "0";
-			default: inq_byte = (i >= 8'd16 && i <= 8'd31) ? " " :
-			                    (i >= 8'd48) ? " " : 8'h00;
+			8'd32: inq_byte = "B";
+			default: inq_byte = (i >= 8'd16 && i <= 8'd31) ? " " : 8'h00;
 		endcase
 	end
 endfunction
@@ -415,14 +426,14 @@ function automatic [7:0] sense_byte;
 	input [7:0] i;
 	begin
 		case (i)
-			8'd0: sense_byte = sense_valid ? 8'hF0 : 8'h70;
-			8'd2: sense_byte = {4'd0, sense_key};
-			8'd3: sense_byte = sense_valid ? sense_info[31:24] : 8'h00;
-			8'd4: sense_byte = sense_valid ? sense_info[23:16] : 8'h00;
-			8'd5: sense_byte = sense_valid ? sense_info[15:8]  : 8'h00;
-			8'd6: sense_byte = sense_valid ? sense_info[7:0]   : 8'h00;
+			8'd0: sense_byte = sense_valid[t_unit] ? 8'hF0 : 8'h70;
+			8'd2: sense_byte = {4'd0, key_of(sense_code[t_unit])};
+			8'd3: sense_byte = sense_valid[t_unit] ? sense_info[t_unit][31:24] : 8'h00;
+			8'd4: sense_byte = sense_valid[t_unit] ? sense_info[t_unit][23:16] : 8'h00;
+			8'd5: sense_byte = sense_valid[t_unit] ? sense_info[t_unit][15:8]  : 8'h00;
+			8'd6: sense_byte = sense_valid[t_unit] ? sense_info[t_unit][7:0]   : 8'h00;
 			8'd7: sense_byte = 8'd14;
-			8'd12: sense_byte = sense_code;
+			8'd12: sense_byte = sense_code[t_unit];
 			default: sense_byte = 8'h00;
 		endcase
 	end
@@ -434,7 +445,8 @@ function automatic [3:0] key_of;
 		case (code)
 			SC_NO_ERROR:      key_of = 4'h0;  // no sense
 			8'h04:            key_of = 4'h2;  // not ready
-			8'h03, SC_INVALID_CMD, SC_INVALID_LBA, 8'h24, SC_INVALID_LUN:
+			8'h03, SC_INVALID_CMD, SC_INVALID_LBA, SC_INVALID_CDB,
+			SC_INVALID_LUN, SC_SAVE_UNSUPP:
 			                  key_of = 4'h5;  // illegal request
 			SC_WRITE_PROTECT: key_of = 4'h7;  // data protect
 			default:          key_of = 4'h4;  // hardware error
@@ -442,16 +454,16 @@ function automatic [3:0] key_of;
 	end
 endfunction
 
-// mode pages the reference emulator provides: 0x00 (4 bytes),
-// 0x01 (8 bytes), 0x04 (20 bytes); everything else is empty
+// Mode pages provided by the reference disk target.
 function automatic [7:0] page_len;
 	input [7:0] p;
 	begin
 		case (p)
 			8'h00: page_len = 8'd4;
-			8'h01: page_len = 8'd8;
+			8'h01: page_len = 8'd4;
+			8'h03: page_len = 8'd24;
 			8'h04: page_len = 8'd20;
-			8'h3F: page_len = 8'd32;   // all pages: 4 + 8 + 20
+			8'h3F: page_len = 8'd52;
 			default: page_len = 8'd0;
 		endcase
 	end
@@ -473,11 +485,24 @@ function automatic [7:0] page1_byte;
 	begin
 		case (i)
 			8'd0: page1_byte = 8'h01;
-			8'd1: page1_byte = 8'h06;
+			8'd1: page1_byte = 8'h02;
 			8'd3: page1_byte = 8'h1B;
-			8'd4: page1_byte = 8'h0B;
-			8'd7: page1_byte = 8'hFF;
 			default: page1_byte = 8'h00;
+		endcase
+	end
+endfunction
+
+function automatic [7:0] page3_byte;
+	input [7:0] i;
+	begin
+		case (i)
+			8'd0: page3_byte = 8'h03;
+			8'd1: page3_byte = 8'h16;
+			8'd11: page3_byte = 8'd32;
+			8'd12: page3_byte = 8'h02;
+			8'd15: page3_byte = 8'h01;
+			8'd20: page3_byte = 8'h80;
+			default: page3_byte = 8'h00;
 		endcase
 	end
 endfunction
@@ -491,7 +516,7 @@ function automatic [7:0] page4_byte;
 			8'd2: page4_byte = geo_cyl[23:16];
 			8'd3: page4_byte = geo_cyl[15:8];
 			8'd4: page4_byte = geo_cyl[7:0];
-			8'd5: page4_byte = 8'd16;  // heads
+			8'd5: page4_byte = 8'd4;   // heads
 			default: page4_byte = 8'h00;
 		endcase
 	end
@@ -506,7 +531,7 @@ function automatic [7:0] mode_byte;
 			case (i)
 				8'd0: mode_byte = ms_total - 8'd1;
 				8'd2: mode_byte = disk_ro ? 8'h80 : 8'h00;
-				8'd3: mode_byte = 8'h08;
+				8'd3: mode_byte = 8'h08; // reference retains this even with DBD
 				8'd5: mode_byte = img_blocks[23:16];
 				8'd6: mode_byte = img_blocks[15:8];
 				8'd7: mode_byte = img_blocks[7:0];
@@ -516,13 +541,14 @@ function automatic [7:0] mode_byte;
 		end
 		else begin
 			off = i - {3'd0, ms_hdr};
-			if (ms_ctl == 2'd1) mode_byte = 8'h00;   // changeable values
-			else if (ms_page == 8'h3F)
-				mode_byte = (off < 8'd4)  ? page0_byte(off) :
-				            (off < 8'd12) ? page1_byte(off - 8'd4) :
-				                            page4_byte(off - 8'd12);
+			if (ms_page == 8'h3F)
+				mode_byte = (off < 8'd4)  ? page1_byte(off) :
+				            (off < 8'd28) ? page3_byte(off - 8'd4) :
+				            (off < 8'd48) ? page4_byte(off - 8'd28) :
+				                            page0_byte(off - 8'd48);
 			else if (ms_page == 8'h00) mode_byte = page0_byte(off);
 			else if (ms_page == 8'h01) mode_byte = page1_byte(off);
+			else if (ms_page == 8'h03) mode_byte = page3_byte(off);
 			else if (ms_page == 8'h04) mode_byte = page4_byte(off);
 			else mode_byte = 8'h00;
 		end
@@ -582,6 +608,30 @@ task automatic fifo_push;
 	end
 endtask
 
+// A full internal buffer changes hands once on every visit.  In particular,
+// dma_esp_write_memory() revisits (and toggles for) a retained full buffer
+// after software re-arms the channel.
+task automatic dma_status_toggle;
+	begin
+		dma_status[7:6] <= (dma_status[7:6] == 2'b01) ? 2'b11 : 2'b01;
+	end
+endtask
+
+// dma_interrupt(): call only once next has reached limit.  A chained window
+// becomes live while ENABLE stays set; a single window disables the channel.
+task automatic dma_hit_limit;
+	begin
+		d_csr[3] <= 1;
+		gap_us <= GAP_US;
+		if (d_csr[1]) begin
+			d_next <= d_start;
+			d_limit <= d_stop;
+			d_csr[1] <= 0;
+		end
+		else d_csr[0] <= 0;
+	end
+endtask
+
 task automatic hard_reset;
 	begin
 		cmd_busy <= 0;
@@ -594,9 +644,15 @@ task automatic hard_reset;
 		status <= status & ~(STAT_INT|STAT_VGC|STAT_PE|STAT_GE|STAT_TC);
 		intstatus <= 8'h00;
 		mode_dma <= 0;
+		dma_flush_pending <= 0;
+		dma_flush_return <= X_IDLE;
+		dma_irq_resume <= 0;
 		counter <= 0;
 		seqstep <= 8'h00;
 		command0 <= 8'h00;
+		command1 <= 8'h00;
+		cmd_inprogress <= 0;
+		cmd_waiting <= 0;
 		xst <= X_IDLE;
 		m_req <= 0;
 		sd_rd <= 0;
@@ -636,104 +692,172 @@ wire [7:0] csr_or = (be[1] ? wdata[15:8] : 8'h00) | (be[0] ? wdata[7:0] : 8'h00)
 // else from the CDB
 wire [2:0] cmd_lun = sel_atn ? t_lun : cdb1[7:5];
 
+// A register access and an engine event may target the FIFO on the same
+// clock.  The reference runs those calls serially.  Give the CPU operation
+// priority and leave the engine state in place so it retries on the next
+// clock, avoiding two helper calls updating the FIFO from one stale count.
+wire cpu_fifo_access = sel_esp &&
+	((be[1] && a_even == 6'h02) || (be[0] && a_odd == 6'h02));
+
+// Execute the active (bottom) rank.  Writes to the command register are
+// queued separately below so a command cannot preempt an in-flight one.
+task automatic start_command;
+	input [7:0] v;
+	begin
+		command0 <= v;
+		cmd_inprogress <= 1;
+		if (v[7]) begin
+			counter <= ({wr_tch, wr_tcl} == 16'd0) ? 17'h10000
+			                                       : {1'b0, wr_tch, wr_tcl};
+			status[4] <= 1'b0;   // clear STAT_TC
+			mode_dma <= 1;
+			dma_irq_resume <= 0;
+		end
+		else begin
+			mode_dma <= 0;
+			dma_irq_resume <= 0;
+		end
+
+		case (v[6:0])
+			7'h00: cmd_inprogress <= 0;  // NOP completes synchronously
+			7'h01: begin                 // flush FIFO completes synchronously
+				fifo_clear;
+				cmd_inprogress <= 0;
+			end
+			7'h02: hard_reset;            // reset chip
+			7'h03: begin                  // reset SCSI bus
+				cmd_busy <= 0;
+				mode_dma <= 0;
+				dma_flush_pending <= 0;
+				dma_irq_resume <= 0;
+				counter <= 0;
+				seqstep <= 8'h00;
+				command0 <= 0;
+				command1 <= 0;
+				cmd_waiting <= 0;
+				xst <= X_IDLE;
+				m_req <= 0;
+				sd_rd <= 0;
+				sd_wr <= 0;
+				if (!configuration[6]) begin         // !CFG1_RESREPT
+					intstatus <= INTR_RST;
+					phase <= PHASE_DO;
+					dly_us <= 25'd500;
+					xst <= X_INT_WAIT;
+				end
+				else cmd_inprogress <= 0;
+			end
+			7'h10: begin                 // transfer information
+				if (v[7]) begin
+					pad_mode <= 0;
+					word_cnt <= 0;
+					gap_us <= SECTOR_US;
+					xst <= (phase == PHASE_DI) ?
+					         (dma_control[4] ? X_DI_CHK : X_FDI_CHK) :
+					       (phase == PHASE_DO) ?
+					         (dma_control[4] ? X_DO_CHK : X_FDO) : X_IDLE;
+				end
+				else if (phase == PHASE_DI) begin
+					xst <= X_PIO_RD;
+				end
+				else if (phase == PHASE_MI) begin
+					dly_us <= 25'd1;
+					xst <= X_INT_WAIT;
+				end
+				else if (phase == PHASE_ST) begin
+					// esp_transfer_info() schedules an interrupt for
+					// this otherwise-unimplemented PIO status case.
+					dly_us <= 25'd1;
+					xst <= X_INT_WAIT;
+				end
+			end
+			7'h11: begin                 // initiator command complete
+				dma_irq_resume <= 0;
+				xst <= X_ICCS1;
+			end
+			7'h12: begin                 // message accepted
+				cmd_busy <= 0;
+				dma_irq_resume <= 0;
+				phase <= PHASE_DO;
+				intstatus <= INTR_DC;
+				dly_us <= ESP_DELAY_US;
+				xst <= X_INT_WAIT;
+			end
+			7'h18: begin                 // transfer pad
+				pad_mode <= 1;
+				word_cnt <= 0;
+				xst <= (phase == PHASE_DI) ? X_DI_CHK :
+				       (phase == PHASE_DO) ? X_DO_CHK : X_IDLE;
+			end
+			7'h41, 7'h42: begin          // select without/with ATN
+				// A select aborts whatever transfer state was left behind,
+				// including an in-flight memory request.
+				m_req <= 0;
+				sd_rd <= 0;
+				sd_wr <= 0;
+				seqstep <= 8'h00;
+				dma_flush_pending <= 0;
+				dma_irq_resume <= 0;
+				sel_atn <= v[1];
+				cdb_n <= 0;
+				if ((selectbusid[2:0] >= SCSI_UNITS) ||
+				    !disk_present_v[selectbusid[2:0]]) begin
+					// esp_select() clears both command ranks on timeout.
+					intstatus <= INTR_DC;
+					command0 <= 0;
+					command1 <= 0;
+					cmd_waiting <= 0;
+					cmd_busy <= 0;
+					phase <= PHASE_ST;
+					dly_us <= seltout_us;
+					xst <= X_INT_WAIT;
+				end
+				else begin
+					cmd_busy <= 1;
+					t_unit <= selectbusid[2:0];
+					xst <= v[1] ? X_SEL_MSG : X_SEL_CDB;
+				end
+			end
+			7'h44: cmd_inprogress <= 0; // enable selection, no reselections
+			default: begin              // unimplemented: illegal command
+				// esp_command_clear() is immediate; command execution itself
+				// remains in progress until software acknowledges INTR_ILL.
+				command0 <= 0;
+				command1 <= 0;
+				cmd_waiting <= 0;
+				intstatus <= intstatus | INTR_ILL;
+				dly_us <= 25'd20;
+				xst <= X_INT_WAIT;
+			end
+		endcase
+	end
+endtask
+
 task automatic reg_write;
 	input [5:0] a;
 	input [7:0] v;
+	reg   [4:0] dma_head;
 	begin
+		dma_head = dma_buf_limit - dma_buf_size;
 		case (a)
 			6'h00: wr_tcl <= v;
 			6'h01: wr_tch <= v;
 			6'h02: fifo_push(v);
 			6'h03: begin
-				// esp_command_write()/esp_start_command()
-				command0 <= v;
-				if (v[7]) begin
-					counter <= ({wr_tch, wr_tcl} == 16'd0) ? 17'h10000
-					                                       : {1'b0, wr_tch, wr_tcl};
-					status[4] <= 1'b0;   // clear STAT_TC
-					mode_dma <= 1;
+				// RESET and BUSRESET execute immediately.  Every other command
+				// occupies the top rank while the bottom rank is in progress.
+				if (v[6:0] == 7'h02 || v[6:0] == 7'h03)
+					start_command(v);
+				else if (cmd_inprogress) begin
+					command1 <= v;
+					if (cmd_waiting) status[6] <= 1'b1;
+					cmd_waiting <= 1;
 				end
-				else mode_dma <= 0;
-				case (v & 8'h7F)
-					7'h00: ;             // NOP
-					7'h01: fifo_clear;   // flush FIFO
-					7'h02: hard_reset;   // reset chip
-					7'h03: begin         // reset SCSI bus
-						cmd_busy <= 0;
-						mode_dma <= 0;
-						counter <= 0;
-						seqstep <= 8'h00;
-						xst <= X_IDLE;
-						m_req <= 0;
-						sd_rd <= 0;
-						sd_wr <= 0;
-						if (!(configuration & 8'h40)) begin  // !CFG1_RESREPT
-							intstatus <= INTR_RST;
-							phase <= PHASE_MI;
-							dly_us <= 25'd500;
-							xst <= X_INT_WAIT;
-						end
-					end
-					7'h10: begin         // transfer information
-						if (v[7]) begin
-							pad_mode <= 0;
-							word_cnt <= 0;
-							gap_us <= SECTOR_US;
-							xst <= (phase == PHASE_DI) ? X_DI_CHK :
-							       (phase == PHASE_DO) ? X_DO_CHK : X_IDLE;
-						end
-						else if (phase == PHASE_DI) xst <= X_PIO_RD;
-						else if (phase == PHASE_MI) begin
-							dly_us <= 25'd1;
-							xst <= X_INT_WAIT;
-						end
-					end
-					7'h11: xst <= X_ICCS1;    // initiator command complete
-					7'h12: begin              // message accepted
-						cmd_busy <= 0;
-						phase <= PHASE_ST;
-						intstatus <= INTR_BS;
-						dly_us <= ESP_DELAY_US;
-						xst <= X_INT_WAIT;
-					end
-					7'h18: begin              // transfer pad
-						pad_mode <= 1;
-						word_cnt <= 0;
-						xst <= (phase == PHASE_DI) ? X_DI_CHK :
-						       (phase == PHASE_DO) ? X_DO_CHK : X_IDLE;
-					end
-					7'h41, 7'h42: begin       // select without/with ATN
-						// a select aborts whatever transfer state was
-						// left behind, including an in-flight memory
-						// request
-						m_req <= 0;
-						sd_rd <= 0;
-						sd_wr <= 0;
-						seqstep <= 8'h00;
-						sel_atn <= v[1];
-						cdb_n <= 0;
-						if ((selectbusid[2:0] >= SCSI_UNITS) ||
-						    !disk_present_v[selectbusid[2:0]]) begin
-							// no disk at this target: selection timeout
-							intstatus <= INTR_DC;
-							cmd_busy <= 0;
-							phase <= PHASE_ST;
-							dly_us <= seltout_us;
-							xst <= X_INT_WAIT;
-						end
-						else begin
-							cmd_busy <= 1;
-							t_unit <= selectbusid[2:0];
-							xst <= v[1] ? X_SEL_MSG : X_SEL_CDB;
-						end
-					end
-					7'h44: ;             // enable selection: no reselections
-					default: begin       // unimplemented: illegal command
-						intstatus <= intstatus | INTR_ILL;
-						dly_us <= 25'd20;
-						xst <= X_INT_WAIT;
-					end
-				endcase
+				else begin
+					command1 <= 0;
+					cmd_waiting <= 0;
+					start_command(v);
+				end
 			end
 			6'h04: selectbusid <= v;
 			6'h05: selecttimeout <= v;
@@ -745,8 +869,26 @@ task automatic reg_write;
 			6'h20: begin
 				dma_control <= v;
 				if (v[1]) hard_reset;    // ESPCTRL_RESET
-				// ESPCTRL_FLUSH: residual bytes are written with byte
-				// enables at the end of the transfer, nothing to do
+				// dma_esp_flush_buffer(): only an enabled device-to-memory
+				// channel with room in its window may drain one padded word.
+				if (v[2] && d_csr[0] && d_dev2m && d_next < d_limit) begin
+					dma_flush_pending <= 1;
+					dma_flush_return <= xst;
+					case (dma_buf_size)
+						5'd0: word_buf <= 32'h00000000;
+						5'd1: word_buf <= {dma_buf[dma_head[3:0]], 24'h000000};
+						5'd2: word_buf <= {dma_buf[dma_head[3:0]],
+						                      dma_buf[dma_head[3:0] + 1'd1], 16'h0000};
+						5'd3: word_buf <= {dma_buf[dma_head[3:0]],
+						                      dma_buf[dma_head[3:0] + 1'd1],
+						                      dma_buf[dma_head[3:0] + 4'd2], 8'h00};
+						default: word_buf <= {dma_buf[dma_head[3:0]],
+						                     dma_buf[dma_head[3:0] + 1'd1],
+						                     dma_buf[dma_head[3:0] + 4'd2],
+						                     dma_buf[dma_head[3:0] + 4'd3]};
+					endcase
+					xst <= X_DI_WR;
+				end
 			end
 			6'h21: dma_status <= v;
 			default: ;
@@ -756,10 +898,18 @@ endtask
 
 always @(posedge clk) begin
 	if (reset) begin
+		for (sk = 0; sk < SCSI_UNITS; sk = sk + 1) begin
+			sense_code[sk] <= SC_NO_ERROR;
+			sense_valid[sk] <= 0;
+			sense_info[sk] <= 0;
+		end
 		fifo_clear;
 		wr_tcl <= 0; wr_tch <= 0;
 		counter <= 0;
 		command0 <= 0;
+		command1 <= 0;
+		cmd_inprogress <= 0;
+		cmd_waiting <= 0;
 		status <= 0;
 		intstatus <= 0;
 		seqstep <= 0;
@@ -772,12 +922,17 @@ always @(posedge clk) begin
 		selecttimeout <= 0;
 		dma_control <= 0;
 		dma_status <= 0;
+		dma_buf_size <= 0;
+		dma_buf_limit <= 0;
 		mode_dma <= 0;
 		phase <= PHASE_DO;
 		t_status <= 0; t_message <= 0; t_lun <= 0;
-		sense_code <= 0; sense_key <= 0; sense_valid <= 0; sense_info <= 0;
 		lba <= 0; blockcounter <= 0;
 		d_csr <= 0;
+		d_dev2m <= 0;
+		dma_flush_pending <= 0;
+		dma_flush_return <= X_IDLE;
+		dma_irq_resume <= 0;
 		d_next <= 0; d_limit <= 0; d_start <= 0; d_stop <= 0;
 		s_next <= 0; s_limit <= 0; s_start <= 0; s_stop <= 0;
 		buf_pos <= 0; buf_limit <= 0; buf_disk <= 0;
@@ -851,12 +1006,15 @@ always @(posedge clk) begin
 		X_SEL_MSG: begin
 			phase <= PHASE_MO;
 			seqstep <= 8'h01;
-			if (fifoflags != 0) begin
-				t_lun <= fifo_head[2:0];
-				fifo_pop;
+			if (cpu_fifo_access) ;
+			else begin
+				if (fifoflags != 0) begin
+					t_lun <= fifo_head[2:0];
+					fifo_pop;
+				end
+				else t_lun <= 0;
+				xst <= X_SEL_CDB;
 			end
-			else t_lun <= 0;
-			xst <= X_SEL_CDB;
 		end
 
 		// select: pop the whole CDB from the FIFO
@@ -864,7 +1022,8 @@ always @(posedge clk) begin
 			phase <= PHASE_CD;
 			seqstep <= 8'h03;
 			if (!sel_atn) t_lun <= 0;
-			if (fifoflags != 0) begin
+			if (cpu_fifo_access) ;
+			else if (fifoflags != 0) begin
 				case (cdb_n)
 					4'd0: cdb0 <= fifo_head;
 					4'd1: cdb1 <= fifo_head;
@@ -888,6 +1047,11 @@ always @(posedge clk) begin
 		X_DISPATCH: begin : dispatch
 			reg [15:0] cnt6;
 			reg [15:0] cnt10;
+			// esp_select() clears the completed select command before
+			// reporting its bus-service/function-complete interrupt.
+			command0 <= 0;
+			command1 <= 0;
+			cmd_waiting <= 0;
 			cnt6  = (cdb4 == 0) ? 16'h0100 : {8'd0, cdb4};
 			cnt10 = {cdb7, cdb8};
 			// without an identify message the LUN comes from the CDB
@@ -903,18 +1067,17 @@ always @(posedge clk) begin
 					fill_idx <= 0;
 					t_status <= STAT_GOOD;
 					phase <= PHASE_DI;
-					sense_code <= SC_NO_ERROR;
-					sense_valid <= 0;
+					sense_code[t_unit] <= SC_NO_ERROR;
+					sense_valid[t_unit] <= 0;
 					xst <= X_FILL;
 				end
 				8'h03: begin                 // REQUEST SENSE (lun independent)
 					fill_kind <= R_SENSE;
-					buf_limit <= (cdb4 == 0) ? 10'd22 :
+					buf_limit <= (cdb4 == 0) ? 10'd4 :
 					             (cdb4 > 8'd22) ? 10'd22 : {2'd0, cdb4};
 					buf_pos <= 0;
 					buf_disk <= 0;
 					fill_idx <= 0;
-					sense_key <= key_of(sense_code);
 					t_status <= STAT_GOOD;
 					phase <= PHASE_DI;
 					xst <= X_FILL;
@@ -922,14 +1085,15 @@ always @(posedge clk) begin
 				default: begin
 					if (cmd_lun != 3'd0) begin
 						t_status <= STAT_CHECK_COND;
-						sense_code <= SC_INVALID_LUN;
-						sense_valid <= 0;
+						sense_code[t_unit] <= SC_INVALID_LUN;
+						sense_valid[t_unit] <= 0;
 						phase <= PHASE_ST;
 					end
 					else case (cdb0)
 						8'h00: begin         // TEST UNIT READY
 							t_status <= STAT_GOOD;
-							sense_code <= SC_NO_ERROR;
+							sense_code[t_unit] <= SC_NO_ERROR;
+							sense_valid[t_unit] <= 0;
 							phase <= PHASE_ST;
 						end
 						8'h25: begin         // READ CAPACITY
@@ -940,8 +1104,8 @@ always @(posedge clk) begin
 							fill_idx <= 0;
 							t_status <= STAT_GOOD;
 							phase <= PHASE_DI;
-							sense_code <= SC_NO_ERROR;
-							sense_valid <= 0;
+							sense_code[t_unit] <= SC_NO_ERROR;
+							sense_valid[t_unit] <= 0;
 							xst <= X_FILL;
 						end
 						8'h08, 8'h28: begin  // READ (6) / READ (10)
@@ -951,6 +1115,9 @@ always @(posedge clk) begin
 							buf_disk <= 1;
 							buf_pos <= 0;
 							buf_limit <= 0;
+							t_status <= STAT_GOOD;
+							sense_code[t_unit] <= SC_NO_ERROR;
+							sense_valid[t_unit] <= 0;
 							phase <= PHASE_DI;
 							read_sector(2'd0);
 						end
@@ -960,46 +1127,75 @@ always @(posedge clk) begin
 							blockcounter <= (cdb0 == 8'h0A) ? cnt6 : cnt10;
 							if (disk_ro) begin
 								t_status <= STAT_CHECK_COND;
-								sense_code <= SC_WRITE_PROTECT;
-								sense_valid <= 0;
+								sense_code[t_unit] <= SC_WRITE_PROTECT;
+								sense_valid[t_unit] <= 0;
 								phase <= PHASE_ST;
 							end
 							else begin
+								t_status <= STAT_GOOD;
+								sense_code[t_unit] <= SC_NO_ERROR;
+								sense_valid[t_unit] <= 0;
 								buf_disk <= 1;
 								buf_pos <= 0;
-								buf_limit <= 10'd512;
-								phase <= PHASE_DO;
+								if (cdb0 == 8'h2A && cnt10 == 0) begin
+									buf_limit <= 0;
+									phase <= PHASE_ST;
+								end
+								else begin
+									buf_limit <= 10'd512;
+									phase <= PHASE_DO;
+								end
 							end
 						end
 						8'h1A: begin         // MODE SENSE
-							fill_kind <= R_MODE;
-							ms_page <= cdb2[5:0] == 6'h3F ? 8'h3F : {2'd0, cdb2[5:0]};
-							ms_ctl <= cdb2[3:2];   // quirk of the reference
-							ms_hdr <= cdb1[3] ? 5'd4 : 5'd12;
-							ms_total <= (cdb1[3] ? 8'd4 : 8'd12)
-							          + page_len({2'd0, cdb2[5:0]});
-							buf_limit <= {2'd0, cdb4};
-							buf_pos <= 0;
-							buf_disk <= 0;
-							fill_idx <= 0;
+							if (cdb2[7:6] == 2'd1 || cdb2[7:6] == 2'd3 ||
+							    page_len({2'd0, cdb2[5:0]}) == 0) begin
+								t_status <= STAT_CHECK_COND;
+								sense_code[t_unit] <= (cdb2[7:6] == 2'd3) ?
+								                          SC_SAVE_UNSUPP : SC_INVALID_CDB;
+								sense_valid[t_unit] <= 0;
+								phase <= PHASE_ST;
+							end
+							else begin
+								fill_kind <= R_MODE;
+								ms_page <= {2'd0, cdb2[5:0]};
+								ms_ctl <= cdb2[7:6];
+								ms_hdr <= cdb1[3] ? 5'd4 : 5'd12;
+								ms_total <= (cdb1[3] ? 8'd4 : 8'd12)
+								          + page_len({2'd0, cdb2[5:0]});
+								buf_limit <= {2'd0, cdb4};
+								buf_pos <= 0;
+								buf_disk <= 0;
+								fill_idx <= 0;
+								t_status <= STAT_GOOD;
+								phase <= PHASE_DI;
+								sense_code[t_unit] <= SC_NO_ERROR;
+								sense_valid[t_unit] <= 0;
+								xst <= X_FILL;
+							end
+						end
+						8'h07: begin         // REASSIGN BLOCKS: reference no-op
 							t_status <= STAT_GOOD;
-							phase <= PHASE_DI;
-							sense_code <= SC_NO_ERROR;
-							sense_valid <= 0;
-							xst <= X_FILL;
+							sense_code[t_unit] <= SC_NO_ERROR;
+							sense_valid[t_unit] <= 0;
+							phase <= PHASE_ST;
 						end
 						8'h1B: begin         // START/STOP (ship)
 							t_status <= STAT_GOOD;
+							sense_code[t_unit] <= SC_NO_ERROR;
+							sense_valid[t_unit] <= 0;
 							phase <= PHASE_ST;
 						end
 						8'h04: begin         // FORMAT DRIVE
 							t_status <= STAT_GOOD;
+							sense_code[t_unit] <= SC_NO_ERROR;
+							sense_valid[t_unit] <= 0;
 							phase <= PHASE_ST;
 						end
 						default: begin       // unknown command
 							t_status <= STAT_CHECK_COND;
-							sense_code <= SC_INVALID_CMD;
-							sense_valid <= 0;
+							sense_code[t_unit] <= SC_INVALID_CMD;
+							sense_valid[t_unit] <= 0;
 							phase <= PHASE_ST;
 						end
 					endcase
@@ -1012,7 +1208,7 @@ always @(posedge clk) begin
 			if ({1'b0, fill_idx} < buf_limit) begin
 				eng_we <= 1;
 				eng_addr <= fill_idx;
-				eng_wd <= resp_byte(fill_kind, {1'b0, fill_idx});
+				eng_wd <= resp_byte(fill_kind, fill_idx);
 				fill_idx <= fill_idx + 1'd1;
 			end
 			else begin
@@ -1036,7 +1232,8 @@ always @(posedge clk) begin
 		X_INT_WAIT: begin
 			if (dly_us == 0) begin
 				status[7] <= 1'b1;
-				xst <= X_IDLE;
+				xst <= (dma_irq_resume == 2'd1) ? X_DI_CHK :
+				       (dma_irq_resume == 2'd2) ? X_DO_CHK : X_IDLE;
 			end
 			else if (tick) dly_us <= dly_us - 1'd1;
 		end
@@ -1045,8 +1242,10 @@ always @(posedge clk) begin
 		X_RD_SECT: begin
 			if (blockcounter == 0) begin
 				phase <= PHASE_ST;
-				xst <= (rd_ret == 2'd1) ? X_DI_CHK :
-				       (rd_ret == 2'd2) ? X_PIO_RD : X_POSTCMD;
+				xst <= (rd_ret == 2'd1 || rd_ret == 2'd3) ?
+				       (dma_control[4] ? X_DI_CHK : X_FDI_CHK) :
+				       (rd_ret == 2'd2) ? X_PIO_RD :
+				       X_POSTCMD;
 			end
 			else if (lba < img_blocks) begin
 				sd_lba_r <= lba;
@@ -1055,12 +1254,14 @@ always @(posedge clk) begin
 			end
 			else begin
 				t_status <= STAT_CHECK_COND;
-				sense_code <= SC_INVALID_LBA;
-				sense_valid <= 1;
-				sense_info <= lba;
+				sense_code[t_unit] <= SC_INVALID_LBA;
+				sense_valid[t_unit] <= 1;
+				sense_info[t_unit] <= lba;
 				phase <= PHASE_ST;
-				xst <= (rd_ret == 2'd1) ? X_DI_CHK :
-				       (rd_ret == 2'd2) ? X_PIO_RD : X_POSTCMD;
+				xst <= (rd_ret == 2'd1 || rd_ret == 2'd3) ?
+				       (dma_control[4] ? X_DI_CHK : X_FDI_CHK) :
+				       (rd_ret == 2'd2) ? X_PIO_RD :
+				       X_POSTCMD;
 			end
 		end
 
@@ -1077,12 +1278,14 @@ always @(posedge clk) begin
 				buf_pos <= 0;
 				buf_limit <= 10'd512;
 				t_status <= STAT_GOOD;
-				sense_code <= SC_NO_ERROR;
-				sense_valid <= 0;
+				sense_code[t_unit] <= SC_NO_ERROR;
+				sense_valid[t_unit] <= 0;
 				lba <= lba + 1'd1;
 				blockcounter <= blockcounter - 1'd1;
-				xst <= (rd_ret == 2'd1) ? X_DI_CHK :
-				       (rd_ret == 2'd2) ? X_PIO_RD : X_POSTCMD;
+				xst <= (rd_ret == 2'd1 || rd_ret == 2'd3) ?
+				       (dma_control[4] ? X_DI_CHK : X_FDI_CHK) :
+				       (rd_ret == 2'd2) ? X_PIO_RD :
+				       X_POSTCMD;
 			end
 		end
 
@@ -1094,11 +1297,11 @@ always @(posedge clk) begin
 			end
 			else begin
 				t_status <= STAT_CHECK_COND;
-				sense_code <= SC_INVALID_LBA;
-				sense_valid <= 1;
-				sense_info <= lba;
+				sense_code[t_unit] <= SC_INVALID_LBA;
+				sense_valid[t_unit] <= 1;
+				sense_info[t_unit] <= lba;
 				phase <= PHASE_ST;
-				xst <= X_DO_CHK;
+				xst <= (!dma_control[4] || fifoflags != 0) ? X_FDO : X_DO_CHK;
 			end
 		end
 
@@ -1114,12 +1317,14 @@ always @(posedge clk) begin
 			if (!sd_ack) begin
 				buf_pos <= 0;
 				t_status <= STAT_GOOD;
-				sense_code <= SC_NO_ERROR;
-				sense_valid <= 0;
+				sense_code[t_unit] <= SC_NO_ERROR;
+				sense_valid[t_unit] <= 0;
 				lba <= lba + 1'd1;
 				blockcounter <= blockcounter - 1'd1;
 				if (blockcounter == 16'd1) phase <= PHASE_ST;
-				xst <= X_DO_PUT;    // drain the rest of the DMA word
+				// The controller FIFO always precedes external-DMA residual
+				// bytes, and MODE_DMA is sampled live at every I/O event.
+				xst <= (!dma_control[4] || fifoflags != 0) ? X_FDO : X_DO_PUT;
 			end
 		end
 
@@ -1127,28 +1332,82 @@ always @(posedge clk) begin
 		// transfer info, data in (disk to memory)
 		//------------------------------------------------------------
 		X_DI_CHK: begin
-			// a floppy sector ends by handing the channel back
-			if (flp_active && (buf_pos >= buf_limit) && (word_cnt == 0)) begin
+			if (pad_mode) begin
+				if (counter == 0) begin
+					intstatus <= INTR_BS;
+					status[4] <= 1'b1;
+					esp_irq(ESP_DELAY_US);
+				end
+				else if (phase != PHASE_DI) begin
+					intstatus <= INTR_BS;
+					esp_irq(ESP_DELAY_US);
+				end
+				else if (buf_pos >= buf_limit) begin
+					if (buf_disk) read_sector(2'd1);
+					else phase <= PHASE_ST;
+				end
+				else begin
+					eng_addr <= buf_pos[8:0];
+					xst <= X_DI_RD;
+				end
+			end
+			// A floppy sector ends only after its last internal-buffer word
+			// has reached memory.
+			else if (flp_active && (buf_pos >= buf_limit) &&
+			         (dma_buf_size == 0)) begin
+				if (d_csr[0] && d_next == d_limit) dma_hit_limit;
 				flp_active <= 0;
 				flp_done   <= 1;
 				xst        <= X_IDLE;
 			end
-			else if (flp_active && (buf_pos >= buf_limit)) xst <= X_DI_WR;
-			// esp_transfer_done(): counter end first, then phase change
-			else if (counter == 0) begin
-				intstatus <= INTR_FC;
-				status[4] <= 1'b1;       // STAT_TC
-				if (word_cnt != 0) xst <= X_DI_WR;
-				else esp_irq(ESP_DELAY_US);
+			// MODE_DMA is a live route in esp_dma_write_memory().  A switch
+			// away from memory DMA retains any channel-buffer residual and
+			// resumes producing target bytes through the controller FIFO.
+			else if (!flp_active && !dma_control[4]) xst <= X_FDI_CHK;
+			// A complete internal buffer changes hands before any channel-limit
+			// decision.  This is the next<=limit read-ahead case in dma.c.
+			else if (dma_buf_limit == 5'd16) begin
+				if (d_csr[0] && gap_us == 0) begin
+					dma_status_toggle;
+					xst <= X_DI_WR;
+				end
 			end
-			else if (phase != PHASE_DI) begin
+			// After esp_transfer_done, a partial buffer waits for explicit
+			// ESPCTRL_FLUSH; a retained full buffer was handled above.
+			else if (dma_irq_resume == 2'd1) begin
+				if (dma_buf_size == 0) begin
+					dma_irq_resume <= 0;
+					xst <= X_IDLE;
+				end
+			end
+			else if (!d_csr[0] || gap_us != 0) ;
+			// ESP_Send_Data() drains bytes already queued in the ESP FIFO
+			// before requesting more from the target.  Those bytes consumed
+			// the ESP counter when they were queued, so do not count them twice.
+			else if (!flp_active && fifoflags != 0) begin
+				if (!cpu_fifo_access) begin
+					dma_buf[dma_buf_limit[3:0]] <= fifo_head;
+					dma_buf_limit <= dma_buf_limit + 1'd1;
+					dma_buf_size <= dma_buf_size + 1'd1;
+					fifo_pop;
+				end
+			end
+			// esp_transfer_done(): counter end first, then phase change.
+			else if (!flp_active && (counter == 0 || phase != PHASE_DI)) begin
 				intstatus <= INTR_BS;
-				if (word_cnt != 0) xst <= X_DI_WR;
-				else esp_irq(ESP_DELAY_US);
+				if (counter == 0) status[4] <= 1'b1;
+				if (d_next == d_limit) dma_hit_limit;
+				dma_irq_resume <= (dma_buf_size != 0) ? 2'd1 : 2'd0;
+				esp_irq(ESP_DELAY_US);
 			end
 			else if (buf_pos >= buf_limit) begin
 				if (buf_disk) read_sector(2'd1);
-				else phase <= PHASE_ST;  // response drained
+				else if (flp_active) begin
+					flp_active <= 0;
+					flp_done <= 1;
+					xst <= X_IDLE;
+				end
+				else phase <= PHASE_ST;
 			end
 			else begin
 				eng_addr <= buf_pos[8:0];
@@ -1161,61 +1420,86 @@ always @(posedge clk) begin
 		X_DI_GET: begin
 			buf_pos <= buf_pos + 1'd1;
 			counter <= counter - 1'd1;
-			case (word_cnt)
-				2'd0: word_buf[31:24] <= eng_q;
-				2'd1: word_buf[23:16] <= eng_q;
-				2'd2: word_buf[15:8]  <= eng_q;
-				2'd3: word_buf[7:0]   <= eng_q;
-			endcase
-			word_cnt <= word_cnt + 1'd1;
-			if (!pad_mode && word_cnt == 2'd3) xst <= X_DI_WR;
-			else begin
-				if (pad_mode) word_cnt <= 0;
-				xst <= X_DI_CHK;
+			if (!flp_active && buf_pos + 1'd1 >= buf_limit) begin
+				if (!buf_disk || blockcounter == 0) phase <= PHASE_ST;
+				else if (lba >= img_blocks) begin
+					t_status <= STAT_CHECK_COND;
+					sense_code[t_unit] <= SC_INVALID_LBA;
+					sense_valid[t_unit] <= 1;
+					sense_info[t_unit] <= lba;
+					phase <= PHASE_ST;
+				end
 			end
+			if (!pad_mode) begin
+				dma_buf[dma_buf_limit[3:0]] <= eng_q;
+				dma_buf_limit <= dma_buf_limit + 1'd1;
+				dma_buf_size <= dma_buf_size + 1'd1;
+			end
+			xst <= X_DI_CHK;
 		end
 
-		// write the gathered word to memory; a partial word at the end
-		// of the transfer goes out with byte enables
+		// Empty complete internal buffers to memory.  ESPCTRL_FLUSH shares
+		// this state but writes exactly one padded word and then returns.
 		X_DI_WR: begin
 			if (!m_req) begin
-				if (d_csr[0] && d_next < d_limit && gap_us == 0) begin
+				if (dma_flush_pending) begin
 					m_req <= 1;
 					m_we <= 1;
 					m_addr <= d_next[25:2];
-					m_be <= (word_cnt == 2'd0) ? 4'b1111 :
-					        (word_cnt == 2'd1) ? 4'b1000 :
-					        (word_cnt == 2'd2) ? 4'b1100 : 4'b1110;
+					m_be <= 4'hF;
 					m_din <= word_buf;
 				end
-				// channel disabled or limit reached: stall until the
-				// CPU re-arms the channel (or resets the chip)
+				else if (d_csr[0] && gap_us == 0 && d_next < d_limit &&
+				         dma_buf_size >= 4) begin
+					m_req <= 1;
+					m_we <= 1;
+					m_addr <= d_next[25:2];
+					m_be <= 4'hF;
+					m_din <= {dma_buf[dma_buf_head[3:0]],
+					          dma_buf[dma_buf_head[3:0] + 1'd1],
+					          dma_buf[dma_buf_head[3:0] + 4'd2],
+					          dma_buf[dma_buf_head[3:0] + 4'd3]};
+				end
+				else if (d_csr[0] && gap_us == 0 && d_next >= d_limit) begin
+					dma_hit_limit;
+					if (!flp_active && (counter == 0 || phase != PHASE_DI)) begin
+						intstatus <= INTR_BS;
+						if (counter == 0) status[4] <= 1'b1;
+						dma_irq_resume <= (dma_buf_size != 0) ? 2'd1 : 2'd0;
+						esp_irq(ESP_DELAY_US);
+					end
+					else xst <= X_DI_CHK;
+				end
 			end
 			else if (m_ack) begin
 				m_req <= 0;
-				// A limit that is not a whole number of words above next
-				// is a programming error - the reference aborts on it - but
-				// it must not leave next above limit, because the driver
-				// subtracts the two to count the bytes moved and calls the
-				// difference a buffer overflow.  Stop on the limit instead.
-				d_next <= (d_next + 3'd4 > d_limit) ? d_limit : (d_next + 3'd4);
-				word_cnt <= 0;
-				// dma_interrupt(CHANNEL_SCSI): the pause before data
-				// flows into the swapped buffer is the driver's window
-				// to program the next chain segment
-				if (d_next + 3'd4 >= d_limit) begin
-					d_csr[3] <= 1;
-					gap_us <= GAP_US;
-					if (d_csr[1]) begin
-						d_next <= d_start;
-						d_limit <= d_stop;
-						d_csr[1] <= 0;
-					end
-					else d_csr[0] <= 0;
+				// A malformed, non-word-aligned limit must not carry next past
+				// the value software subtracts to calculate bytes transferred.
+				d_next <= (d_next + 32'd4 > d_limit) ? d_limit
+				                                      : d_next + 32'd4;
+				if (dma_buf_size <= 4) begin
+					dma_buf_size <= 0;
+					dma_buf_limit <= 0;
 				end
-				// back to the check: it stages the completion
-				// interrupt (or the next word)
-				xst <= X_DI_CHK;
+				else dma_buf_size <= dma_buf_size - 5'd4;
+				if (dma_flush_pending) begin
+					dma_flush_pending <= 0;
+					if (d_next + 32'd4 >= d_limit) dma_hit_limit;
+					if (dma_irq_resume == 2'd1) begin
+						if (dma_buf_size <= 4) dma_irq_resume <= 0;
+						// A control-register FLUSH returns after one word;
+						// it must not fall through and drain a retained full
+						// buffer as though a new ESP I/O event had arrived.
+						xst <= X_IDLE;
+					end
+					else xst <= dma_flush_return;
+				end
+				else if (dma_irq_resume == 2'd1 && dma_buf_size <= 4) begin
+					if (d_next + 32'd4 >= d_limit) dma_hit_limit;
+					dma_irq_resume <= 0;
+					xst <= X_IDLE;
+				end
+				else xst <= (dma_buf_size > 4) ? X_DI_WR : X_DI_CHK;
 			end
 		end
 
@@ -1223,27 +1507,54 @@ always @(posedge clk) begin
 		// transfer info, data out (memory to disk)
 		//------------------------------------------------------------
 		X_DO_CHK: begin
-			if (flp_active && (buf_pos >= buf_limit)) begin
+			if (pad_mode) begin
+				if (counter == 0) begin
+					intstatus <= INTR_BS;
+					status[4] <= 1'b1;
+					esp_irq(ESP_DELAY_US);
+				end
+				else if (phase != PHASE_DO) begin
+					intstatus <= INTR_BS;
+					esp_irq(ESP_DELAY_US);
+				end
+				else begin
+					do_rem <= 3'd1;
+					word_buf <= 32'd0;
+					xst <= X_DO_PUT;
+				end
+			end
+			else if (flp_active && (buf_pos >= buf_limit) &&
+			         dma_buf_size == 0) begin
+				if (d_csr[0] && d_next == d_limit) dma_hit_limit;
 				flp_active <= 0;
 				flp_done   <= 1;
 				xst        <= X_IDLE;
 			end
-			else if (counter == 0) begin
-				intstatus <= INTR_FC;
-				status[4] <= 1'b1;       // STAT_TC
-				esp_irq(ESP_DELAY_US);
+			// esp_dma_read_memory() always empties the controller FIFO first.
+			// With MODE_DMA clear it then waits there; with the bit set it
+			// returns here and continues with the external DMA buffer.
+			else if (!flp_active && (fifoflags != 0 || !dma_control[4]))
+				xst <= X_FDO;
+			else if (dma_irq_resume == 2'd2) ;
+			else if (dma_buf_limit == 5'd16) begin
+				if (d_csr[0] && gap_us == 0) begin
+					dma_status_toggle;
+					xst <= X_DO_PUT;
+				end
 			end
-			else if (phase != PHASE_DO) begin
+			else if (!flp_active && (counter == 0 || phase != PHASE_DO)) begin
 				intstatus <= INTR_BS;
+				if (counter == 0) status[4] <= 1'b1;
+				if (d_csr[0] && d_next == d_limit) dma_hit_limit;
+				dma_irq_resume <= (dma_buf_size != 0) ? 2'd2 : 2'd0;
 				esp_irq(ESP_DELAY_US);
 			end
-			else if (pad_mode) begin
-				// transfer pad: receive zero bytes
-				do_rem <= 3'd1;
-				word_buf <= 32'd0;
-				xst <= X_DO_PUT;
+			else if (!d_csr[0] || gap_us != 0) ;
+			else if (d_next < d_limit) xst <= X_DO_RD;
+			else begin
+				dma_hit_limit;
+				xst <= X_DO_CHK;
 			end
-			else xst <= X_DO_RD;
 		end
 
 		X_DO_RD: begin
@@ -1257,32 +1568,53 @@ always @(posedge clk) begin
 			end
 			else if (m_ack) begin
 				m_req <= 0;
-				word_buf <= m_dout;
-				do_rem <= 3'd4;
-				d_next <= (d_next + 3'd4 > d_limit) ? d_limit : (d_next + 3'd4);
-				if (d_next + 3'd4 >= d_limit) begin
-					d_csr[3] <= 1;
-					gap_us <= GAP_US;
-					if (d_csr[1]) begin
-						d_next <= d_start;
-						d_limit <= d_stop;
-						d_csr[1] <= 0;
-					end
-					else d_csr[0] <= 0;
-				end
-				xst <= X_DO_PUT;
+				dma_buf[dma_buf_limit[3:0]] <= m_dout[31:24];
+				dma_buf[dma_buf_limit[3:0] + 1'd1] <= m_dout[23:16];
+				dma_buf[dma_buf_limit[3:0] + 4'd2] <= m_dout[15:8];
+				dma_buf[dma_buf_limit[3:0] + 4'd3] <= m_dout[7:0];
+				dma_buf_limit <= dma_buf_limit + 5'd4;
+				dma_buf_size <= dma_buf_size + 5'd4;
+				d_next <= (d_next + 32'd4 > d_limit) ? d_limit
+				                                      : d_next + 32'd4;
+				xst <= X_DO_CHK;
 			end
 		end
 
 		X_DO_PUT: begin
-			if (do_rem == 0 || counter == 0 || phase != PHASE_DO)
+			if (pad_mode) begin
+				if (do_rem == 0 || counter == 0 || phase != PHASE_DO)
+					xst <= X_DO_CHK;
+				else begin
+					eng_we <= 1;
+					eng_addr <= buf_pos[8:0];
+					eng_wd <= word_buf[31:24];
+					word_buf <= {word_buf[23:0], 8'h00};
+					do_rem <= do_rem - 1'd1;
+					buf_pos <= buf_pos + 1'd1;
+					counter <= counter - 1'd1;
+					if (buf_pos + 1'd1 == buf_limit) begin
+						if (buf_disk) xst <= X_WR_SECT;
+						else begin phase <= PHASE_ST; xst <= X_DO_CHK; end
+					end
+				end
+			end
+			else if (dma_buf_size == 0) begin
+				dma_buf_limit <= 0;
 				xst <= X_DO_CHK;
+			end
+			else if (!flp_active && (counter == 0 || phase != PHASE_DO)) begin
+				intstatus <= INTR_BS;
+				if (counter == 0) status[4] <= 1'b1;
+				if (d_csr[0] && d_next == d_limit) dma_hit_limit;
+				dma_irq_resume <= 2'd2;
+				esp_irq(ESP_DELAY_US);
+			end
 			else begin
 				eng_we <= 1;
 				eng_addr <= buf_pos[8:0];
-				eng_wd <= word_buf[31:24];
-				word_buf <= {word_buf[23:0], 8'h00};
-				do_rem <= do_rem - 1'd1;
+				eng_wd <= dma_buf[dma_buf_head[3:0]];
+				dma_buf_size <= dma_buf_size - 1'd1;
+				if (dma_buf_size == 1) dma_buf_limit <= 0;
 				buf_pos <= buf_pos + 1'd1;
 				counter <= counter - 1'd1;
 				if (buf_pos + 1'd1 == buf_limit) begin
@@ -1296,19 +1628,110 @@ always @(posedge clk) begin
 		end
 
 		//------------------------------------------------------------
+		// DMA-tagged transfer information with ESPCTRL_MODE_DMA clear.
+		// The command still owns the transfer counter, but bytes travel
+		// through the controller FIFO rather than the memory DMA channel.
+		//------------------------------------------------------------
+		X_FDI_CHK: begin
+			if (dma_control[4]) xst <= X_DI_CHK;
+			else if (gap_us != 0) ;
+			else if (counter == 0) begin
+				intstatus <= INTR_BS;
+				status[4] <= 1'b1;       // STAT_TC
+				esp_irq(ESP_DELAY_US);
+			end
+			else if (phase != PHASE_DI) begin
+				intstatus <= INTR_BS;
+				esp_irq(ESP_DELAY_US);
+			end
+			else if (fifoflags == 5'd16) begin
+				// The reference retries its I/O event until software makes
+				// room.  Holding this state has the same visible contract.
+			end
+			else if (buf_pos >= buf_limit) begin
+				if (buf_disk) read_sector(2'd3);
+				else begin
+					phase <= PHASE_ST;
+					xst <= X_FDI_CHK;
+				end
+			end
+			else begin
+				eng_addr <= buf_pos[8:0];
+				xst <= X_FDI_WAIT;
+			end
+		end
+
+		X_FDI_WAIT: xst <= X_FDI_GET;    // registered buffer read settles
+
+		X_FDI_GET: begin
+			if (cpu_fifo_access) ;
+			else if (fifoflags == 5'd16) xst <= X_FDI_CHK;
+			else begin
+				fifo_push(eng_q);
+				buf_pos <= buf_pos + 1'd1;
+				counter <= counter - 1'd1;
+				if (buf_pos + 1'd1 >= buf_limit) begin
+					if (!buf_disk || blockcounter == 0) phase <= PHASE_ST;
+					else if (lba >= img_blocks) begin
+						t_status <= STAT_CHECK_COND;
+						sense_code[t_unit] <= SC_INVALID_LBA;
+						sense_valid[t_unit] <= 1;
+						sense_info[t_unit] <= lba;
+						phase <= PHASE_ST;
+					end
+				end
+				xst <= X_FDI_CHK;
+			end
+		end
+
+		X_FDO: begin
+			if (cpu_fifo_access) ;
+			else if (gap_us != 0) ;
+			else if (counter == 0) begin
+				intstatus <= INTR_BS;
+				status[4] <= 1'b1;       // STAT_TC
+				esp_irq(ESP_DELAY_US);
+			end
+			else if (phase != PHASE_DO) begin
+				intstatus <= INTR_BS;
+				esp_irq(ESP_DELAY_US);
+			end
+			else if (fifoflags != 0) begin
+				eng_we <= 1;
+				eng_addr <= buf_pos[8:0];
+				eng_wd <= fifo_head;
+				fifo_pop;
+				buf_pos <= buf_pos + 1'd1;
+				counter <= counter - 1'd1;
+				if (buf_pos + 1'd1 == buf_limit) begin
+					if (buf_disk) xst <= X_WR_SECT;
+					else begin
+						phase <= PHASE_ST;
+						xst <= X_FDO;
+					end
+				end
+			end
+			else if (dma_control[4]) xst <= X_DO_CHK;
+		end
+
+		//------------------------------------------------------------
 		// initiator command complete: status byte, then message byte
 		//------------------------------------------------------------
 		X_ICCS1: begin
-			fifo_push(t_status);
-			phase <= PHASE_MI;           // SCSIdisk_Send_Status()
-			xst <= X_ICCS2;
+			if (!cpu_fifo_access) begin
+				fifo_push(t_status);
+				phase <= PHASE_MI;           // SCSIdisk_Send_Status()
+				xst <= X_ICCS2;
+			end
 		end
 
 		X_ICCS2: begin
-			fifo_push(t_message);
-			intstatus <= INTR_FC;
-			dly_us <= ESP_DELAY_US;
-			xst <= X_INT_WAIT;
+			if (!cpu_fifo_access) begin
+				fifo_push(t_message);
+				intstatus <= INTR_FC;
+				dly_us <= ESP_DELAY_US;
+				xst <= X_INT_WAIT;
+			end
 		end
 
 		//------------------------------------------------------------
@@ -1324,15 +1747,31 @@ always @(posedge clk) begin
 			end
 			else begin
 				eng_addr <= buf_pos[8:0];
-				xst <= X_PIO_GET;
+				xst <= X_PIO_WAIT;
 			end
 		end
 
+		X_PIO_WAIT: xst <= X_PIO_GET;     // registered buffer read settles
+
 		X_PIO_GET: begin
-			fifo_push(eng_q);
-			buf_pos <= buf_pos + 1'd1;
-			if (buf_pos + 1'd1 >= buf_limit && !buf_disk) phase <= PHASE_ST;
-			esp_irq(25'd1);
+			if (!cpu_fifo_access) begin
+				fifo_push(eng_q);
+				buf_pos <= buf_pos + 1'd1;
+				if (buf_pos + 1'd1 >= buf_limit) begin
+					if (!buf_disk || blockcounter == 0) phase <= PHASE_ST;
+					else if (lba >= img_blocks) begin
+						// SCSIdisk_Send_Data() attempts the next disk read
+						// as it returns this last byte, so an end crossing
+						// becomes visible before software issues another TI.
+						t_status <= STAT_CHECK_COND;
+						sense_code[t_unit] <= SC_INVALID_LBA;
+						sense_valid[t_unit] <= 1;
+						sense_info[t_unit] <= lba;
+						phase <= PHASE_ST;
+					end
+				end
+				esp_irq(25'd1);
+			end
 		end
 
 		default: xst <= X_IDLE;
@@ -1353,16 +1792,35 @@ always @(posedge clk) begin
 				if (((be[1] && a_even == 6'h05) || (be[0] && a_odd == 6'h05)) && status[7]) begin
 					intstatus <= 8'h00;
 					status <= status & ~(STAT_INT|STAT_VGC|STAT_PE|STAT_GE);
+					// Lowering the interrupt finishes the active rank.  If a
+					// command is waiting, promote and start the newest queued byte.
+					if (cmd_waiting) begin
+						command1 <= 0;
+						cmd_waiting <= 0;
+						start_command(command1);
+					end
+					else cmd_inprogress <= 0;
 				end
 			end
 		end
 
-		// DMA CSR command (OR of byte lanes, like DMA_CSR_Write)
-		if (sel_csr & we & (csr_or != 0)) begin
-			if (csr_or[4]) d_csr <= d_csr & ~8'b00001011;   // RESET
-			if (csr_or[1]) d_csr[1] <= 1;                   // SETSUPDATE
-			if (csr_or[0]) d_csr[0] <= 1;                   // SETENABLE
-			if (csr_or[3]) d_csr[3] <= 0;                   // CLRCOMPLETE
+		// DMA_CSR_Write latches direction on every write, including zero.
+		if (sel_csr & we) begin
+			d_dev2m <= csr_or[2];
+			if (csr_or != 0) begin
+				if (csr_or[4]) d_csr <= d_csr & ~8'b00001011; // RESET
+				if (csr_or[5]) begin                            // INITBUF
+					dma_status <= 0;
+					dma_buf_size <= 0;
+					dma_buf_limit <= 0;
+					dma_flush_pending <= 0;
+					dma_flush_return <= X_IDLE;
+					dma_irq_resume <= 0;
+				end
+				if (csr_or[1]) d_csr[1] <= 1;                 // SETSUPDATE
+				if (csr_or[0]) d_csr[0] <= 1;                 // SETENABLE
+				if (csr_or[3]) d_csr[3] <= 0;                 // CLRCOMPLETE
+			end
 		end
 
 		if (sel_sptr & we) begin
@@ -1384,8 +1842,32 @@ always @(posedge clk) begin
 		end
 		// DMA_Init_Write: a write to the init register loads next
 		if (sel_ini & we) begin
+			dma_status <= 0;
+			dma_buf_size <= 0;
+			dma_buf_limit <= 0;
+			dma_flush_pending <= 0;
+			dma_flush_return <= X_IDLE;
+			dma_irq_resume <= 0;
 			if (!addr[1]) begin if (be[1]) d_next[31:24] <= wdata[15:8]; if (be[0]) d_next[23:16] <= wdata[7:0]; end
-			else begin if (be[1]) d_next[15:8] <= wdata[15:8]; if (be[0]) d_next[7:0] <= wdata[7:0]; end
+			else begin
+				if (be[1]) d_next[15:8] <= wdata[15:8];
+				if (be[0]) begin
+					d_next[7:0] <= wdata[7:0];
+					dma_buf_limit <= {1'b0, wdata[3:0]};
+				end
+			end
+		end
+
+		// SCSI_Insert(): sense belongs to the medium in the selected slot,
+		// so replacement media must not inherit the previous image's error.
+		// Keep these assignments in this process (the sole sense owner), and
+		// last so a mount pulse wins over any command completing this cycle.
+		for (sk = 0; sk < SCSI_UNITS; sk = sk + 1) begin
+			if (img_mounted[sk]) begin
+				sense_code[sk] <= SC_NO_ERROR;
+				sense_valid[sk] <= 0;
+				sense_info[sk] <= 0;
+			end
 		end
 	end
 end

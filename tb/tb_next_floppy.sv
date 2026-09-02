@@ -41,7 +41,8 @@ reg        buf_we = 0;
 reg  [7:0] buf_wdata = 0;
 reg        dma_done = 0;
 
-reg         img_mounted = 0;
+reg   [1:0] img_mounted = 0;
+reg         img_readonly = 0;
 reg  [63:0] img_size = 0;
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
@@ -59,7 +60,7 @@ next_floppy #(.CLK_HZ(1000000)) dut
 	.buf_addr(buf_addr), .buf_we(buf_we), .buf_wdata(buf_wdata),
 	.buf_q(buf_q), .buf_len(buf_len),
 	.dma_req(dma_req), .dma_wr(dma_wr), .dma_done(dma_done),
-	.img_mounted({1'b0, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
+	.img_mounted(img_mounted), .img_readonly(img_readonly), .img_size(img_size),
 	.sd_unit(),
 	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
@@ -193,6 +194,17 @@ task run_channel;
 	end
 endtask
 
+// Abort an intentionally wedged fail-first transfer without leaving the
+// one-second DSR reset poll armed.  DSR reset preserves the mounted medium
+// and the drive's current cylinder, just as the controller-only reset does.
+task reset_controller_no_poll;
+	begin
+		wr8(4'h4, 8'h80);
+		wr8(4'h5, 8'h13); wr8(4'h5, 8'h00);
+		wr8(4'h5, 8'h10); wr8(4'h5, 8'h00);
+	end
+endtask
+
 integer errors = 0;
 
 task check;
@@ -273,6 +285,20 @@ initial begin
 	rd8(4'h8, v);
 	check(v[2] == 1'b1, "an absent drive reports no drive");
 	check(v[1:0] == 2'd0, "an absent drive reports no medium");
+
+	// floppy_recalibrate() ignores a drive that is not connected: it
+	// neither marks it busy nor schedules a completion interrupt.
+	wr8(4'h5, 8'h07); wr8(4'h5, 8'h01);
+	rd8(4'h4, msr);
+	check(!msr[1], "an absent drive does not become busy on recalibrate");
+	repeat (400) @(posedge clk);
+	check(!int_floppy, "an absent drive does not interrupt on recalibrate");
+	// Clear any state left by a broken implementation so later cases are
+	// independent; controller reset does not eject the mounted medium.
+	reset = 1;
+	repeat (4) @(posedge clk);
+	reset = 0;
+	repeat (10) @(posedge clk);
 	wr8(4'h2, 8'h1C);            // back to drive 0
 
 	// The medium is still there with the motor stopped.  The
@@ -309,6 +335,27 @@ initial begin
 	rd8(4'h5, v);
 	check(v == 8'h00, "sense interrupt: present cylinder 0");
 	check(!int_floppy, "sense interrupt clears the request");
+
+	// SENSE DRIVE STATUS uses the bit positions defined by floppy.c:
+	// WP=0x40, T0=0x10, HD=0x04 and DS=0x03.  Bits which the C model
+	// does not define must remain clear.
+	wr8(4'h5, 8'h04); wr8(4'h5, 8'h04);       // drive 0, head 1
+	rd8(4'h5, v);
+	check(v == 8'h14, "writable track-zero ST3 is exactly T0|HD");
+
+	// A seek completion has no FIFO result.  Reading that empty FIFO still
+	// returns zero and acknowledges the interrupt in the C model.  Prime the
+	// otherwise stale storage and DIO bit so both effects are deterministic.
+	wr8(4'h5, 8'h07); wr8(4'h5, 8'h00);
+	repeat (400) @(posedge clk);
+	check(int_floppy, "recalibrate supplies an interrupt for empty-FIFO acknowledgement");
+	dut.res[0] = 8'hA5;
+	dut.msr = 8'h40;
+	rd8(4'h5, v);
+	check(v == 8'h00, "an empty FIFO returns zero instead of stale result storage");
+	check(!int_floppy, "an empty FIFO read acknowledges the pending interrupt");
+	rd8(4'h4, msr);
+	check(msr[7] && !msr[6], "an empty FIFO read sets RQM and clears DIO");
 
 	// SEEK to cylinder 5
 	wr8(4'h5, 8'h0F); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
@@ -397,17 +444,419 @@ initial begin
 	while (sd_wr_act) @(posedge clk);
 	repeat (20) @(posedge clk);
 	check(sd_writes > 0, "write put a sector back on the image");
+	$display("  write LBA = %0d", last_lba);
 	// head 1, sector 3 on cylinder 0 with 18 sectors per track is LBA 20
 	bad = 0;
 	for (i = 0; i < 512; i = i + 1)
 		if (disk[20*512 + i] !== (8'hA0 + i[7:0])) bad = bad + 1;
 	check(bad == 0, "the written sector landed at the right offset");
 
+	// Protection is checked before DMA.  Consuming a sector and silently
+	// discarding it made a protected write appear to succeed.
+	img_readonly = 1;
+	img_mounted = 1; @(posedge clk); img_mounted = 0;
+	wr8(4'h5, 8'h04); wr8(4'h5, 8'h00);       // drive 0, head 0
+	rd8(4'h5, v);
+	check(v == 8'h50, "read-only track-zero ST3 is exactly WP|T0");
+	wr8(4'h5, 8'h45); wr8(4'h5, 8'h00); wr8(4'h5, 8'h00);
+	wr8(4'h5, 8'h00); wr8(4'h5, 8'h04); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h04); wr8(4'h5, 8'h1B); wr8(4'h5, 8'hFF);
+	repeat (20) @(posedge clk);
+	check(int_floppy && !dma_req, "a protected write fails before requesting DMA");
+	rd8(4'h5, v);                 // ST0
+	rd8(4'h5, v);                 // ST1
+	check(v[1], "a protected write reports ST1 not-writable");
+	for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
+	img_readonly = 0;
+	img_mounted = 1; @(posedge clk); img_mounted = 0;
+
+	// Disable implied seek, move to cylinder 5, then request cylinder 0.
+	// The reference reports wrong-cylinder instead of moving implicitly.
+	wr8(4'h5, 8'h13); wr8(4'h5, 8'h00); wr8(4'h5, 8'h17); wr8(4'h5, 8'h00);
+	wr8(4'h5, 8'h0F); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
+	repeat (400) @(posedge clk);
+	wr8(4'h5, 8'h08); rd8(4'h5, v); rd8(4'h5, v);
+	wr8(4'h5, 8'h46); wr8(4'h5, 8'h00); wr8(4'h5, 8'h00);
+	wr8(4'h5, 8'h00); wr8(4'h5, 8'h01); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h1B); wr8(4'h5, 8'hFF);
+	repeat (20) @(posedge clk);
+	check(int_floppy && !dma_req, "wrong-cylinder read fails before DMA");
+	rd8(4'h5, v); rd8(4'h5, v); rd8(4'h5, v);
+	check(v[4], "wrong-cylinder read reports ST2 wrong-cylinder");
+	for (i = 0; i < 4; i = i + 1) rd8(4'h5, v);
+
+	// READ ID starts with fresh command status.  It must not leak the
+	// preceding wrong-cylinder failure into its own seven-byte result.
+	wr8(4'h5, 8'h4A); wr8(4'h5, 8'h00);
+	repeat (20) @(posedge clk);
+	rd8(4'h5, v);
+	check(v[7:6] == 2'b00, "read id clears stale ST0 termination status");
+	rd8(4'h5, v);
+	check(v == 0, "read id clears stale ST1 status");
+	rd8(4'h5, v);
+	check(v == 0, "read id clears stale ST2 status");
+	for (i = 0; i < 4; i = i + 1) rd8(4'h5, v);
+
+	// Every software reset path must abandon a partial FIFO command.
+	wr8(4'h5, 8'h03); wr8(4'h5, 8'hDF);
+	wr8(4'h4, 8'h80);             // DSR software reset
+	wr8(4'h5, 8'h10);             // VERSION is now a fresh command
+	rd8(4'h5, v);
+	check(v == 8'h90, "DSR reset abandons a partial command");
+
+	// FORMAT consumes C/H/R/N descriptors and zeroes their sectors.
+	wr8(4'h7, 8'h00);             // 500 kbit/s for 1.44 MB
+	wr8(4'h5, 8'h0D); wr8(4'h5, 8'h00); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h1B); wr8(4'h5, 8'h00);
+	host[0] = 8'd5; host[1] = 0; host[2] = 1; host[3] = 2;
+	run_channel;
+	while (sd_writes < 2) @(posedge clk);
+	while (sd_wr_act) @(posedge clk);
+	repeat (30) @(posedge clk);
+	bad = 0;
+	for (i = 0; i < 512; i = i + 1)
+		if (disk[180*512 + i] !== 0) bad = bad + 1;
+	check(bad == 0, "format zeroes the described sector");
+	$display("  format LBA = %0d", last_lba);
+	for (i = 0; i < 7; i = i + 1) rd8(4'h5, v);
+
+	// get_logical_sec() validates every sector, not only the command's
+	// starting R byte.  A transfer which reaches sector 19 on an 18-sector
+	// track must stop before it accesses the first sector of the next head.
+	bad = sd_reads;
+	wr8(4'h5, 8'h46); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
+	wr8(4'h5, 8'h00); wr8(4'h5, 8'd18); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'd19); wr8(4'h5, 8'h1B); wr8(4'h5, 8'hFF);
+	run_channel;
+	repeat (1600) @(posedge clk);
+	check(sd_reads == bad + 1,
+	      "read stops before fetching a sector beyond the track");
+	check(int_floppy && !dma_req,
+	      "read past EOT terminates instead of requesting another DMA sector");
+	if (int_floppy) begin
+		rd8(4'h5, v); rd8(4'h5, v);
+		check(v[7], "read past EOT reports ST1 end-of-cylinder");
+		for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
+	end
+	reset_controller_no_poll;
+
+	for (i = 0; i < 512; i = i + 1) host[i] = 8'hC0 ^ i[7:0];
+	bad = sd_writes;
+	wr8(4'h5, 8'h45); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
+	wr8(4'h5, 8'h00); wr8(4'h5, 8'd18); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'd19); wr8(4'h5, 8'h1B); wr8(4'h5, 8'hFF);
+	run_channel;
+	while (sd_writes == bad) @(posedge clk);
+	while (sd_wr_act) @(posedge clk);
+	repeat (20) @(posedge clk);
+	check(sd_writes == bad + 1,
+	      "write commits only the valid last sector of the track");
+	check(int_floppy && !dma_req,
+	      "write past EOT terminates instead of requesting cross-track data");
+	if (int_floppy) begin
+		rd8(4'h5, v); rd8(4'h5, v);
+		check(v[7], "write past EOT reports ST1 end-of-cylinder");
+		for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
+	end
+	reset_controller_no_poll;
+
+	// FORMAT differs from READ/WRITE in the C model: it consumes the next
+	// four-byte C/H/R/N descriptor, then rejects its sector before zeroing or
+	// writing it.  Exercise all 18 valid descriptors plus the rejected 19th.
+	bad = sd_writes;
+	wr8(4'h5, 8'h0D); wr8(4'h5, 8'h00); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'd19); wr8(4'h5, 8'h1B); wr8(4'h5, 8'h00);
+	for (i = 1; i <= 19; i = i + 1) begin
+		host[0] = 8'd5; host[1] = 0; host[2] = i[7:0]; host[3] = 2;
+		run_channel;
+	end
+	repeat (2000) @(posedge clk);
+	check(sd_writes == bad + 18,
+	      "format rejects the first descriptor beyond the track before writing");
+	check(int_floppy && !dma_req, "format past the track terminates cleanly");
+	if (int_floppy) begin
+		rd8(4'h5, v); rd8(4'h5, v);
+		check(v[7], "format past the track reports ST1 end-of-cylinder");
+		for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
+	end
+	reset_controller_no_poll;
+
+	// If a medium disappears after FORMAT has begun, its terminal no-media
+	// result must retire FORMAT mode.  Otherwise the next ordinary READ uses
+	// a four-byte DMA length and interprets sector data as a format descriptor.
+	bad = sd_writes;
+	wr8(4'h5, 8'h0D); wr8(4'h5, 8'h00); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h02); wr8(4'h5, 8'h1B); wr8(4'h5, 8'h00);
+	host[0] = 8'd5; host[1] = 0; host[2] = 1; host[3] = 2;
+	run_channel;
+	wr8(4'h8, 8'h80);             // eject while the first sector is retiring
+	repeat (2000) @(posedge clk);
+	check(int_floppy, "an ejected in-flight format terminates");
+	check(sd_writes == bad, "an ejected in-flight format does not write the old slot");
+	check(!dut.format_mode, "a terminal format abort clears format mode");
+	if (int_floppy)
+		for (i = 0; i < 7; i = i + 1) rd8(4'h5, v);
+
+	img_size = BLOCKS*512;
+	img_readonly = 0;
+	img_mounted = 1; @(posedge clk); img_mounted = 0;
+	repeat (20) @(posedge clk);
+	wr8(4'h5, 8'h46); wr8(4'h5, 8'h00); wr8(4'h5, 8'h00);
+	wr8(4'h5, 8'h00); wr8(4'h5, 8'h01); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h1B); wr8(4'h5, 8'hFF);
+	while (!dma_req) @(posedge clk);
+	check(buf_len == 11'd512,
+	      "ordinary read after aborted format retains a full sector DMA length");
+	reset_controller_no_poll;
+	wr8(4'h5, 8'h0F); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
+	repeat (400) @(posedge clk);
+	wr8(4'h5, 8'h08); rd8(4'h5, v); rd8(4'h5, v);
+
+	// FORMAT also calls get_logical_sec() before starting its descriptor
+	// loop.  A seek can leave the drive at cylinder 80, but formatting there
+	// must fail before requesting descriptor DMA or touching the image.
+	wr8(4'h5, 8'h0F); wr8(4'h5, 8'h00); wr8(4'h5, 8'd80);
+	repeat (400) @(posedge clk);
+	wr8(4'h5, 8'h08); rd8(4'h5, v); rd8(4'h5, v);
+	bad = sd_writes;
+	wr8(4'h5, 8'h0D); wr8(4'h5, 8'h00); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h1B); wr8(4'h5, 8'h00);
+	repeat (20) @(posedge clk);
+	check(int_floppy && !dma_req,
+	      "format rejects an out-of-range cylinder before descriptor DMA");
+	check(sd_writes == bad, "out-of-range cylinder format does not touch the image");
+	if (int_floppy) begin
+		rd8(4'h5, v); rd8(4'h5, v);
+		check(v[2], "out-of-range cylinder format reports ST1 no-data");
+		for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
+	end
+	reset_controller_no_poll;
+	wr8(4'h5, 8'h0F); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
+	repeat (400) @(posedge clk);
+	wr8(4'h5, 8'h08); rd8(4'h5, v); rd8(4'h5, v);
+
+	// A channel which never acknowledges the sector must not wedge the
+	// controller forever; floppy.c reports an overrun/underrun result.
+	wr8(4'h5, 8'h46); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
+	wr8(4'h5, 8'h00); wr8(4'h5, 8'h02); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h02); wr8(4'h5, 8'h1B); wr8(4'h5, 8'hFF);
+	while (!dma_req) @(posedge clk);
+	repeat (100010) @(posedge clk);
+	check(int_floppy && !dma_req, "a stalled DMA transfer times out");
+	rd8(4'h5, v); rd8(4'h5, v);
+	check(v[4], "a stalled DMA transfer reports ST1 overrun");
+	for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
+
+	// ST0 encodes the selected drive in bits 1:0 and the head in bit 2.
+	// Exercise drive 1/head 1 through an immediate wrong-cylinder result.
+	img_size = BLOCKS*512;
+	img_mounted = 2'b10;
+	@(posedge clk);
+	img_mounted = 0;
+	repeat (20) @(posedge clk);
+
+	// DOR reads reconstruct all motor bits from the per-drive spinning
+	// flags.  Selecting drive 1 and starting its motor does not implicitly
+	// stop drive 0 merely because the raw byte no longer contains MOT0EN.
+	wr8(4'h2, 8'h0C);             // force a drive 0 motor transition
+	wr8(4'h2, 8'h1C);             // drive 0 spinning
+	wr8(4'h2, 8'h2D);             // drive 1 spinning, selected
+	rd8(4'h2, v);
+	check(v == 8'h3D, "DOR read reconstructs both drives' running motors");
+	wr8(4'h2, 8'h0D);             // stop selected drive 1 only
+	rd8(4'h2, v);
+	check(v == 8'h1D, "DOR read retains drive 0 motor after stopping drive 1");
+	wr8(4'h2, 8'h1C);             // restore drive 0 selection
+
+	wr8(4'h7, 8'h00);
+	wr8(4'h5, 8'h46); wr8(4'h5, 8'h05); wr8(4'h5, 8'h01);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h01); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h1B); wr8(4'h5, 8'hFF);
+	repeat (20) @(posedge clk);
+	rd8(4'h5, v);
+	check(v == 8'h45, "drive 1/head 1 result encodes ST0 as 0x45");
+	for (i = 0; i < 6; i = i + 1) rd8(4'h5, v);
+
+	// SEEK keeps its completion cylinder for the drive that owned the
+	// command, even while the DOR remains on drive 0.  The reference's
+	// seek status contains only SEEK END; drive/head bits are added only
+	// to the seven-byte read/write result path.
+	wr8(4'h5, 8'h0F); wr8(4'h5, 8'h05); wr8(4'h5, 8'd7);
+	repeat (400) @(posedge clk);
+	check(int_floppy, "drive 1 seek raises its completion interrupt");
+	wr8(4'h5, 8'h08);
+	rd8(4'h5, v);
+	check(v == 8'h20, "drive 1 seek status matches the reference");
+	rd8(4'h5, v);
+	check(v == 8'd7, "sense interrupt returns the command drive cylinder");
+
+	wr8(4'h5, 8'h07); wr8(4'h5, 8'h01);       // recalibrate drive 1
+	repeat (400) @(posedge clk);
+	wr8(4'h5, 8'h08);
+	rd8(4'h5, v);
+	check(v == 8'h20, "drive 1 recalibrate status matches the reference");
+	rd8(4'h5, v);
+	check(v == 8'd0, "drive 1 recalibrate reports cylinder zero");
+
+	// floppy.c validates the complete eight-bit N byte.  Folding it to
+	// three bits accepts malformed values such as 0x82 as ordinary 512-byte
+	// transfers and lets them reach the disk/DMA path.
+	wr8(4'h5, 8'h46); wr8(4'h5, 8'h00); wr8(4'h5, 8'd5);
+	wr8(4'h5, 8'h00); wr8(4'h5, 8'h01); wr8(4'h5, 8'h82);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h1B); wr8(4'h5, 8'hFF);
+	repeat (20) @(posedge clk);
+	check(int_floppy && !dma_req, "read rejects a high-bit alias of its block size");
+	if (int_floppy) begin
+		rd8(4'h5, v); rd8(4'h5, v);
+		check(v[2], "bad read block size reports ST1 no-data");
+		for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
+	end
+	wr8(4'h4, 8'h80);             // abandon a falsely accepted command
+
+	wr8(4'h5, 8'h0D); wr8(4'h5, 8'h00); wr8(4'h5, 8'h82);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h1B); wr8(4'h5, 8'h00);
+	repeat (20) @(posedge clk);
+	check(int_floppy && !dma_req, "format rejects a high-bit alias of its block size");
+	if (int_floppy) begin
+		rd8(4'h5, v); rd8(4'h5, v);
+		check(v[2], "bad format block size reports ST1 no-data");
+		for (i = 0; i < 5; i = i + 1) rd8(4'h5, v);
+	end
+	wr8(4'h4, 8'h80);             // abandon a falsely accepted command
+
+	// The same full-byte comparison applies to each C/H/R/N descriptor.
+	// A bad descriptor stops FORMAT without writing the addressed sector.
+	bad = sd_writes;
+	wr8(4'h5, 8'h0D); wr8(4'h5, 8'h00); wr8(4'h5, 8'h02);
+	wr8(4'h5, 8'h01); wr8(4'h5, 8'h1B); wr8(4'h5, 8'h00);
+	host[0] = 8'd5; host[1] = 0; host[2] = 1; host[3] = 8'h82;
+	run_channel;
+	repeat (2000) @(posedge clk);
+	check(int_floppy, "bad format descriptor completes with a result");
+	check(sd_writes == bad, "bad format descriptor never reaches the disk");
+	if (int_floppy) begin
+		rd8(4'h5, v);
+		check(v == 8'h00, "bad format descriptor preserves normal ST0");
+		rd8(4'h5, v);
+		check(v == 8'h00, "bad format descriptor preserves clear ST1");
+		rd8(4'h5, v);
+		check(v == 8'h00, "bad format descriptor preserves clear ST2");
+		for (i = 0; i < 4; i = i + 1) rd8(4'h5, v);
+	end
+	wr8(4'h4, 8'h80);
+
 	// an opcode the controller does not implement
 	wr8(4'h5, 8'h1F);
 	repeat (20) @(posedge clk);
+	check(int_floppy, "invalid command raises its completion interrupt");
 	rd8(4'h5, v);
 	check(v == 8'h80, "invalid command reports invalid opcode");
+
+	// CTRL_RESET runs before CTRL_EJECT in floppy.c: reset selects drive 0,
+	// then eject invalidates that medium's size and block-size geometry.  A
+	// stale DOR selects/ejects drive 1 instead and lets READ ID falsely pass.
+	wr8(4'h2, 8'h2D);             // select drive 1, motor 1 on
+	wr8(4'h8, 8'hA0);             // controller reset and eject together
+	rd8(4'h2, v);
+	check(v == 8'h00, "external controller reset clears DOR before eject");
+	wr8(4'h7, 8'h00);
+	wr8(4'h5, 8'h4A); wr8(4'h5, 8'h00);
+	repeat (20) @(posedge clk);
+	rd8(4'h5, v);
+	check(v == 8'h40, "read id after eject reports abnormal termination");
+	rd8(4'h5, v);
+	check(v == 8'h04, "read id after eject reports no data");
+	for (i = 0; i < 4; i = i + 1) rd8(4'h5, v);
+	rd8(4'h5, v);
+	check(v == 8'h00, "read id after eject exposes the cleared block size");
+	wr8(4'h2, 8'h2D);             // drive 1 was not the ejection target
+	rd8(4'h8, v);
+	check(v[1:0] == 2'd2, "reset plus eject preserves the other drive's medium");
+
+	// A drive and the removable medium in it are separate things.  Once
+	// drive 1 has proved that it is fitted, ejecting its disk must leave a
+	// fitted, empty drive: CTRL_DRV_ID stays clear, the SRA fitted bit stays
+	// clear, and commands which require only a drive still run.
+	wr8(4'h8, 8'h80);             // eject drive 1 selected by the DOR
+	repeat (2) @(posedge clk);     // let the command retire before reset
+	reset = 1;                    // a system reset must not forget the fixture
+	repeat (4) @(posedge clk);
+	reset = 0;
+	repeat (10) @(posedge clk);
+	wr8(4'h2, 8'h0D);             // select drive 1 after reset
+	rd8(4'h8, v);
+	check(!v[2] && v[1:0] == 2'd0,
+	      "eject leaves drive 1 fitted but empty");
+	rd8(4'h0, v);
+	check(!v[6], "eject does not turn a fitted drive 1 into no drive");
+	wr8(4'h5, 8'h07); wr8(4'h5, 8'h01);
+	rd8(4'h4, msr);
+	check(msr[1], "an empty fitted drive becomes busy on recalibrate");
+	repeat (400) @(posedge clk);
+	check(int_floppy, "an empty fitted drive completes recalibrate");
+	if (int_floppy) begin
+		wr8(4'h5, 8'h08);
+		rd8(4'h5, v);
+		check(v == 8'h20, "empty drive recalibrate reports seek end");
+		rd8(4'h5, v);
+		check(v == 8'h00, "empty drive recalibrate reports cylinder zero");
+	end
+
+	// Leaving reset through DOR RESET_N produces one poll interrupt after
+	// exactly one second.  It has no result phase of its own; SENSE
+	// INTERRUPT STATUS observes the clean reset ST0/PCN and acknowledges it.
+	wr8(4'h2, 8'h08);             // enter reset
+	wr8(4'h2, 8'h0C);             // leave reset and arm the poll
+	repeat (999900) @(posedge clk);
+	check(!int_floppy, "reset poll does not interrupt before one second");
+	repeat (200) @(posedge clk);
+	rd8(4'h4, msr);
+	check(int_floppy && msr == 8'h80,
+	      "DOR reset release raises the one-second poll interrupt");
+	wr8(4'h5, 8'h08);
+	rd8(4'h5, v);
+	check(v == 8'h00, "reset poll sense returns clean ST0");
+	rd8(4'h5, v);
+	check(v == 8'h00, "reset poll sense returns cylinder zero");
+	check(!int_floppy, "reset poll sense clears the request");
+
+	// DSR bit 7 is the other 82077 stop/start reset path and arms the same
+	// poll.  The external NeXT CTRL_RESET is a generic controller reset and
+	// deliberately does not.
+	wr8(4'h4, 8'h80);
+	repeat (1000100) @(posedge clk);
+	check(int_floppy, "DSR reset raises the one-second poll interrupt");
+	wr8(4'h5, 8'h08); rd8(4'h5, v); rd8(4'h5, v);
+
+	// The ROM sends exactly 13 00 58 00 after reset; bit 4 of 0x58 disables
+	// polling and must cancel the pending event before its deadline.
+	wr8(4'h2, 8'h08); wr8(4'h2, 8'h0C);
+	wr8(4'h5, 8'h13); wr8(4'h5, 8'h00);
+	wr8(4'h5, 8'h58); wr8(4'h5, 8'h00);
+	repeat (1000100) @(posedge clk);
+	check(!int_floppy, "ROM CONFIGURE disables the pending reset poll");
+	wr8(4'h8, 8'h20);             // CTRL_RESET, not a reset release
+	repeat (1000100) @(posedge clk);
+	check(!int_floppy, "external controller reset does not arm a poll");
+
+	// In floppy.c an interrupt-producing command replaces the single reset
+	// event.  These commands complete immediately in this RTL, so consuming
+	// their result must also discard the old poll state.
+	wr8(4'h2, 8'h08); wr8(4'h2, 8'h0C);
+	wr8(4'h5, 8'h1F);
+	repeat (2) @(posedge clk);
+	check(int_floppy, "invalid command replaces a pending reset poll");
+	rd8(4'h5, v);
+	repeat (1000100) @(posedge clk);
+	check(!int_floppy, "invalid result leaves no stale reset poll");
+
+	wr8(4'h2, 8'h08); wr8(4'h2, 8'h0C);
+	wr8(4'h5, 8'h4A); wr8(4'h5, 8'h00); // empty drive 0: immediate no-data
+	repeat (2) @(posedge clk);
+	check(int_floppy, "read id replaces a pending reset poll");
+	for (i = 0; i < 7; i = i + 1) rd8(4'h5, v);
+	repeat (1000100) @(posedge clk);
+	check(!int_floppy, "read id result leaves no stale reset poll");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

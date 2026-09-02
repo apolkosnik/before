@@ -276,6 +276,18 @@ task sptr_rd32;
 	end
 endtask
 
+task ini_wr32;
+	input [31:0] v;
+	begin
+		@(posedge clk);
+		sel_ini <= 1; addr <= 6'h00; we <= 1; be <= 2'b11; wdata <= v[31:16];
+		@(posedge clk);
+		addr <= 6'h02; wdata <= v[15:0];
+		@(posedge clk);
+		sel_ini <= 0; we <= 0;
+	end
+endtask
+
 task csr_cmd;
 	input [7:0] v;
 	begin
@@ -342,6 +354,19 @@ task select_atn6;
 	end
 endtask
 
+task select_atn6_target;
+	input [2:0] target;
+	input [7:0] c0, c1, c2, c3, c4, c5;
+	begin
+		esp_wr8(6'h02, 8'h80);
+		esp_wr8(6'h02, c0); esp_wr8(6'h02, c1);
+		esp_wr8(6'h02, c2); esp_wr8(6'h02, c3);
+		esp_wr8(6'h02, c4); esp_wr8(6'h02, c5);
+		esp_wr8(6'h04, {5'd0, target});
+		esp_wr8(6'h03, 8'h42);
+	end
+endtask
+
 task select_atn10;
 	input [7:0] c0, c1, c2, c3, c4, c5, c6, c7, c8, c9;
 	begin
@@ -383,13 +408,28 @@ task ti_dma_in;
 	input [31:0] base;
 	input [31:0] limit;
 	begin
-		ptr_wr32(6'h10, base);       // next
+		ini_wr32(base);              // next and internal-buffer reset
 		ptr_wr32(6'h14, limit);      // limit
-		csr_cmd(8'h11);              // RESET | SETENABLE -> enable
+		csr_cmd(8'h15);              // RESET | DEV2M | SETENABLE
 		esp_wr8(6'h00, n[7:0]);      // transfer count low
 		esp_wr8(6'h01, n[15:8]);     // transfer count high
 		esp_wr8(6'h03, 8'h90);       // transfer info, DMA
 		wait_irq;
+	end
+endtask
+
+// ESPCTRL_FLUSH drains one padded longword per write on an enabled DEV2M
+// channel.  Keep the wait bounded independently of DMA-complete, since a
+// short response normally leaves next below the programmed channel limit.
+task flush_dma_in_words;
+	input integer words;
+	integer fw;
+	begin
+		for (fw = 0; fw < words; fw = fw + 1) begin
+			esp_wr8(6'h20, 8'h34);
+			repeat (12) @(posedge clk);
+		end
+		esp_wr8(6'h20, 8'h30);
 	end
 endtask
 
@@ -412,6 +452,8 @@ reg [7:0] v, sts;
 reg [31:0] d;
 reg [7:0] intr;
 reg ok;
+reg [9:0] fifo_race_pos;
+reg [16:0] fifo_race_count;
 
 initial begin
 	repeat (10) @(posedge clk);
@@ -425,8 +467,467 @@ initial begin
 	img_mounted = 0;
 	repeat (50) @(posedge clk);
 
-	// enable the ESP interrupt at the DMA control register
+	// Enable ESP interrupts and the external memory-DMA path.
+	esp_wr8(6'h20, 8'h30);
+
+	// The four undocumented ESP registers have a fixed readback in the
+	// reference (0x0c is confirmed on hardware), rather than open-bus zero.
+	ok = 1;
+	for (i = 12; i < 16; i = i + 1) begin
+		esp_rd8(i[5:0], v);
+		if (v != 8'h01) ok = 0;
+	end
+	check(ok, "unknown ESP registers 0x0c..0x0f read as one");
+
+	// Both DMA buffer-initialization paths clear the ESP DMA FIFO state and
+	// DMA Init retains the low-nibble offset used by the real 16-byte buffer.
+	esp_wr8(6'h21, 8'hC0);
+	csr_cmd(8'h20);                         // DMA_INITBUF
+	esp_rd8(6'h21, v);
+	check(v == 0, "DMA INITBUF clears the ESP FIFO status");
+	esp_wr8(6'h21, 8'hC0);
+	ini_wr32(BUF);
+	esp_rd8(6'h21, v);
+	check(v == 0, "DMA init-register write clears the ESP FIFO status");
+	ini_wr32(BUF + 32'd4);
+	@(posedge clk);
+	check(dut.dma_buf_fill == 4,
+	      "DMA init-register write seeds the internal-buffer offset");
+	csr_cmd(8'h20);
+	@(posedge clk);
+	check(dut.dma_buf_fill == 0, "DMA INITBUF clears the internal-buffer offset");
+
+	// A two-byte response remains only in the internal DMA buffer.  FLUSH is
+	// a no-op while disabled or in M2DEV, then DEV2M pads it to a longword,
+	// writes it, advances next, and empties the residual buffer.
+	ram[BUF >> 2] = 32'hDEADBEEF;
+	select_atn6(8'h03, 0, 0, 0, 8'd2, 0);
+	wait_irq; read_intr(intr);
+	ini_wr32(BUF);
+	ptr_wr32(6'h14, BUF + 32'd16);
+	csr_cmd(8'h15);
+	esp_wr8(6'h21, 8'h95);
+	esp_wr8(6'h00, 8'd2);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	wait_irq; read_intr(intr);
+	check(dut.d_next == BUF && ram[BUF >> 2] == 32'hDEADBEEF,
+	      "short DMA data in retains bytes until FLUSH");
+	csr_cmd(8'h14);                        // reset/disabled, DEV2M latched
+	esp_wr8(6'h20, 8'h34);
+	repeat (12) @(posedge clk);
+	check(dut.d_next == BUF && dut.dma_buf_fill == 2,
+	      "DMA FLUSH is a no-op while the channel is disabled");
+	csr_cmd(8'h01);                        // enabled, memory-to-device
+	esp_wr8(6'h20, 8'h34);
+	repeat (12) @(posedge clk);
+	check(dut.d_next == BUF && dut.dma_buf_fill == 2,
+	      "DMA FLUSH is a no-op in memory-to-device direction");
+	csr_cmd(8'h05);                        // enabled, device-to-memory
+	flush_dma_in_words(1);
+	esp_rd8(6'h21, v);
+	check(dut.d_next == BUF + 4 && ram[BUF >> 2] == 32'h70000000,
+	      "active DEV2M FLUSH pads, writes, and advances one longword");
+	check(dut.dma_buf_fill == 0 && v == 8'h95,
+	      "active DEV2M FLUSH empties residual bytes without toggling status");
+	finish_command(sts);
+	check(sts == 0, "short flushed data-in probe completes normally");
+	csr_cmd(8'h30);                        // reset and initialize shared DMA
+
+	// FLUSH is a standalone DMA-channel operation even when no ESP transfer
+	// is awaiting a residual drain.  The reference pads an empty buffer to one
+	// zero longword and returns without entering esp_transfer_done().
+	ram[BUF >> 2] = 32'hDEADBEEF;
+	ini_wr32(BUF);
+	ptr_wr32(6'h14, BUF + 32'd16);
+	csr_cmd(8'h15);
+	flush_dma_in_words(1);
+	repeat (150) @(posedge clk);
+	check(dut.d_next == BUF + 4 && ram[BUF >> 2] == 32'h00000000,
+	      "empty active DEV2M FLUSH writes exactly one padded longword");
+	check(!int_scsi && dut.xst == 0,
+	      "empty active DEV2M FLUSH does not start ESP transfer completion");
+	csr_cmd(8'h30);
+
+	// Previous toggles the ESP DMA FIFO state after each complete 16-byte
+	// external-DMA buffer handoff.  Split an aligned 32-byte INQUIRY into
+	// two channel segments.  dma.c's next<=limit loop fills the second
+	// buffer before reporting the first channel completion.
+	for (i = 0; i < 8; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	select_atn6(8'h12, 0, 0, 0, 8'd32, 0);
+	wait_irq; read_intr(intr);
+	ini_wr32(BUF);
+	ptr_wr32(6'h14, BUF + 32'd16);
+	csr_cmd(8'h15);                    // RESET | DEV2M | SETENABLE
+	esp_wr8(6'h21, 8'h15);            // lower status bits must survive
+	esp_wr8(6'h00, 8'd32);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	wait_dma_complete;
+	repeat (150) @(posedge clk);
+	esp_rd8(6'h21, v);
+	check(v == 8'hD5,
+	      "DMA data in: limit equality prefetches the second 16-byte buffer");
+	esp_rd8(6'h00, v);
+	esp_rd8(6'h04, sts);
+	check(v == 0 && sts[4] && sts[2:0] == 3'd3 && int_scsi,
+	      "DMA data in: prefetch consumes the ESP count and reaches status");
+	check(ram_byte(BUF + 8) == "P" && ram_byte(BUF + 15) == "s" &&
+	      ram[(BUF >> 2) + 4] == 32'hDEADBEEF,
+	      "DMA data in: prefetched second buffer is not yet in RAM");
+	ptr_wr32(6'h14, BUF + 32'd32);
+	csr_cmd(8'h0D);                    // DEV2M | clear complete | re-enable
+	@(posedge clk);                    // observe completion low before re-waiting
+	wait_dma_complete;
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h21, v);
+	check(v == 8'h55,
+	      "DMA data in: draining the prefetched buffer selects state 0x40");
+	check(ram_byte(BUF + 16) == "H" && ram_byte(BUF + 17) == "D" &&
+	      ram_byte(BUF + 18) == "D" && ram_byte(BUF + 31) == " ",
+	      "DMA data in: rearm drains retained bytes without re-reading target");
+	csr_cmd(8'h0C);
+	finish_command(sts);
+	check(sts == 0, "DMA FIFO-state data-in probe completes normally");
+
+	// Memory-to-device DMA fills a complete 16-byte internal buffer before
+	// presenting bytes to the target.  A two-byte ESP count must retain the
+	// other fourteen; the next TI consumes bytes 2 and 3 without fetching a
+	// new memory word or skipping ahead.
+	for (i = 0; i < 32; i = i + 1) begin
+		case (i[1:0])
+			0: ram[((BUF2 + i) >> 2)][31:24] = 8'h10 + i[7:0];
+			1: ram[((BUF2 + i) >> 2)][23:16] = 8'h10 + i[7:0];
+			2: ram[((BUF2 + i) >> 2)][15:8]  = 8'h10 + i[7:0];
+			3: ram[((BUF2 + i) >> 2)][7:0]   = 8'h10 + i[7:0];
+		endcase
+	end
+	select_atn6(8'h0A, 0, 0, 0, 8'h01, 0);
+	wait_irq; read_intr(intr);
+	ini_wr32(BUF2);
+	ptr_wr32(6'h14, BUF2 + 32'd16);
+	csr_cmd(8'h11);
+	esp_wr8(6'h00, 8'd2);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	repeat (800) @(posedge clk);
+	check(int_scsi_dma && dut.d_next == BUF2 + 32'd16,
+	      "short DMA data out preloads one complete internal buffer");
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h21, v);
+	check(v == 8'h40, "short DMA data out selects the first buffer state");
+	ptr_wr32(6'h14, BUF2 + 32'd32);
+	csr_cmd(8'h09);
+	esp_wr8(6'h00, 8'd2);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h21, v);
+	check(dut.d_next == BUF2 + 32'd16 && dut.dbuf[0] == 8'h10 &&
+	      dut.dbuf[1] == 8'h11 && dut.dbuf[2] == 8'h12 &&
+	      dut.dbuf[3] == 8'h13,
+	      "next DMA TI drains residual bytes without another memory fetch");
+	check(v == 8'hC0, "residual DMA data out revisits the full buffer state");
+	// Abort this deliberately short WRITE before it reaches the disk image.
+	esp_wr8(6'h03, 8'h03);
+	wait_irq; read_intr(intr);
+	csr_cmd(8'h30);
+
+	// Exercise the memory-to-device direction as well.  The first two
+	// segments expose the transitions; the final segment completes the
+	// ordinary full-sector WRITE without changing its data path.
+	for (i = 0; i < 128; i = i + 1)
+		ram[(BUF2 >> 2) + i] = 32'hA55AC33C;
+	select_atn6(8'h0A, 0, 0, 0, 8'h01, 0);
+	wait_irq; read_intr(intr);
+	ini_wr32(BUF2);
+	ptr_wr32(6'h14, BUF2 + 32'd16);
+	csr_cmd(8'h11);
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h02);
+	esp_wr8(6'h03, 8'h90);
+	wait_dma_complete;
+	esp_rd8(6'h21, v);
+	check(v == 8'h40, "DMA data out: first 16-byte handoff selects state 0x40");
+	ptr_wr32(6'h14, BUF2 + 32'd32);
+	csr_cmd(8'h09);
+	@(posedge clk);
+	wait_dma_complete;
+	esp_rd8(6'h21, v);
+	check(v == 8'hC0, "DMA data out: second 16-byte handoff selects state 0xC0");
+	ptr_wr32(6'h14, BUF2 + 32'd512);
+	csr_cmd(8'h09);
+	wait_irq; read_intr(intr);
+	check(intr == 8'h10, "DMA FIFO-state data-out probe reaches transfer count zero");
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1)
+		if (disk[i] !== ((i[1:0] == 0) ? 8'hA5 :
+		                  (i[1:0] == 1) ? 8'h5A :
+		                  (i[1:0] == 2) ? 8'hC3 : 8'h3C)) ok = 0;
+	check(ok, "DMA FIFO-state data-out probe writes the sector byte exact");
+	csr_cmd(8'h08);
+	finish_command(sts);
+	check(sts == 0, "DMA FIFO-state data-out probe completes normally");
+	for (i = 0; i < 512; i = i + 1) disk[i] = pat(0, i);
+
+	// Command bit 7 loads the ESP counter, but DMA control bit 4 chooses
+	// external memory DMA versus the ESP's own FIFO.  With MODE_DMA clear,
+	// a 16-byte INQUIRY must fill the FIFO and leave RAM untouched.
 	esp_wr8(6'h20, 8'h20);
+	for (i = 0; i < 4; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	select_atn6(8'h12, 0, 0, 0, 8'd16, 0);
+	wait_irq; read_intr(intr);
+	ptr_wr32(6'h10, BUF);
+	ptr_wr32(6'h14, BUF + 16);
+	csr_cmd(8'h11);
+	esp_wr8(6'h21, 8'h2A);
+	esp_wr8(6'h00, 8'd16);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h07, v);
+	check(intr == 8'h10 && v == 8'd16,
+	      "DMA-tagged TI uses the ESP FIFO when MODE_DMA is clear");
+	esp_rd8(6'h21, v);
+	check(v == 8'h2A, "FIFO-routed data in does not toggle DMA FIFO state");
+	check(ram[(BUF >> 2)] == 32'hDEADBEEF &&
+	      ram[(BUF >> 2) + 1] == 32'hDEADBEEF &&
+	      ram[(BUF >> 2) + 2] == 32'hDEADBEEF &&
+	      ram[(BUF >> 2) + 3] == 32'hDEADBEEF,
+	      "FIFO-mode transfer leaves the memory DMA window untouched");
+	ok = 1;
+	for (i = 0; i < 16; i = i + 1) begin
+		esp_rd8(6'h02, v);
+		if ((i == 0 && v != 8'h00) || (i == 8 && v != "P") ||
+		    (i == 15 && v != "s")) ok = 0;
+	end
+	check(ok, "FIFO-mode inquiry returns the target bytes through ESP FIFO");
+	finish_command(sts);
+	check(sts == 0, "FIFO-mode inquiry completes normally");
+
+	// Exercise the other FIFO-DMA direction for a complete disk sector.
+	// Keep a valid memory-DMA descriptor armed as a canary: MODE_DMA is
+	// clear, so every byte must instead be consumed from the ESP FIFO.
+	for (i = 0; i < 128; i = i + 1)
+		ram[(BUF2 >> 2) + i] = 32'hDEADBEEF;
+	select_atn6(8'h0A, 0, 0, 0, 8'h01, 0);
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd0, "FIFO-mode write enters data out phase");
+	ptr_wr32(6'h10, BUF2);
+	ptr_wr32(6'h14, BUF2 + 32'd512);
+	csr_cmd(8'h11);
+	esp_wr8(6'h21, 8'h2B);
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h02);
+	esp_wr8(6'h03, 8'h90);
+	// The target models its initial sector latency before accepting bytes.
+	// Bound that wait, then stream 32 FIFO-sized chunks one byte at a time;
+	// the engine drains between register writes, so no FIFO overflow is used.
+	repeat (400) @(posedge clk);
+	check(dut.gap_us == 0, "FIFO-mode write initial sector delay expires");
+	for (s = 0; s < 32; s = s + 1)
+		for (i = 0; i < 16; i = i + 1)
+			esp_wr8(6'h02, 8'h5A ^ {s[3:0], i[3:0]});
+	wait_irq; read_intr(intr);
+	check(intr == 8'h10,
+	      "FIFO-mode write transfer count zero requests bus service");
+	esp_rd8(6'h21, v);
+	check(v == 8'h2B, "FIFO-routed data out does not toggle DMA FIFO state");
+	ok = 1;
+	for (i = 0; i < 128; i = i + 1)
+		if (ram[(BUF2 >> 2) + i] !== 32'hDEADBEEF) ok = 0;
+	check(ok, "FIFO-mode write leaves the memory DMA window untouched");
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1)
+		if (disk[i] !== (8'h5A ^ i[7:0])) ok = 0;
+	check(ok, "FIFO-mode write streams all 512 bytes to the disk image");
+	finish_command(sts);
+	check(sts == 0, "FIFO-mode write completes normally");
+	for (i = 0; i < 512; i = i + 1) disk[i] = pat(0, i);
+	esp_wr8(6'h20, 8'h30);
+
+	// CPU FIFO accesses and an ESP I/O event can land on the same clock.
+	// The C model serializes those calls; use CPU priority here and require
+	// the engine to retry, rather than allowing two nonblocking helper calls
+	// to update the FIFO from the same stale count.
+	esp_wr8(6'h20, 8'h20);                 // FIFO-routed DMA
+	select_atn6(8'h12, 0, 0, 0, 8'd32, 0);
+	wait_irq; read_intr(intr);
+	esp_wr8(6'h00, 8'd17);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	i = 0;
+	while (dut.fifoflags != 5'd16 && i < 2000) begin
+		@(posedge clk); i = i + 1;
+	end
+	check(dut.fifoflags == 5'd16,
+	      "FIFO collision DI probe fills the controller FIFO");
+	esp_rd8(6'h02, v);                     // make room for byte 16
+	while (dut.xst != 5'd27) @(negedge clk); // X_FDI_GET
+	fifo_race_pos = dut.buf_pos;
+	fifo_race_count = dut.counter;
+	// Align a CPU FIFO read with the engine's attempted push.
+	sel_esp = 1; addr = 6'h02; we = 0; be = 2'b10; wdata = 0;
+	@(posedge clk); #1;
+	check(dut.buf_pos == fifo_race_pos &&
+	      dut.counter == fifo_race_count && dut.fifoflags == 5'd14,
+	      "simultaneous DI push/CPU read gives CPU priority and retries engine");
+	sel_esp = 0; be = 0;
+	repeat (4) @(posedge clk);
+	check(dut.buf_pos == fifo_race_pos + 1'd1 &&
+	      dut.counter == fifo_race_count - 1'd1 && dut.fifoflags == 5'd15,
+	      "deferred DI FIFO push completes once after the CPU read");
+	esp_wr8(6'h03, 8'h02);                 // abort the short probe
+	repeat (8) @(posedge clk);
+
+	select_atn6(8'h0A, 0, 0, 0, 8'h01, 0);
+	wait_irq; read_intr(intr);
+	esp_wr8(6'h02, 8'h31);                 // oldest target byte
+	esp_wr8(6'h00, 8'd1);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	while (!(dut.xst == 5'd28 && dut.gap_us == 0 &&
+	         dut.fifoflags == 1)) @(negedge clk); // X_FDO
+	fifo_race_pos = dut.buf_pos;
+	fifo_race_count = dut.counter;
+	// Align a CPU append with the engine's attempted pop.
+	sel_esp = 1; addr = 6'h02; we = 1; be = 2'b10; wdata = 16'hA200;
+	@(posedge clk); #1;
+	check(dut.buf_pos == fifo_race_pos &&
+	      dut.counter == fifo_race_count && dut.fifoflags == 5'd2,
+	      "simultaneous DO pop/CPU write gives CPU priority and retries engine");
+	sel_esp = 0; we = 0; be = 0;
+	repeat (3) @(posedge clk);
+	check(dut.buf_pos == fifo_race_pos + 1'd1 && dut.counter == 0 &&
+	      dut.fifoflags == 1 && dut.dbuf[fifo_race_pos[8:0]] == 8'h31,
+	      "deferred DO FIFO pop consumes the original oldest byte once");
+	esp_wr8(6'h03, 8'h02);
+	repeat (8) @(posedge clk);
+	csr_cmd(8'h30);
+
+	// MODE_DMA is sampled on each reference I/O event, not latched by TI.
+	// Begin an INQUIRY through the FIFO, then switch to external DMA while
+	// the full FIFO is stalled.  Its queued bytes must reach RAM first.
+	esp_wr8(6'h20, 8'h20);
+	for (i = 0; i < 8; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	select_atn6(8'h12, 0, 0, 0, 8'd32, 0);
+	wait_irq; read_intr(intr);
+	ini_wr32(BUF);
+	ptr_wr32(6'h14, BUF + 32'd32);
+	csr_cmd(8'h15);
+	esp_wr8(6'h00, 8'd32);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	i = 0;
+	while (dut.fifoflags != 5'd16 && i < 2000) begin
+		@(posedge clk); i = i + 1;
+	end
+	check(dut.fifoflags == 5'd16 && dut.counter == 17'd16,
+	      "live MODE_DMA DI probe stalls with sixteen queued bytes");
+	esp_wr8(6'h20, 8'h30);                 // switch route while TI is active
+	i = 0;
+	while (!int_scsi && i < 5000) begin
+		@(posedge clk); i = i + 1;
+	end
+	check(int_scsi && dut.counter == 0 && dut.fifoflags == 0,
+	      "live MODE_DMA switch drains FIFO and completes the active TI");
+	check(ram_byte(BUF) == 8'h00 && ram_byte(BUF + 8) == "P" &&
+	      ram_byte(BUF + 15) == "s" && ram_byte(BUF + 16) == "H" &&
+	      ram_byte(BUF + 31) == " ",
+	      "live MODE_DMA DI preserves FIFO-first target byte order");
+	if (int_scsi) begin
+		read_intr(intr);
+		csr_cmd(8'h0C);
+		finish_command(sts);
+	end
+	else begin
+		esp_wr8(6'h03, 8'h02);
+		repeat (8) @(posedge clk);
+		csr_cmd(8'h30);
+	end
+
+	// Data-out always consumes controller-FIFO bytes before invoking the
+	// external DMA channel, even when MODE_DMA was already set at TI start.
+	ram[(BUF2 >> 2)] = 32'h11121314;
+	ram[(BUF2 >> 2) + 1] = 32'h15161718;
+	ram[(BUF2 >> 2) + 2] = 32'h191A1B1C;
+	ram[(BUF2 >> 2) + 3] = 32'h1D1E1F20;
+	select_atn6(8'h0A, 0, 0, 0, 8'h01, 0);
+	wait_irq; read_intr(intr);
+	esp_wr8(6'h02, 8'hA0); esp_wr8(6'h02, 8'hA1);
+	esp_wr8(6'h02, 8'hA2); esp_wr8(6'h02, 8'hA3);
+	ini_wr32(BUF2);
+	ptr_wr32(6'h14, BUF2 + 32'd16);
+	csr_cmd(8'h11);
+	esp_wr8(6'h00, 8'd8);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	i = 0;
+	while (!int_scsi && i < 5000) begin
+		@(posedge clk); i = i + 1;
+	end
+	check(int_scsi && dut.counter == 0 && dut.fifoflags == 0,
+	      "external data-out drains the controller FIFO before RAM");
+	check(dut.dbuf[0] == 8'hA0 && dut.dbuf[1] == 8'hA1 &&
+	      dut.dbuf[2] == 8'hA2 && dut.dbuf[3] == 8'hA3 &&
+	      dut.dbuf[4] == 8'h11 && dut.dbuf[5] == 8'h12 &&
+	      dut.dbuf[6] == 8'h13 && dut.dbuf[7] == 8'h14,
+	      "external data-out target stream is FIFO bytes followed by RAM bytes");
+	if (int_scsi) read_intr(intr);
+	esp_wr8(6'h03, 8'h02);                 // abort before sector commit
+	repeat (8) @(posedge clk);
+	csr_cmd(8'h30);
+
+	// The command register is dual ranked.  TI remains active; the first
+	// queued NOP is overwritten by ICCS, setting GE.  Acknowledging TI's
+	// interrupt must then launch the newest pending command.
+	esp_wr8(6'h20, 8'h30);
+	select_atn6(8'h12, 0, 0, 0, 8'd16, 0);
+	wait_irq; read_intr(intr);
+	ini_wr32(BUF);
+	ptr_wr32(6'h14, BUF + 32'd16);
+	csr_cmd(8'h15);
+	esp_wr8(6'h00, 8'd16);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);                 // active, delayed by gap_us
+	esp_wr8(6'h03, 8'h00);                 // first pending command
+	esp_wr8(6'h03, 8'h11);                 // replace pending and set GE
+	wait_irq;
+	esp_rd8(6'h04, v);
+	check(v[7] && v[6], "third ESP command overwrites pending rank and sets GE");
+	esp_rd8(6'h03, v);
+	check(v == 8'h90, "queued commands do not replace the active command rank");
+	read_intr(intr);
+	check(intr == 8'h10, "delayed DMA TI completes before its queued command");
+	if (intr == 8'h10) begin
+		// Let the interrupt-read side effects settle before waiting for the
+		// newly promoted ICCS command; otherwise int_scsi is still the old
+		// asserted value in this NBA slot.
+		@(negedge clk);
+		wait_irq; read_intr(intr);
+		check(intr == 8'h08,
+		      "interrupt acknowledge launches replacement pending ICCS");
+		esp_rd8(6'h02, sts);
+		esp_rd8(6'h02, v);
+		check(sts == 0 && v == 0,
+		      "queued ICCS returns target status and command-complete message");
+		esp_wr8(6'h03, 8'h12);
+		wait_irq; read_intr(intr);
+	end
+	else begin
+		esp_wr8(6'h03, 8'h02);
+		repeat (8) @(posedge clk);
+	end
+	csr_cmd(8'h30);
+
+	// Illegal commands clear the readable active rank immediately, while
+	// retaining the delayed illegal-command interrupt for software to ack.
+	esp_wr8(6'h03, 8'h7F);
+	esp_rd8(6'h03, v);
+	check(v == 0, "illegal ESP opcode clears command register zero");
+	wait_irq; read_intr(intr);
+	check(intr == 8'h40, "illegal ESP opcode reports INTR_ILL");
 
 	//------------------------------------------------------------
 	// TEST UNIT READY
@@ -435,8 +936,16 @@ initial begin
 	wait_irq;
 	read_intr(intr);
 	check(intr == 8'h18, "select: bus service and function complete");
+	esp_rd8(6'h03, v);
+	check(v == 8'h00, "select completion clears the ESP command register");
 	esp_rd8(6'h04, v);
 	check(v[2:0] == 3'd3, "test unit ready: status phase");
+	// esp_transfer_info() schedules an interrupt even for the reference's
+	// otherwise-unimplemented PIO transfer in status phase.
+	esp_wr8(6'h03, 8'h10);
+	repeat (100) @(posedge clk);
+	check(int_scsi, "PIO transfer information in status phase interrupts");
+	if (int_scsi) read_intr(intr);
 	finish_command(sts);
 	check(sts == 8'h00, "test unit ready: good status");
 
@@ -448,18 +957,79 @@ initial begin
 	read_intr(intr);
 	esp_rd8(6'h04, v);
 	check(v[2:0] == 3'd1, "inquiry: data in phase");
+	for (i = 0; i < 16; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
 	ti_dma_in(17'd54, BUF, BUF + 32'd64);
 	read_intr(intr);
-	check(intr == 8'h08, "inquiry: transfer function complete");
+	check(intr == 8'h10, "inquiry: transfer count zero requests bus service");
 	esp_rd8(6'h04, v);
 	check(v[4], "inquiry: transfer count zero");
+	check(v[2:0] == 3'd3, "inquiry: final data byte advances to status phase");
+	check(dut.d_next == BUF + 32'd48 &&
+	      ram[(BUF >> 2) + 12] == 32'hDEADBEEF,
+	      "inquiry: DMA retains the final six bytes at the 48-byte boundary");
+	flush_dma_in_words(1);
+	check(dut.d_next == BUF + 32'd52 &&
+	      ram[(BUF >> 2) + 12] == 32'h00000000 &&
+	      ram[(BUF >> 2) + 13] == 32'hDEADBEEF,
+	      "inquiry: first FLUSH drains four retained bytes");
+	flush_dma_in_words(1);
+	check(dut.d_next == BUF + 32'd56 &&
+	      ram[(BUF >> 2) + 13] == 32'h00000000 &&
+	      ram[(BUF >> 2) + 14] == 32'hDEADBEEF,
+	      "inquiry: second FLUSH pads the final two bytes and stops at 56");
 	check(ram_byte(BUF+8)  == "P" && ram_byte(BUF+9)  == "r" &&
 	      ram_byte(BUF+15) == "s", "inquiry: vendor Previous");
 	check(ram_byte(BUF+16) == "H" && ram_byte(BUF+17) == "D",
 	      "inquiry: model HDD");
-	check(ram_byte(BUF+53) == " ", "inquiry: byte 53 written");
+	check(ram_byte(BUF+3) == 8'h01 && ram_byte(BUF+32) == "B" &&
+	      ram_byte(BUF+53) == 8'h00,
+	      "inquiry: SCSI-1 format and reference revision bytes");
 	finish_command(sts);
 	check(sts == 8'h00, "inquiry: good status");
+
+	//------------------------------------------------------------
+	// MODE SENSE parity with the reference disk pages
+	//------------------------------------------------------------
+	select_atn6(8'h1A, 8'h08, 8'h03, 8'h00, 8'd28, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd28, BUF, BUF + 32'd32); read_intr(intr);
+	flush_dma_in_words(3);
+	check(ram_byte(BUF) == 8'd27 && ram_byte(BUF+3) == 8,
+	      "mode sense: DBD header matches reference");
+	check(ram_byte(BUF+4) == 8'h03 && ram_byte(BUF+5) == 8'h16 &&
+	      ram_byte(BUF+15) == 8'd32 && ram_byte(BUF+16) == 8'h02 &&
+	      ram_byte(BUF+24) == 8'h80,
+	      "mode sense: format-device page matches reference");
+	finish_command(sts);
+	check(sts == 8'h00, "mode sense: page 3 good status");
+	select_atn6(8'h1A, 8'h08, 8'h04, 8'h00, 8'd24, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd24, BUF, BUF + 32'd32); read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF+6) == 0 && ram_byte(BUF+7) == 0 &&
+	      ram_byte(BUF+8) == 1 && ram_byte(BUF+9) == 4,
+	      "mode sense: reference 4-head, 32-sector HDD geometry");
+	finish_command(sts);
+
+	select_atn6(8'h1A, 8'h00, 8'h40, 8'h00, 8'd64, 8'h00);
+	wait_irq; read_intr(intr); finish_command(sts);
+	check(sts == 8'h02, "mode sense: changeable values rejected");
+
+	select_atn6(8'h1A, 8'h00, 8'hC0, 8'h00, 8'd64, 8'h00);
+	wait_irq; read_intr(intr); finish_command(sts);
+	check(sts == 8'h02, "mode sense: saved values rejected");
+	select_atn6(8'h03, 0, 0, 0, 0, 0); // allocation zero means four bytes
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd4, BUF, BUF + 32'd16); read_intr(intr);
+	flush_dma_in_words(1);
+	check(ram_byte(BUF+2) == 8'h05,
+	      "request sense: saved-values error has illegal-request key");
+	finish_command(sts);
+	check(sts == 8'h00, "request sense: zero allocation returns four bytes");
+
+	select_atn6(8'h07, 0, 0, 0, 0, 0);
+	wait_irq; read_intr(intr); finish_command(sts);
+	check(sts == 8'h00, "reassign blocks: accepted as reference no-op");
 
 	//------------------------------------------------------------
 	// READ CAPACITY
@@ -469,6 +1039,7 @@ initial begin
 	read_intr(intr);
 	ti_dma_in(17'd8, BUF, BUF + 32'd16);
 	read_intr(intr);
+	flush_dma_in_words(2);
 	check(ram_byte(BUF+0) == 8'h00 && ram_byte(BUF+1) == 8'h00 &&
 	      ram_byte(BUF+2) == 8'h00 && ram_byte(BUF+3) == 8'd7,
 	      "read capacity: last lba 7");
@@ -486,7 +1057,9 @@ initial begin
 	check(v[2:0] == 3'd1, "read: data in phase");
 	ti_dma_in(17'd1024, BUF, BUF + 32'd1024);
 	read_intr(intr);
-	check(intr == 8'h08, "read: function complete");
+	check(intr == 8'h10, "read: transfer count zero requests bus service");
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3, "read: final data byte advances to status phase");
 	check(int_scsi_dma, "read: dma channel complete interrupt");
 	csr_cmd(8'h08);              // CLRCOMPLETE
 	@(posedge clk);
@@ -522,7 +1095,7 @@ initial begin
 	esp_wr8(6'h03, 8'h90);       // transfer info, DMA
 	wait_irq;
 	read_intr(intr);
-	check(intr == 8'h08, "write: function complete");
+	check(intr == 8'h10, "write: transfer count zero requests bus service");
 	ok = 1;
 	for (i = 0; i < 512; i = i + 1)
 		if (disk[5*512 + i] !== (~pat(5, i) & 8'hFF)) ok = 0;
@@ -549,28 +1122,28 @@ initial begin
 	ptr_wr32(6'h14, 32'h00002200);
 	ptr_wr32(6'h18, 32'h00002400);           // segment B armed in start/stop
 	ptr_wr32(6'h1C, 32'h00002600);
-	csr_cmd(8'h13);                          // SETENABLE | SETSUPDATE
+	csr_cmd(8'h17);                          // DEV2M | SETENABLE | SETSUPDATE
 	esp_wr8(6'h00, 8'h00);
 	esp_wr8(6'h01, 8'h08);                   // 2048 bytes
 	esp_wr8(6'h03, 8'h90);                   // transfer info, DMA
 
 	// driver interrupt service: two more segments then let it finish
 	wait_dma_complete;
-	csr_cmd(8'h08);                          // CLRCOMPLETE
+	csr_cmd(8'h0C);                          // DEV2M | CLRCOMPLETE
 	ptr_wr32(6'h18, 32'h00002800);           // segment C
 	ptr_wr32(6'h1C, 32'h00002A00);
-	csr_cmd(8'h02);                          // SETSUPDATE
+	csr_cmd(8'h06);                          // DEV2M | SETSUPDATE
 	wait_dma_complete;
-	csr_cmd(8'h08);
+	csr_cmd(8'h0C);
 	ptr_wr32(6'h18, 32'h00002C00);           // segment D
 	ptr_wr32(6'h1C, 32'h00002E00);
-	csr_cmd(8'h02);
+	csr_cmd(8'h06);
 	wait_dma_complete;
-	csr_cmd(8'h08);
+	csr_cmd(8'h0C);
 
 	wait_irq;                                // ESP: counter reached zero
 	read_intr(intr);
-	check(intr == 8'h08, "chained read: function complete");
+	check(intr == 8'h10, "chained read: transfer count zero requests bus service");
 	ok = 1;
 	for (i = 0; i < 512; i = i + 1) begin
 		if (ram_byte(32'h00002000 + i) != pat(2, i)) ok = 0;
@@ -644,7 +1217,7 @@ initial begin
 
 	wait_irq;
 	read_intr(intr);
-	check(intr == 8'h08, "chained write: function complete");
+	check(intr == 8'h10, "chained write: transfer count zero requests bus service");
 
 	ok = 1;
 	for (s = 0; s < 4; s = s + 1)
@@ -665,6 +1238,19 @@ initial begin
 	check(ok, "chained write: neighbouring blocks untouched");
 	finish_command(sts);
 	check(sts == 8'h00, "chained write: good status");
+
+	// Unlike the six-byte commands, a zero transfer length in READ(10)
+	// or WRITE(10) really means zero.  It is a successful no-op and must
+	// not enter a data phase or touch the disk.
+	select_atn10(8'h2A, 8'h00, 8'h00, 8'h00, 8'h00, 8'd2,
+	             8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq;
+	read_intr(intr);
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3 && !sd_wr,
+	      "zero-length write(10): status phase with no disk transfer");
+	finish_command(sts);
+	check(sts == 8'h00, "zero-length write(10): good status");
 
 	//------------------------------------------------------------
 	// selection timeout on target 1 (no disk there)
@@ -700,6 +1286,7 @@ initial begin
 	read_intr(intr);
 	ti_dma_in(17'd22, BUF, BUF + 32'd32);
 	read_intr(intr);
+	flush_dma_in_words(2);
 	check(ram_byte(BUF+0) == 8'hF0, "request sense: valid, format 0x70");
 	check(ram_byte(BUF+2) == 8'h05, "request sense: illegal request key");
 	check(ram_byte(BUF+12) == 8'h21, "request sense: invalid lba code");
@@ -708,6 +1295,24 @@ initial begin
 	      "request sense: info holds the failed lba");
 	finish_command(sts);
 	check(sts == 8'h00, "request sense: good status");
+
+	// Establish a stale CHECK CONDITION, then prove a zero-length READ(10)
+	// replaces it with GOOD/no-sense just like any successful read command.
+	select_atn6(8'h08, 8'h00, 8'h00, 8'h20, 8'h01, 8'h00);
+	wait_irq;
+	read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "zero-length read setup: stale check condition exists");
+	select_atn10(8'h28, 8'h00, 8'h00, 8'h00, 8'h00, 8'h20,
+	             8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq;
+	read_intr(intr);
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3 && !sd_rd,
+	      "zero-length read(10): status phase with no disk transfer");
+	finish_command(sts);
+	check(sts == 8'h00 && dut.sense_code[0] == 8'h00 && !dut.sense_valid[0],
+	      "zero-length read(10): clears stale status and sense");
 
 	// saved registers: plain storage the driver can use for residual
 	// bookkeeping (dropping the write was worth a kernel panic)
@@ -750,7 +1355,7 @@ initial begin
 
 	wait_irq;
 	read_intr(intr);
-	check(intr == 8'h08, "shared channel: the disk command still completes");
+	check(intr == 8'h10, "shared channel: disk completion requests bus service");
 	scsi_busy = 0;
 
 	// The hand-over is only allowed at an idle moment, and a SCSI
@@ -787,6 +1392,8 @@ initial begin
 		i = i + 1;
 	end
 	check(flp_done, "shared channel: the floppy is served once the disk is done");
+	check(int_scsi_dma,
+	      "shared channel: exact floppy limit raises DMA completion");
 	ok = 1;
 	for (i = 0; i < 512; i = i + 1)
 		if (ram_byte(32'h00005000 + i) !== (8'hA5 ^ i[7:0])) ok = 0;
@@ -834,6 +1441,156 @@ initial begin
 	check(ok, "target 1: the block comes from the second image");
 	finish_command(sts);
 	check(sts == 8'h00, "target 1: good status");
+
+	//------------------------------------------------------------
+	// Sense belongs to the target. An error on target 1 must not
+	// overwrite an invalid-LBA sense retained by target 0.
+	//------------------------------------------------------------
+	select_atn6_target(3'd0, 8'h08, 0, 0, 8'h20, 8'h01, 0);
+	wait_irq; read_intr(intr); finish_command(sts);
+	check(sts == 8'h02, "per-target sense: target 0 records invalid LBA");
+	select_atn6_target(3'd1, 8'hFF, 0, 0, 0, 0, 0);
+	wait_irq; read_intr(intr); finish_command(sts);
+	check(sts == 8'h02, "per-target sense: target 1 reports its own error");
+	select_atn6_target(3'd0, 8'h03, 0, 0, 0, 8'd22, 0);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd22, BUF, BUF + 32'd32); read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF+12) == 8'h21 && ram_byte(BUF+6) == 8'h20,
+	      "per-target sense: target 0 invalid LBA survives target 1 command");
+	finish_command(sts);
+
+	// Replacement media starts with fresh status and sense state.  An
+	// error retained from the previous image must not be attributed to
+	// the newly inserted disk.
+	img_size = DISK_BLOCKS*512;
+	img_mounted = 1;
+	@(posedge clk);
+	img_mounted = 0;
+	repeat (400) @(posedge clk);
+	select_atn6_target(3'd0, 8'h03, 0, 0, 0, 8'd22, 0);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd22, BUF, BUF + 32'd32); read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF+0) == 8'h70 && ram_byte(BUF+2) == 8'h00 &&
+	      ram_byte(BUF+12) == 8'h00,
+	      "media replacement: clears the previous image's retained sense");
+	finish_command(sts);
+
+	//------------------------------------------------------------
+	// A programmed-I/O READ must return the currently addressed byte and
+	// enter status phase as the final disk byte is delivered, just as
+	// SCSIdisk_Send_Data() does.
+	//------------------------------------------------------------
+	select_atn6_target(3'd0, 8'h08, 0, 0, 8'h02, 8'h01, 0);
+	wait_irq; read_intr(intr);
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1) begin
+		esp_wr8(6'h03, 8'h10);       // transfer information, PIO
+		wait_irq; read_intr(intr);
+		esp_rd8(6'h02, v);
+		if (v !== pat(2, i)) begin
+			if (ok) $display("  first PIO mismatch byte %0d got %02x want %02x",
+			                 i, v, pat(2, i));
+			ok = 0;
+		end
+	end
+	check(ok, "pio read: all 512 bytes match the disk image");
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3,
+	      "pio read: final disk byte advances directly to status phase");
+	finish_command(sts);
+	check(sts == 8'h00, "pio read: good status");
+
+	// Two-sector PIO read: the first boundary must refill and remain in
+	// data-in; only the second boundary may advance to status.
+	select_atn6_target(3'd0, 8'h08, 0, 0, 8'h02, 8'h02, 0);
+	wait_irq; read_intr(intr);
+	ok = 1;
+	for (i = 0; i < 1024; i = i + 1) begin
+		esp_wr8(6'h03, 8'h10);
+		wait_irq; read_intr(intr);
+		esp_rd8(6'h02, v);
+		if (v !== pat(2 + i/512, i % 512)) ok = 0;
+		if (i == 511) begin
+			esp_rd8(6'h04, v);
+			check(v[2:0] == 3'd1,
+			      "multi-sector pio: first boundary remains data-in");
+		end
+	end
+	check(ok, "multi-sector pio: both sectors are byte exact");
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3,
+	      "multi-sector pio: final boundary advances to status");
+	finish_command(sts);
+	check(sts == 8'h00, "multi-sector pio: good status");
+
+	// The reference checks the following block while delivering the
+	// current sector's final byte.  Crossing the image end must therefore
+	// finish with CHECK CONDITION without one extra PIO command.
+	select_atn6_target(3'd0, 8'h08, 0, 0, 8'h07, 8'h02, 0);
+	wait_irq; read_intr(intr);
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1) begin
+		esp_wr8(6'h03, 8'h10);
+		wait_irq; read_intr(intr);
+		esp_rd8(6'h02, v);
+		if (v !== pat(7, i)) ok = 0;
+	end
+	check(ok, "pio end crossing: final valid sector is byte exact");
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3,
+	      "pio end crossing: last valid byte discovers invalid next LBA");
+	finish_command(sts);
+	check(sts == 8'h02 && dut.sense_code[0] == 8'h21 &&
+	      dut.sense_valid[0] && dut.sense_info[0] == 8,
+	      "pio end crossing: check condition identifies LBA 8");
+
+	// A transfer-count boundary exactly at byte 512 must not hide the
+	// target's synchronous attempt to refill the requested second block.
+	for (i = 0; i < 256; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	select_atn6_target(3'd0, 8'h08, 0, 0, 8'h07, 8'h02, 0);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd512, BUF, BUF + 32'd512);
+	read_intr(intr);
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1)
+		if (ram_byte(BUF + i) !== pat(7, i)) ok = 0;
+	check(ok, "dma end crossing: final valid sector is byte exact");
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3,
+	      "dma end crossing: 512-byte TI discovers invalid next LBA");
+	finish_command(sts);
+	check(sts == 8'h02 && dut.sense_code[0] == 8'h21 &&
+	      dut.sense_valid[0] && dut.sense_info[0] == 8,
+	      "dma end crossing: check condition identifies LBA 8");
+
+	// esp_message_accepted() disconnects the target after the command-
+	// complete message: INTR_DC is reported and the reference leaves its
+	// disconnected bus phase at PHASE_DO.
+	select_atn6(8'h00, 0, 0, 0, 0, 0);
+	wait_irq; read_intr(intr);
+	esp_wr8(6'h03, 8'h11);       // initiator command complete
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h02, sts);
+	esp_rd8(6'h02, v);           // command-complete message
+	esp_wr8(6'h03, 8'h12);       // message accepted
+	wait_irq; read_intr(intr);
+	check(intr == 8'h20,
+	      "message accepted: reports disconnect interrupt");
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd0,
+	      "message accepted: leaves the reference disconnected phase");
+
+	// A SCSI bus reset reports reset-detected and leaves the disconnected
+	// phase at data-out in esp_bus_reset().
+	esp_wr8(6'h03, 8'h03);
+	esp_rd8(6'h03, v);
+	check(v == 0, "SCSI bus reset immediately clears command register zero");
+	wait_irq; read_intr(intr);
+	check(intr == 8'h80, "SCSI bus reset reports reset detected");
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd0, "SCSI bus reset leaves the data-out phase");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

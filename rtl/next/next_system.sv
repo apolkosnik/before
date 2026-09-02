@@ -729,6 +729,7 @@ next_mo #(.CLK_HZ(CLK_HZ)) mo
 	.m_ack(mo_m_ack),
 	.int_disk(int_disk),
 	.int_disk_dma(int_disk_dma),
+	.mo_gpo(),
 	.img_mounted(oimg_mounted),
 	.img_readonly(oimg_readonly),
 	.img_size(oimg_size),
@@ -790,6 +791,8 @@ next_floppy #(.CLK_HZ(CLK_HZ)) floppy
 	.rdata(flp_rdata),
 	.int_floppy(int_floppy),
 	.flp_select(flp_select),
+	// This system is the Cube040.  Previous routes the OSP GPO to the
+	// shared floppy/SCSI DMA select only on a Cube030.
 	.mo_gpo(1'b0),
 	.buf_addr(flp_addr),
 	.buf_we(flp_bwe),
