@@ -508,28 +508,32 @@ longint run_cycles;
 reg     halt_run = 0;
 reg     stop_at_kernel = 0;
 reg     saw_kernel = 0;
+reg [31:0] kernel_entry = 32'h040002cc; // LC_UNIXTHREAD PC in NeXTSTEP 3.3 /sdmach
 integer typew_delay_mc = 0;
 integer typesd_delay_mc = 0;
 
-initial stop_at_kernel = $test$plusargs("stopkernel");
+initial begin
+	stop_at_kernel = $test$plusargs("stopkernel");
+	if ($value$plusargs("kernelentry=%h", kernel_entry)) ;
+end
 
 //----------------------------------------------------------------------------
-// Resident-kernel-text write watch.
+// Optional physical-memory write watch.
 //
-// The 2026-09-04 MiSTer post-mortem found the running kernel's text at guest
-// physical 0x04014740..0x0401aa4f overwritten with kernel-pointer data and a
-// large zero fill (not disk sectors), which sent execution to 0x3c014d9c
-// (0x04014d9c with bits 27-29 set) and panicked in the MMU table walk.  Kernel
-// text is never written by correct software once the image is running, so any
-// write into the guard window AFTER the kernel takes control names the faulty
-// master and address directly - which a post-mortem cannot.
+// The former default 0x04014740..0x0401aa4f is the kernel's reclaimed
+// initialization text: _init_TEXT_BEGIN.._init_TEXT_END.  Writes there are
+// legitimate after initialization.  Also, executing from RAM first enters
+// the disk bootloader, which must finish loading /sdmach before this arms.
+// An explicitly selected window is a diagnostic watch, not by itself proof
+// of corruption.  See docs/PANIC_AUDIT.md for the symbol/disassembly evidence.
 //
-//   +guardlo=<hex byte>  window start (default 0x04014740)
-//   +guardhi=<hex byte>  window end,  inclusive (default 0x0401aa4f)
+//   +guardlo=<hex byte>  window start (required to enable the watch)
+//   +guardhi=<hex byte>  window end, inclusive (required)
 //   +guardhalt           stop the run on the first hit (freeze for inspection)
 //----------------------------------------------------------------------------
-reg [31:0] guard_lo = 32'h04014740;
-reg [31:0] guard_hi = 32'h0401aa4f;
+reg [31:0] guard_lo = 32'hffffffff;
+reg [31:0] guard_hi = 32'h00000000;
+reg        guard_enable = 0;
 reg        guard_halt = 0;
 reg        guard_armed = 0;         // set once the kernel is executing
 integer    guard_hits = 0;
@@ -548,29 +552,38 @@ reg [31:0] cwr_data [0:63];
 reg [31:0] cwr_pc   [0:63];
 
 initial begin
-	if ($value$plusargs("guardlo=%h", guard_lo)) ;
-	if ($value$plusargs("guardhi=%h", guard_hi)) ;
+	integer have_lo, have_hi;
+	have_lo = $value$plusargs("guardlo=%h", guard_lo);
+	have_hi = $value$plusargs("guardhi=%h", guard_hi);
 	guard_halt = $test$plusargs("guardhalt");
+	if ((have_lo != 0) != (have_hi != 0) ||
+	    (guard_halt && !have_lo) || (have_lo && guard_lo > guard_hi))
+		$fatal(1, "write watch needs +guardlo and +guardhi defining an ordered window");
+	guard_enable = have_lo && have_hi;
 end
 
 // Arm only once the kernel is running: the ROM's SCSI load legitimately fills
 // this text during boot, so the window is fair game until control transfers.
 always @(posedge clk) if (!reset && saw_kernel) guard_armed <= 1;
 
-// Panic detector: a fetch outside every region this machine can execute from
-// (ROM 0x00-0x01, RAM 0x04-0x07, RAM mirrors 0x10-0x1F) is the wild jump that
-// the hardware panic showed (pc=0x3c014d9c).  Latch and optionally halt.
+// Match the reported panic PC.  dbg_pc is VIRTUAL: comparing it against the
+// physical RAM/ROM map wrongly diagnoses valid user mappings as wild jumps.
 reg        wildpc_seen = 0;
 reg [31:0] wildpc_val = 0;
 reg        wildpc_halt = 0;
-initial wildpc_halt = $test$plusargs("wildhalt");
-wire wild_pc = !( dbg_pc < 32'h02000000 ||
-                 (dbg_pc >= 32'h04000000 && dbg_pc < 32'h08000000) ||
-                 (dbg_pc >= 32'h10000000 && dbg_pc < 32'h20000000) );
-always @(posedge clk) if (!reset && guard_armed && wild_pc && !wildpc_seen) begin
+reg [31:0] wildpc_target = 32'h3c014d9c;
+reg panic_trace = 0;
+initial begin
+	wildpc_halt = $test$plusargs("wildhalt");
+	panic_trace = $test$plusargs("panictrace");
+	if ($value$plusargs("wildpc=%h", wildpc_target)) ;
+end
+wire wild_pc = dbg_pc == wildpc_target && dut.cpu.core.sr[13];
+always @(posedge clk) if (!reset && saw_kernel && wild_pc && !wildpc_seen) begin
 	wildpc_seen <= 1;
 	wildpc_val  <= dbg_pc;
-	$display("[%0t] WILDPC: kernel fetch from unmapped %08x (panic jump)", $time, dbg_pc);
+	$display("[%0t] WILDPC: supervisor PC reached panic target %08x", $time, dbg_pc);
+	dump_panic_trace;
 	if (wildpc_halt) halt_run <= 1;
 end
 
@@ -595,7 +608,7 @@ always @(posedge clk) if (!reset && guard_armed) begin : guard_watch
 			cwr_pc[cwr_n % 64]   <= dbg_pc;
 			cwr_n = cwr_n + 1;
 		end
-		if (gaddr >= guard_lo && gaddr <= guard_hi) begin
+		if (guard_enable && gaddr >= guard_lo && gaddr <= guard_hi) begin
 			if (guard_hits < 32) begin
 				guard_addr[guard_hits] <= gaddr;
 				guard_data[guard_hits] <= dut.ram_din;
@@ -604,7 +617,7 @@ always @(posedge clk) if (!reset && guard_armed) begin : guard_watch
 				guard_va[guard_hits]   <= dut.cpu.mmu_addr_log;
 				guard_pa[guard_hits]   <= dut.cpu.mmu_addr_phys;
 			end
-			$display("[%0t] GUARD: write into resident kernel text addr=%08x data=%08x master=%0d pc=%08x va=%08x pa=%08x",
+			$display("[%0t] GUARD: watched write addr=%08x data=%08x master=%0d pc=%08x va=%08x pa=%08x",
 			         $time, gaddr, dut.ram_din, who, dbg_pc,
 			         dut.cpu.mmu_addr_log, dut.cpu.mmu_addr_phys);
 			guard_hits = guard_hits + 1;
@@ -612,6 +625,41 @@ always @(posedge clk) if (!reset && guard_armed) begin : guard_watch
 		end
 	end
 end
+
+// Include cache hits and bypassed reads: the bus-only history misses a stale
+// cached return address.  Record what the CPU consumed before the bad jump.
+reg [31:0] ptr_pc [0:63], ptr_va [0:63], ptr_pa [0:63], ptr_data [0:63];
+reg [15:0] ptr_ir [0:63];
+reg [7:0] ptr_state [0:63];
+reg [3:0] ptr_kind [0:63]; // write, instruction, size[1:0]
+integer ptr_n = 0;
+always @(posedge clk) if (!reset && panic_trace && saw_kernel && !wildpc_seen &&
+                         dut.clkena && dut.cpu.mem_req && dut.cpu.mem_ack) begin
+	ptr_pc[ptr_n % 64] <= dut.cpu.core.pc_i;
+	ptr_ir[ptr_n % 64] <= dut.cpu.core.ir;
+	ptr_state[ptr_n % 64] <= dut.cpu.core.state;
+	ptr_va[ptr_n % 64] <= dut.cpu.mem_addr;
+	ptr_pa[ptr_n % 64] <= dut.cpu.mmu_addr_phys;
+	ptr_data[ptr_n % 64] <= dut.cpu.mem_write ? dut.cpu.mem_wdata : dut.cpu.mem_rdata;
+	ptr_kind[ptr_n % 64] <= {dut.cpu.mem_write, dut.cpu.mem_instr, dut.cpu.mem_size};
+	ptr_n <= ptr_n + 1;
+end
+
+task dump_panic_trace;
+	integer i, base;
+	begin
+		$display("CPU: pc_i=%08x ir=%04x state=%0d sr=%04x sp=%08x rte_pc=%08x",
+		         dut.cpu.core.pc_i, dut.cpu.core.ir, dut.cpu.core.state,
+		         dut.cpu.core.sr, dut.cpu.core.dbg_a7, dut.cpu.core.rte_pc);
+		base = ptr_n > 64 ? ptr_n - 64 : 0;
+		$display("--- last %0d CPU completions (enable with +panictrace) ---", ptr_n - base);
+		for (i = base; i < ptr_n; i = i + 1)
+			$display("pc=%08x ir=%04x state=%0d %s instr=%b size=%0d va=%08x pa=%08x data=%08x",
+			         ptr_pc[i % 64], ptr_ir[i % 64], ptr_state[i % 64],
+			         ptr_kind[i % 64][3] ? "WR" : "RD", ptr_kind[i % 64][2],
+			         ptr_kind[i % 64][1:0], ptr_va[i % 64], ptr_pa[i % 64], ptr_data[i % 64]);
+	end
+endtask
 
 task key_event;
 	input make;
@@ -672,10 +720,10 @@ initial begin
 	end
 end
 
-// A real NeXTSTEP image leaves the ROM at 0x01xxxxxx and begins executing
-// the loaded kernel at 0x04xxxxxx.  This is the decisive end condition for
-// the disk-boot regression and avoids simulating an arbitrary time beyond it.
-always @(posedge clk) if (!reset && bootsd && dbg_pc[31:24] == 8'h04) begin
+// The disk bootloader also executes at 0x04xxxxxx (e.g. 0x04381930).
+// Only the kernel's actual entry point establishes a completed kernel load.
+always @(posedge clk) if (!reset && bootsd && dbg_pc == kernel_entry && !saw_kernel) begin
+	$display("[%0t] BOOT: kernel entry %08x", $time, kernel_entry);
 	saw_kernel <= 1;
 	if (stop_at_kernel) halt_run <= 1;
 end
@@ -978,9 +1026,11 @@ always @(posedge clk) if (!reset) begin
 		                                          : "(MISMATCH: walker read != memory)");
 		$display("    srp=%08x urp=%08x tc=%08x",
 		         dut.cpu.mmu.srp, dut.cpu.mmu.urp, dut.cpu.mmu.tc);
-		if (dut.cpu.mmu.w_la[31:24] == 8'h3c) begin
+		if (dut.cpu.mmu.w_la == wildpc_target && dut.cpu.mmu.w_super && dut.cpu.mmu.f_bank) begin
 			dump_walk_ring;
+			dump_panic_trace;
 			$display("[%0t] BOOT: the panic fault reproduced", $time);
+			errors = errors + 1;
 			fb_dump;
 			halt_run <= 1;
 		end
@@ -1107,10 +1157,10 @@ initial begin
 		      "a stale mailbox injects no frames into the guest");
 	end
 
-	if (saw_kernel) begin : guard_report
+	if (saw_kernel && guard_enable) begin : guard_report
 		integer gg;
 		reg [8*6:1] mname;
-		$display("=== resident kernel text guard %08x..%08x: %0d write(s) after handoff ===",
+		$display("=== physical write watch %08x..%08x: %0d write(s) after kernel entry ===",
 		         guard_lo, guard_hi, guard_hits);
 		for (gg = 0; gg < guard_hits && gg < 32; gg = gg + 1) begin
 			case (guard_who[gg])
@@ -1132,8 +1182,7 @@ initial begin
 				$display("    va=%08x -> pa=%08x data=%08x pc=%08x",
 				         cwr_va[q % 64], cwr_pa[q % 64], cwr_data[q % 64], cwr_pc[q % 64]);
 		end
-		check(guard_hits == 0,
-		      "no master writes into resident kernel text after the kernel runs");
+		check(guard_hits == 0, "no writes to the explicitly watched window after kernel entry");
 	end
 
 
@@ -1145,6 +1194,7 @@ initial begin
 
 	if (bootsd) begin : scdma_dump
 		integer kk;
+		check(!wildpc_seen, "supervisor PC did not reach the panic target");
 		$display("=== SCSI DMA channel writes to memory (frozen at berr) ===");
 		for (kk = 0; kk < scdma_n && kk < 64; kk = kk + 1)
 			$display("  [%0d] addr=%08x data=%08x", kk, scdma_addr[kk], scdma_data[kk]);
