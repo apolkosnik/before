@@ -66,13 +66,13 @@ localparam CONF_STR = {
 	"S0,VHDIMG,SCSI Disk 0;",
 	"S1,VHDIMG,SCSI Disk 1;",
 	"S2,VHDIMG,SCSI Disk 2;",
-	"S3,VHDIMG,SCSI Disk 3;",
+	"S3,ISO,CD-ROM;",
 	"S4,IMGIMAFLPVFDFD ,Floppy;",
-	"S5,IMGMO OD ,Optical 0;",
-	"S6,IMGMO OD ,Optical 1;",
+	"S5,IMGMO OD ,Magneto-optical;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
+	"O[58],Ethernet cable,Connected,Disconnected;",
 	"O[57:55],Boot device,Auto,Disk,Floppy,Network,ROM Default,Optical;",
 	"-;",
 	"T[0],Reset;",
@@ -85,6 +85,7 @@ wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
 wire  [10:0] ps2_key;
+wire        enet_connected = |status[54:52] && !status[58];
 
 wire        ioctl_download;
 wire [15:0] ioctl_index;
@@ -99,23 +100,28 @@ wire  [7:0] ioctl_dout;
 // and 9 shift clean out of the byte - leaving a mask of zero, which
 // hps_io treats as "no slot given" and turns into slot 0.  An optical
 // image mounted at S8 therefore arrived as a mount of SCSI target 0,
-// carrying the wrong size.  With VDNUM 7 the mask is bits 0..6 and
-// bit 7 is only ever the flag.
+// carrying the wrong size.  This build stays below that ceiling with
+// VDNUM 6, so bits 0..5 are slots and bit 7 remains only the flag.
 //
-// Four SCSI targets, one floppy - the machine has one drive - and the
-// two optical drives NeXTSTEP probes as od0 and od1.
-wire  [6:0] img_mounted_v, sd_ack_v;
-wire  [1:0] oimg_mounted  = {img_mounted_v[6], img_mounted_v[5]};
+// Four SCSI targets, one floppy and one magneto-optical drive.  ISO is
+// deliberately not accepted by the MO slot: this controller consumes
+// NeXT's 1296-byte encoded MO sectors, while a CD-ROM is a 2048-byte SCSI
+// target and needs a different target implementation.
+wire  [5:0] img_mounted_v, sd_ack_v;
+wire  [1:0] oimg_mounted  = {1'b0, img_mounted_v[5]};
 wire        osd_unit;
 wire [31:0] osd_lba;
 wire        osd_rd, osd_wr;
 wire  [7:0] osd_buff_din;
-wire        osd_ack       = osd_unit ? sd_ack_v[6] : sd_ack_v[5];
+wire        osd_ack       = sd_ack_v[5];
 wire  [5:0] img_mounted   = {2'b00, img_mounted_v[3:0]};
 wire  [1:0] fimg_mounted  = {1'b0, img_mounted_v[4]};
-wire        sd_unit, fsd_unit;
-// one engine, two targets: its SD request goes to the slot it names
-wire        sd_ack        = sd_ack_v[sd_unit];
+wire  [2:0] sd_unit;
+wire        fsd_unit;
+// One engine, six possible targets: only targets 0..3 have host slots in
+// this build.  Keep the complete target number until this final routing
+// point so target 2/3 cannot alias target 0/1.
+wire        sd_ack        = (sd_unit < 3'd4) ? sd_ack_v[sd_unit] : 1'b0;
 wire        fsd_ack       = sd_ack_v[4];
 // the engine serves one target at a time: its request goes to that slot
 wire  [5:0] scsi_onehot   = 6'd1 << sd_unit;
@@ -130,7 +136,7 @@ wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_dout, sd_buff_din;
 wire        sd_buff_wr;
 
-hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(6)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -152,16 +158,14 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
 	.img_mounted(img_mounted_v),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
-	.sd_lba('{sd_lba, sd_lba, sd_lba, sd_lba, fsd_lba, osd_lba, osd_lba}),
-	.sd_rd({osd_rd & osd_unit, osd_rd & ~osd_unit, fsd_rd,
-	        {4{sd_rd}} & scsi_onehot[3:0]}),
-	.sd_wr({osd_wr & osd_unit, osd_wr & ~osd_unit, fsd_wr,
-	        {4{sd_wr}} & scsi_onehot[3:0]}),
+	.sd_lba('{sd_lba, sd_lba, sd_lba, sd_lba, fsd_lba, osd_lba}),
+	.sd_rd({osd_rd, fsd_rd, {4{sd_rd}} & scsi_onehot[3:0]}),
+	.sd_wr({osd_wr, fsd_wr, {4{sd_wr}} & scsi_onehot[3:0]}),
 	.sd_ack(sd_ack_v),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din('{sd_buff_din, sd_buff_din, sd_buff_din, sd_buff_din,
-	               fsd_buff_din, osd_buff_din, osd_buff_din}),
+	               fsd_buff_din, osd_buff_din}),
 	.sd_buff_wr(sd_buff_wr),
 
 	.ps2_key(ps2_key)
@@ -227,6 +231,7 @@ next_system #(
 
 	.ps2_key(ps2_key),
 	.boot_sel(status[57:55]),
+	.enet_connected(enet_connected),
 
 	.oimg_mounted(oimg_mounted),
 	.oimg_readonly(img_readonly),
@@ -406,7 +411,7 @@ next_enet_bridge #(.CLK_HZ(32000000)) enet_bridge
 (
 	.clk(clk_sys),
 	.reset(reset),
-	.enable(|status[54:52]),
+	.enable(enet_connected),
 
 	.btx_req(btx_req),
 	.btx_len(btx_len),

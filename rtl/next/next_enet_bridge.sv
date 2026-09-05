@@ -32,7 +32,7 @@ module next_enet_bridge #(parameter CLK_HZ = 100000000)
 (
 	input             clk,
 	input             reset,
-	input             enable,        // OSD Network option is not Off
+	input             enable,        // effective external link is connected
 
 	// frame streaming to/from next_enet_dma
 	input             btx_req,

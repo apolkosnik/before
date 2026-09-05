@@ -57,11 +57,12 @@ module next_kms_snd #(parameter CLK_HZ = 100000000)
 	// RAM master port
 	output reg        m_req,
 	output reg        m_we,
-	output reg [23:0] m_addr,
+	output reg [29:0] m_addr,
 	output reg  [3:0] m_be,
 	output reg [31:0] m_din,
 	input      [31:0] m_dout,
 	input             m_ack,
+	input             m_err,
 
 	output        int_snd_ovrun,   // INT_SOUND_OVRUN level
 	output        int_snd_out_dma, // channel complete level
@@ -164,6 +165,18 @@ reg [17:0] pace;                 // microseconds until the completion intr
 reg [15:0] poll;                 // polling interval while idle
 
 wire [7:0] csr_or = (be[1] ? wdata[15:8] : 8'h00) | (be[0] ? wdata[7:0] : 8'h00);
+
+// Sound DMA memory faults are DMA channel errors in Previous.  Do not let
+// high/virtual pointers wrap into the low 64 MB RAM window.
+task automatic dma_bus_exception;
+	begin
+		s_csr[0] <= 0;
+		s_csr[3] <= 1;
+		s_csr[4] <= 1;
+		m_req <= 0;
+		est <= E_IDLE;
+	end
+endtask
 
 //----------------------------------------------------------------------------
 // PS/2 set-2 to NeXT keycode translation (Keymap_GetKeyFromScancode in
@@ -506,23 +519,26 @@ always @(posedge clk) begin
 			end
 		end
 
-		E_RD: begin
-			if (s_next >= s_limit) est <= E_PACE;
-			else begin
-				m_req <= 1;
-				m_we <= 0;
-				m_be <= 4'hF;
-				m_addr <= s_next[25:2];
-				est <= E_ACK;
+			E_RD: begin
+				if (s_next >= s_limit) est <= E_PACE;
+				else begin
+					m_req <= 1;
+					m_we <= 0;
+					m_be <= 4'hF;
+					m_addr <= s_next[31:2];
+					est <= E_ACK;
+				end
 			end
-		end
 
-		E_ACK: if (m_ack) begin
-			m_req <= 0;
-			// samples are consumed; no audio output path yet
-			s_next <= (s_next | 32'd3) + 32'd1;   // whole words
-			est <= E_RD;
-		end
+			E_ACK: if (m_err) begin
+				dma_bus_exception;
+			end
+			else if (m_ack) begin
+				m_req <= 0;
+				// samples are consumed; no audio output path yet
+				s_next <= (s_next | 32'd3) + 32'd1;   // whole words
+				est <= E_RD;
+			end
 
 		E_PACE: begin
 			// interrupt after roughly len/4 microseconds

@@ -25,23 +25,26 @@ reg  [15:0] wdata = 0;
 wire [15:0] rdata;
 
 wire        m_req, m_we, m_ack;
-wire [23:0] m_addr;
+wire [29:0] m_addr;
 wire  [3:0] m_be;
 wire [31:0] m_din;
 reg  [31:0] m_dout;
+wire        m_addr_valid = (m_addr[29:24] == 6'd1);
+wire        m_err = m_req && !m_addr_valid;
+integer     m_err_count = 0;
 
 wire int_snd_ovrun, int_snd_out_dma;
 
 // 1 MHz "clock" so a microsecond is one cycle
 next_kms_snd #(.CLK_HZ(1000000)) dut
-(
-	.clk(clk), .reset(reset),
-	.ps2_key(11'd0),
-	.sel_kms(sel_kms), .sel_csr(sel_csr), .sel_sptr(sel_sptr),
-	.sel_ptr(sel_ptr), .sel_ini(sel_ini),
-	.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
-	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
-	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
+	(
+		.clk(clk), .reset(reset),
+		.ps2_key(11'd0),
+		.sel_kms(sel_kms), .sel_csr(sel_csr), .sel_sptr(sel_sptr),
+		.sel_ptr(sel_ptr), .sel_ini(sel_ini),
+		.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
+		.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
+		.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(m_err),
 	.int_snd_ovrun(int_snd_ovrun), .int_snd_out_dma(int_snd_out_dma),
 	.int_keymouse()
 );
@@ -50,8 +53,15 @@ next_kms_snd #(.CLK_HZ(1000000)) dut
 reg ack_r;
 assign m_ack = ack_r;
 always @(posedge clk) begin
-	if (reset) ack_r <= 0;
-	else if (!m_req) ack_r <= 0;
+	if (reset) begin
+		ack_r <= 0;
+		m_err_count <= 0;
+	end
+	else if (m_err) begin
+		m_err_count <= m_err_count + 1;
+		ack_r <= 0;
+	end
+	else if (!m_req || !m_addr_valid) ack_r <= 0;
 	else if (!ack_r) begin
 		m_dout <= 32'h55aa1234;
 		ack_r <= 1;
@@ -134,6 +144,8 @@ task check;
 endtask
 
 reg [7:0] v;
+reg [31:0] l;
+integer err_before;
 
 initial begin
 	repeat (10) @(posedge clk);
@@ -169,13 +181,29 @@ initial begin
 	check(int_snd_ovrun, "INT_SOUND_OVRUN raised");
 
 	// sound out disable clears the underrun state
-	kms_cmd(8'h07, 32'h0);       // KMSCMD_SND_OUT without SIO_ENABLE
-	repeat (2) @(posedge clk);
-	kms_rd8(4'h0, v);
-	check(!v[5] && !v[6], "disable clears underrun and request");
-	check(!int_snd_ovrun, "INT_SOUND_OVRUN released");
+		kms_cmd(8'h07, 32'h0);       // KMSCMD_SND_OUT without SIO_ENABLE
+		repeat (2) @(posedge clk);
+		kms_rd8(4'h0, v);
+		check(!v[5] && !v[6], "disable clears underrun and request");
+		check(!int_snd_ovrun, "INT_SOUND_OVRUN released");
 
-	if (errors == 0) $display("ALL PASS");
+		// Invalid high DMA pointers are channel bus exceptions, not low-RAM
+		// aliases.  This guards the same 24-bit truncation class as Ethernet.
+		err_before = m_err_count;
+		ptr_wr32(4'h0, 32'h3C014D9C);
+		ptr_wr32(4'h4, 32'h3C014DA0);
+		csr_cmd(8'h11);              // RESET | SETENABLE
+		kms_wr8(4'h0, 8'h80);
+		kms_cmd(8'h0F, 32'h0);
+		repeat (100) @(posedge clk);
+		kms_cmd(8'h07, 32'h0);
+		l = {dut.s_csr, 24'h000000};
+		check(m_err_count > err_before && m_addr == 30'h0F005367,
+		      "sound DMA invalid high address reports BUSEXC without 24-bit wrap");
+		check(l[28] && l[27] && !l[24],
+		      "sound CSR: BUSEXC and COMPLETE set, ENABLE clear");
+
+		if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);
 	$finish;
 end

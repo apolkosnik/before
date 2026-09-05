@@ -28,10 +28,14 @@ reg  [15:0] wdata = 0;
 wire [15:0] rdata;
 
 wire        m_req, m_we, m_ack;
-wire [23:0] m_addr;
+wire [29:0] m_addr;
 wire  [3:0] m_be;
 wire [31:0] m_din;
 reg  [31:0] m_dout;
+wire        m_addr_valid = (m_addr[29:24] == 6'd0) ||
+                           (m_addr[29:24] == 6'd1);
+wire        m_err = m_req && !m_addr_valid;
+integer     m_err_count = 0;
 
 wire int_disk, int_disk_dma, mo_gpo;
 
@@ -42,7 +46,7 @@ next_mo #(.CLK_HZ(1000000)) dut
 	.sel_osp(sel_osp), .sel_csr(sel_csr), .sel_ptr(sel_ptr), .sel_ini(sel_ini),
 	.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
-	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
+	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(m_err),
 	.int_disk(int_disk), .int_disk_dma(int_disk_dma),
 	.mo_gpo(mo_gpo),
 	.img_mounted(oimg_mounted), .img_readonly(oimg_readonly), .img_size(oimg_size),
@@ -90,6 +94,8 @@ reg     sd_owner_watch = 0, sd_owner_expected = 0, sd_owner_mismatch = 0;
 always @(posedge clk) begin
 	if (sd_owner_watch && dut.dsk_active && osd_unit != sd_owner_expected)
 		sd_owner_mismatch <= 1;
+	// Match hps_io: data/strobe are registered after the bus transaction,
+	// so the last buffer write reaches the device after ack has fallen.
 	osd_buff_wr <= 0;
 	if (osd_rd && !osd_ack && !osd_active && !osd_wact) begin
 		osd_ack <= 1;
@@ -108,13 +114,13 @@ always @(posedge clk) begin
 		if (!osd_buff_wr) begin
 			osd_buff_dout <= cart[{osd_lba, 9'd0} + {23'd0, osd_buff_addr}];
 			osd_buff_wr <= 1;
-		end
-		else begin
 			if (osd_buff_addr == 9'd511) begin
 				osd_ack <= 0;
 				osd_active <= 0;
 			end
-			else osd_buff_addr <= osd_buff_addr + 1'd1;
+		end
+		else begin
+			if (osd_buff_addr != 9'd511) osd_buff_addr <= osd_buff_addr + 1'd1;
 		end
 	end
 	else if (osd_ack && osd_wact) begin
@@ -142,8 +148,9 @@ reg        ack_r;
 assign m_ack = ack_r;
 
 always @(posedge clk) begin
+	if (m_err) m_err_count <= m_err_count + 1;
 	if (reset) ack_r <= 0;
-	else if (!m_req) ack_r <= 0;
+	else if (!m_req || !m_addr_valid) ack_r <= 0;
 	else if (!ack_r) begin
 		if (m_we) begin
 			if (m_be[3]) ram[m_addr[13:0]][31:24] <= m_din[31:24];
@@ -1707,6 +1714,31 @@ initial begin
 	      !dut.drv_seeking[0] && dut.drv_head[0] == 3'd0,
 	      "write-protected relative jump completes on CMD_DELAY and selects no head");
 	oimg_readonly = 0;
+
+	//------------------------------------------------------------
+	// DMA validation: bad alignment is rejected at enable, and a memory
+	// fault preserves the full bad address until the arbiter rejects it.
+	//------------------------------------------------------------
+	osp_wr8(5'h07, 8'h00);
+	ptr_wr32(5'h00, SRC + 32'd1);
+	ptr_wr32(5'h04, SRC + 32'd1024);
+	csr_cmd(8'h11);
+	repeat (4) @(posedge clk);
+	check(!dut.d_csr[0] && dut.d_csr[3] && dut.d_csr[4] &&
+	      dut.d_next == SRC + 32'd1,
+	      "misaligned MO DMA window completes with BUSEXC without moving next");
+
+	csr_cmd(8'h10);
+	ptr_wr32(5'h00, 32'h08000000);
+	ptr_wr32(5'h04, 32'h08000400);
+	csr_cmd(8'h11);
+	osp_wr8(5'h07, 8'h40);
+	repeat (200) @(posedge clk);
+	check(m_err_count != 0 && m_addr == 30'h02000000,
+	      "MO DMA preserves invalid high address bits through its master port");
+	check(!dut.d_csr[0] && dut.d_csr[3] && dut.d_csr[4] &&
+	      dut.d_next == 32'h08000000,
+	      "rejected MO DMA access completes with BUSEXC and cannot advance");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

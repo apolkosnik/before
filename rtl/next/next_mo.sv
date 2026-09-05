@@ -14,7 +14,10 @@
 //  producer/consumer roles, including BUF_TOGGLE and ECC_BLOCKS overlap.
 //============================================================================
 
-module next_mo #(parameter CLK_HZ = 100000000)
+module next_mo #(
+	parameter CLK_HZ = 100000000,
+	parameter [1:0] DRIVE_CONNECTED = 2'b11
+)
 (
 	input         clk,
 	input         reset,
@@ -33,11 +36,14 @@ module next_mo #(parameter CLK_HZ = 100000000)
 	// RAM master port (32-bit, level req / level ack)
 	output reg        m_req,
 	output reg        m_we,
-	output reg [23:0] m_addr,
+	// Full word address; next_system validates the RAM aperture before
+	// reducing it to the external RAM index.
+	output reg [29:0] m_addr,
 	output reg  [3:0] m_be,
 	output reg [31:0] m_din,
 	input      [31:0] m_dout,
 	input             m_ack,
+	input             m_err,
 
 	output        int_disk,      // OSP interrupt level
 	output        int_disk_dma,  // DMA channel complete level
@@ -144,14 +150,15 @@ wire buf_clear_bus = sel_osp && we && (addr[4:1] == 4'h3) &&
 // The drives.  Everything the OSP asks about a drive is per drive, and
 // the selected one comes from CSR2's drive select bit.
 //----------------------------------------------------------------------------
-// The drives are fitted to the machine; the cartridges come and go.
+// Fitted drives are a machine-level choice; cartridges come and go.
 // The reference keeps them apart - connected is configuration, set at
 // init along with complete and a cleared attention, while inserted is
 // whether there is a cartridge in the drive.  A connected drive with
 // no cartridge still answers, and says it is empty; an unconnected one
 // does not answer at all, which is how a machine with no optical
-// drive looks.  NeXTSTEP probes od0 and od1, so both are fitted.
-wire [1:0] drv_conn = 2'b11;     // both drives are fitted
+// drive looks.  The standalone device defaults to both drives for its
+// two-drive tests; next_system overrides this for the single-drive core.
+wire [1:0] drv_conn = DRIVE_CONNECTED;
 reg  [1:0] drv_ins = 0;          // a cartridge is in the drive
 reg  [1:0] drv_wp = 0;           // mounted read only
 reg  [1:0] drv_spinning = 0;
@@ -182,6 +189,11 @@ reg         dsk_is_wr = 0;       // the run puts a sector back
 reg         dsk_erase = 0;       // ... as 0xFF rather than the buffer
 reg         dsk_owner = 0;       // drive that initiated the current SD run
 reg         dsk_abort_wait = 0;  // discard a late ack before accepting a new run
+// The HPS write strobe trails sd_ack at the end of a block.  Latch ownership
+// from our ack so that tail remains ours, but interleaved slots do not.
+reg         dsk_read_owned = 0;
+wire        dsk_read_window = ((dst == D_RGO) || (dst == D_RACK)) &&
+                              (sd_ack || dsk_read_owned);
 
 // A sector covers its first and last block only in part, so putting one
 // back means reading each block, replacing the window inside it, and
@@ -193,11 +205,8 @@ wire [11:0] wgidx = {1'd0, dsk_blk, 8'd0, 1'd0} + {3'd0, sd_buff_addr};
 wire        wgin  = (wgidx >= {3'd0, dsk_skip}) &&
                     ((wgidx - {3'd0, dsk_skip}) < SECT_DISK);
 always @(posedge clk) begin
-	// dsk_active spans the whole run, gaps included, and the host's
-	// buffer bus is shared: without the ack, another device's sector
-	// lands in the staging buffer and the write-back carries it into
-	// the cartridge.
-	if (dsk_active && sd_buff_wr && sd_ack) stage[sd_buff_addr] <= sd_buff_dout;
+	if (dsk_active && dsk_read_window && sd_buff_wr)
+		stage[sd_buff_addr] <= sd_buff_dout;
 	stage_q <= stage[sd_buff_addr];
 	win_q   <= wgin;
 end
@@ -463,6 +472,19 @@ task automatic dma_done_disk;
 	end
 endtask
 
+// DMA memory faults are channel errors, not wrapped RAM accesses.
+// Previous preserves SUPDATE, disables the channel and raises the DMA
+// interrupt through COMPLETE|BUSEXC.
+task automatic dma_bus_exception;
+	begin
+		d_csr[0] <= 0;
+		d_csr[3] <= 1;
+		d_csr[4] <= 1;
+		m_req <= 0;
+		mst <= M_IDLE;
+	end
+endtask
+
 // fmt_sector_done(): step the formatter's address and count the
 // sector off; the operation completes when the count runs out
 task automatic fmt_sector_done;
@@ -521,6 +543,7 @@ task automatic dsk_start;
 			dsk_bank   <= is_wr ? eccout : eccin;
 			dsk_is_wr  <= is_wr;
 			dsk_erase  <= is_erase;
+			dsk_read_owned <= 0;
 			if (!is_wr) begin
 				ecc_size_b[eccin] <= 0;
 				ecc_limit_b[eccin] <= SECT_DISK;
@@ -594,8 +617,8 @@ always @(posedge clk) begin
 		drv_status[1] <= 0;
 		attn_pend <= 0;
 		drv_spinning <= 0; drv_spiraling <= 0;
-		drv_attn <= 0; drv_compl <= 2'b11;   // MO_Init: complete, no attn
-		drv_enabled <= 2'b11;
+		drv_attn <= 0; drv_compl <= DRIVE_CONNECTED; // connected drives complete
+		drv_enabled <= DRIVE_CONNECTED;
 		head_pos[0] <= 0; head_pos[1] <= 0;
 		drv_head[0] <= NO_HEAD; drv_head[1] <= NO_HEAD;
 		drv_cmd_pend <= 0; drv_busy <= 0; drv_busy_dnum <= 0; drv_dly <= 0;
@@ -606,7 +629,7 @@ always @(posedge clk) begin
 		fmt_mode <= FM_IDLE; sector_counter <= 0; write_timing <= 0;
 		sector_misses <= 0;
 		dst <= D_IDLE; dsk_active <= 0; dsk_we <= 0;
-		dsk_owner <= 0; dsk_abort_wait <= 0;
+		dsk_owner <= 0; dsk_abort_wait <= 0; dsk_read_owned <= 0;
 		dsk_is_wr <= 0; dsk_erase <= 0;
 		dsk_lba_r <= 0; dsk_blk <= 0; dsk_nblk <= 0; dsk_skip <= 0;
 		rs_start_enc <= 0;
@@ -627,7 +650,7 @@ always @(posedge clk) begin
 
 		// place the streamed byte if it falls inside the sector window
 		if (!fmt_reset_bus && dsk_active && !dsk_is_wr &&
-		    sd_buff_wr && sd_ack) begin : place
+		    dsk_read_window && sd_buff_wr) begin : place
 			reg [11:0] gidx;
 			gidx = {1'd0, dsk_blk, 8'd0, 1'd0} + {3'd0, sd_buff_addr};
 			if (gidx >= {3'd0, dsk_skip} &&
@@ -1001,7 +1024,11 @@ always @(posedge clk) begin
 		if (sel_csr & we & (csr_or != 0)) begin
 			if (csr_or[4]) d_csr <= d_csr & ~8'b00001011;   // RESET
 			if (csr_or[1]) d_csr[1] <= 1;                   // SETSUPDATE
-			if (csr_or[0]) d_csr[0] <= 1;                   // SETENABLE
+			if (csr_or[0]) begin                            // SETENABLE
+				if (d_next[1:0] != 0 || d_limit[3:0] != 0)
+					dma_bus_exception;
+				else d_csr[0] <= 1;
+			end
 			if (csr_or[3]) d_csr[3] <= 0;                   // CLRCOMPLETE
 		end
 
@@ -1154,11 +1181,15 @@ always @(posedge clk) begin
 			sd_rd <= 1;
 			if (sd_ack) begin
 				sd_rd <= 0;
+				dsk_read_owned <= 1;
 				dst <= D_RACK;
 			end
 		end
 		D_RACK: begin
-			if (!sd_ack) dst <= dsk_is_wr ? D_WGO : D_NEXT;
+			if (!sd_ack) begin
+				dsk_read_owned <= 0;
+				dst <= dsk_is_wr ? D_WGO : D_NEXT;
+			end
 		end
 		D_WGO: begin
 			sd_wr <= 1;
@@ -1244,10 +1275,13 @@ always @(posedge clk) begin
 					m_req <= 1;
 					m_we <= 0;
 					m_be <= 4'hF;
-					m_addr <= d_next[25:2];
+					m_addr <= d_next[31:2];
 					mst <= M_WAIT;
 				end
-				M_WAIT: if (m_ack) begin
+				M_WAIT: if (m_err) begin
+					dma_bus_exception;
+				end
+				else if (m_ack) begin
 					m_req <= 0;
 					mo_addr <= ecc_size_b[eccin][10:0];
 					mo_wdata <=
@@ -1440,11 +1474,14 @@ always @(posedge clk) begin
 					m_req <= 1;
 					m_we <= 1;
 					m_be <= 4'b1000 >> d_next[1:0];
-					m_addr <= d_next[25:2];
+					m_addr <= d_next[31:2];
 					m_din <= {4{ecc_q}};
 					mst <= M_WAIT;
 				end
-				M_WAIT: if (m_ack) begin
+				M_WAIT: if (m_err) begin
+					dma_bus_exception;
+				end
+				else if (m_ack) begin
 					m_req <= 0;
 					ecc_size_b[eccout] <= ecc_size_b[eccout] - 12'd1;
 					d_next <= d_next + 32'd1;
@@ -1514,6 +1551,7 @@ always @(posedge clk) begin
 			dsk_is_wr <= 0;
 			dsk_erase <= 0;
 			dsk_we <= 0;
+			dsk_read_owned <= 0;
 			sd_rd <= 0;
 			sd_wr <= 0;
 			// Hold off at least until a post-reset cycle observes ack low;

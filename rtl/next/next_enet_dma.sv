@@ -40,15 +40,17 @@ module next_enet_dma #(parameter CLK_HZ = 100000000)
 	// RAM master port (32-bit, level req / level ack)
 	output reg        m_req,
 	output reg        m_we,
-	output reg [23:0] m_addr,
+	output reg [29:0] m_addr,
 	output reg  [3:0] m_be,
 	output reg [31:0] m_din,
 	input      [31:0] m_dout,
 	input             m_ack,
+	input             m_err,
 
-	// BMAP twisted-pair select (disables the loopback path, see
-	// enet_state() in ethernet.c)
+	// BMAP twisted-pair select and external link state.  Loopback remains
+	// local even when the cable is disconnected; only wire modes fail.
 	input         tpe_select,
+	input         cable_connected,
 
 	// frame bridge (next_enet_bridge): when the guest runs with the
 	// loopback disabled, transmitted frames stream out here and
@@ -80,7 +82,8 @@ module next_enet_dma #(parameter CLK_HZ = 100000000)
 //----------------------------------------------------------------------------
 
 localparam TXSTAT_READY    = 8'h80, TXSTAT_NET_BUSY = 8'h40,
-           TXSTAT_TX_RECVD = 8'h20, TXSTAT_UNDERFLOW = 8'h08;
+           TXSTAT_TX_RECVD = 8'h20, TXSTAT_UNDERFLOW = 8'h08,
+           TXSTAT_16COLLS  = 8'h02;
 localparam RXSTAT_PKT_OK   = 8'h80, RXSTAT_SHORT_PKT = 8'h08,
            RXSTAT_OVERFLOW = 8'h01;
 localparam TXMODE_DIS_LOOP = 8'h02;
@@ -228,9 +231,11 @@ localparam E_IDLE   = 4'd0,
 reg [3:0] est;
 reg [10:0] brx_pos;
 
-assign brx_ready = (est == E_IDLE) && (rx_len == 0) && !en_stopped;
+assign brx_ready = cable_connected && (est == E_IDLE) &&
+                   (rx_len == 0) && !en_stopped;
 
 wire loopback = !tpe_select && !(tx_mode & TXMODE_DIS_LOOP);
+wire wire_connected = cable_connected && !loopback;
 
 // helper: byte lane select for a byte address
 function [3:0] be_of;
@@ -325,6 +330,35 @@ task automatic dma_done_rx;
 			rx_csr[CSR_SUPDATE] <= 0;
 		end
 		else rx_csr[CSR_ENABLE] <= 0;
+	end
+endtask
+
+// Previous catches DMA memory faults as channel errors.  Keep the full
+// programmed pointer through the master port so invalid/virtual addresses
+// become BUSEXC instead of aliasing modulo the 64 MB RAM aperture.
+task automatic dma_bus_exception_tx;
+	begin
+		tx_csr[CSR_ENABLE] <= 0;
+		tx_csr[CSR_COMPLETE] <= 1;
+		tx_csr[CSR_BUSEXC] <= 1;
+		tx_len <= 0;
+		btx_req <= 0;
+		btx_pending <= 0;
+		est <= E_IDLE;
+		m_req <= 0;
+	end
+endtask
+
+task automatic dma_bus_exception_rx;
+	begin
+		rx_csr[CSR_ENABLE] <= 0;
+		rx_csr[CSR_COMPLETE] <= 1;
+		rx_csr[CSR_BUSEXC] <= 1;
+		rx_len <= 0;
+		rx_pos <= 0;
+		tx_status <= tx_status & ~TXSTAT_NET_BUSY;
+		est <= E_IDLE;
+		m_req <= 0;
 	end
 endtask
 
@@ -437,26 +471,29 @@ always @(posedge clk) begin
 			end
 		end
 
-		E_TX_RD: begin
-			if (tx_next >= tx_limit_addr) est <= E_TX_END;
-			else begin
-				m_req <= 1;
-				m_we <= 0;
-				m_be <= 4'hF;
-				m_addr <= tx_next[25:2];
-				est <= E_TX_ACK;
+			E_TX_RD: begin
+				if (tx_next >= tx_limit_addr) est <= E_TX_END;
+				else begin
+					m_req <= 1;
+					m_we <= 0;
+					m_be <= 4'hF;
+					m_addr <= tx_next[31:2];
+					est <= E_TX_ACK;
+				end
 			end
-		end
 
-		E_TX_ACK: if (m_ack) begin : tx_ack
-			reg [7:0] b;
-			m_req <= 0;
-			b = (tx_next[1:0] == 2'd0) ? m_dout[31:24] :
-			    (tx_next[1:0] == 2'd1) ? m_dout[23:16] :
-			    (tx_next[1:0] == 2'd2) ? m_dout[15:8] : m_dout[7:0];
-			if (tx_len < 12'd2047) begin
-				pw_we <= 1;
-				pw_addr <= tx_len[10:0];
+			E_TX_ACK: if (m_err) begin
+				dma_bus_exception_tx;
+			end
+			else if (m_ack) begin : tx_ack
+				reg [7:0] b;
+				m_req <= 0;
+				b = (tx_next[1:0] == 2'd0) ? m_dout[31:24] :
+				    (tx_next[1:0] == 2'd1) ? m_dout[23:16] :
+				    (tx_next[1:0] == 2'd2) ? m_dout[15:8] : m_dout[7:0];
+				if (tx_len < 12'd2047) begin
+					pw_we <= 1;
+					pw_addr <= tx_len[10:0];
 				pw_data <= b;
 				tx_len <= tx_len + 1'd1;
 			end
@@ -494,6 +531,15 @@ always @(posedge clk) begin
 					tx_len <= 0;
 					est <= E_IDLE;
 				end
+				else if (!cable_connected) begin
+					// enet_state()==EN_DISCONNECTED: the packet was read
+					// from memory, but the external wire reports sixteen
+					// collisions and nothing is handed to the bridge.
+					tx_status <= (tx_status | TXSTAT_16COLLS) &
+					             ~(TXSTAT_TX_RECVD | TXSTAT_NET_BUSY);
+					tx_len <= 0;
+					est <= E_IDLE;
+				end
 				else begin
 					// hand the frame to the bridge (the wire side)
 					btx_req <= 1;
@@ -508,7 +554,15 @@ always @(posedge clk) begin
 			// serve the bridge's byte fetches out of the packet buffer;
 			// the read data settles one cycle after the address applies
 			btx_ack <= 0;
-			if (btx_pending) begin
+			if (!cable_connected) begin
+				btx_req <= 0;
+				btx_pending <= 0;
+				tx_status <= (tx_status | TXSTAT_16COLLS) &
+				             ~(TXSTAT_TX_RECVD | TXSTAT_NET_BUSY);
+				tx_len <= 0;
+				est <= E_IDLE;
+			end
+			else if (btx_pending) begin
 				btx_q <= pkt_q;
 				btx_ack <= 1;
 				btx_pending <= 0;
@@ -546,7 +600,7 @@ always @(posedge clk) begin
 				// consumed from the bridge but discarded, which keeps
 				// the boot ROM's quiet-network and address-filter test
 				// phases deterministic on a live LAN.
-				if (pkt_for_me && !loopback) begin
+				if (pkt_for_me && !loopback && wire_connected) begin
 					tx_status <= tx_status | TXSTAT_NET_BUSY;
 					rx_len <= (({1'b0, brx_pos} < 12'd60) ? 12'd60 : {1'b0, brx_pos}) + 12'd4;
 					rx_pos <= 0;
@@ -555,7 +609,7 @@ always @(posedge clk) begin
 			end
 		end
 
-		E_RX_WR: begin
+			E_RX_WR: begin
 			// packet done takes precedence: when the packet ends exactly
 			// at the window limit (the ROM sizes its ring slots to the
 			// frame length) this must be a completed packet, not a full
@@ -566,22 +620,25 @@ always @(posedge clk) begin
 				dma_done_rx;
 				est <= E_IDLE;
 			end
-			else begin
-				m_req <= 1;
-				m_we <= 1;
-				m_be <= be_of(rx_next[1:0]);
-				m_addr <= rx_next[25:2];
-				m_din <= {4{pkt_q}};
-				est <= E_RX_ACK;
+				else begin
+					m_req <= 1;
+					m_we <= 1;
+					m_be <= be_of(rx_next[1:0]);
+					m_addr <= rx_next[31:2];
+					m_din <= {4{pkt_q}};
+					est <= E_RX_ACK;
+				end
 			end
-		end
 
-		E_RX_ACK: if (m_ack) begin
-			m_req <= 0;
-			rx_next <= rx_next + 1'd1;
-			rx_pos <= rx_pos + 1'd1;
-			est <= E_RX_PRE;
-		end
+			E_RX_ACK: if (m_err) begin
+				dma_bus_exception_rx;
+			end
+			else if (m_ack) begin
+				m_req <= 0;
+				rx_next <= rx_next + 1'd1;
+				rx_pos <= rx_pos + 1'd1;
+				est <= E_RX_PRE;
+			end
 
 		E_RX_PRE: est <= E_RX_WR;   // pkt_q settles for the new rx_pos
 

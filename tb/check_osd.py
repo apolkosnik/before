@@ -35,6 +35,7 @@ import re
 import sys
 
 TOP = "../NeXT.sv"
+SYSTEM = "../rtl/next/next_system.sv"
 MAX_SLOTS = 7          # bit 7 is the read-only flag; 8 and up fall out
 
 
@@ -44,6 +45,7 @@ def fail(msg):
 
 
 src = open(TOP).read()
+system_src = open(SYSTEM).read()
 
 # VDNUM as given to hps_io
 m = re.search(r"hps_io\s*#\s*\(.*?\.VDNUM\(\s*(\d+)\s*\)", src, re.S)
@@ -77,6 +79,13 @@ for n, ext, label in entries:
             fail(f'S{n} ("{label.strip()}") is the {kind} but its extensions '
                  f'{groups} do not include "{want}" - a NeXT {kind} image is '
                  f'.{want.strip().lower()} and would not be listed at all')
+    if "optical" in label.lower() and "ISO" in groups:
+        fail(f'S{n} ("{label.strip()}") routes to the 1296-byte encoded MO '
+             "controller, so it cannot accept a 2048-byte SCSI CD-ROM ISO")
+    if "cd-rom" in label.lower() and "ISO" not in groups:
+        fail(f'S{n} ("{label.strip()}") is the CD-ROM but its extensions '
+             f'{groups} do not include "ISO" - a CD image is .iso and would '
+             "not appear in the browser")
 
 nums = [n for n, _ in slots]
 
@@ -98,6 +107,31 @@ missing = sorted(set(range(vdnum)) - set(nums))
 if missing:
     fail(f"VDNUM={vdnum} but slot(s) {missing} have no menu entry")
 
+# The SCSI engine names six targets with a three-bit unit number.  A scalar
+# declaration here aliases target 2 to slot 0 and target 3 to slot 1 while
+# still compiling, so make the integration width part of the slot contract.
+if not re.search(r"wire\s*\[\s*2\s*:\s*0\s*\]\s*sd_unit\s*;", src):
+    fail("sd_unit is not a three-bit wire; SCSI targets above 1 would alias")
+
+for signal in ("img_mounted_v", "sd_ack_v"):
+    if not re.search(r"wire\s*\[\s*%d\s*:\s*0\s*\][^;]*\b%s\b" %
+                     (vdnum - 1, signal), src):
+        fail(f"{signal} width does not match VDNUM={vdnum}")
+
+# Storage masters must arrive at the system with all 30 word-address bits,
+# and the system must reject a request outside physical RAM.  These guards
+# prevent a future interface cleanup from recreating modulo-64-MB DMA.
+for master in ("sc", "mo"):
+    if not re.search(r"wire\s*\[\s*29\s*:\s*0\s*\]\s*%s_m_addr\s*;" %
+                     master, system_src):
+        fail(f"{master} storage DMA does not retain the full word address")
+    if not re.search(r"%s_m_addr\[29:24\]\s*==\s*6'b000001" % master,
+                     system_src):
+        fail(f"{master} storage DMA has no physical-RAM aperture check")
+    if not re.search(r"assign\s+%s_m_err\s*=\s*%s_m_req\s*&&\s*!%s_m_is_ram" %
+                     (master, master, master), system_src):
+        fail(f"{master} storage DMA does not report rejected addresses")
+
 # The unpacked arrays handed to hps_io are indexed 0..VDNUM-1, while the
 # packed sd_rd/sd_wr vectors run the other way.  Getting one of them a
 # device short does not fail to build; it crosses two drives over.
@@ -114,8 +148,10 @@ for port in ("sd_lba", "sd_buff_din"):
 # relabelled entry and the routing under it can disagree without
 # anything failing to build - the mount simply arrives at the wrong
 # device, which is how a floppy image once turned up as a disk.
+# The SCSI mount (img_mounted) carries the fixed disks and the CD-ROM, since
+# the CD-ROM is a SCSI target served by the same engine.
 DEVICES = [
-    ("img_mounted",  "disk",    ("disk",)),
+    ("img_mounted",  "scsi",    ("disk", "cd-rom")),
     ("fimg_mounted", "floppy",  ("floppy",)),
     ("oimg_mounted", "optical", ("optical",)),
 ]

@@ -22,6 +22,7 @@ always #5 clk = ~clk;
 
 reg reset = 1;
 reg bridge_enable = 0;
+reg cable_connected = 1;
 
 // register access to the enet module
 reg         sel = 0;
@@ -33,10 +34,12 @@ wire [15:0] rdata;
 
 // guest RAM master port of the enet module
 wire        m_req, m_we, m_ack;
-wire [23:0] m_addr;
+wire [29:0] m_addr;
 wire  [3:0] m_be;
 wire [31:0] m_din;
 reg  [31:0] m_dout;
+wire        m_addr_valid = (m_addr[29:24] == 6'd1);
+wire        m_err = m_req && !m_addr_valid;
 
 // bridge streaming
 wire        btx_req, btx_rd, btx_ack, btx_done;
@@ -54,13 +57,13 @@ wire [63:0] eb_wdata;
 wire [63:0] eb_rdata;
 
 next_enet_dma #(.CLK_HZ(1000000)) enet
-(
-	.clk(clk), .reset(reset),
-	.sel(sel), .addr(addr), .we(we), .be(be),
-	.wdata(wdata), .rdata(rdata),
-	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
-	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
-	.tpe_select(1'b0),
+	(
+		.clk(clk), .reset(reset),
+		.sel(sel), .addr(addr), .we(we), .be(be),
+		.wdata(wdata), .rdata(rdata),
+		.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
+		.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(m_err),
+	.tpe_select(1'b0), .cable_connected(cable_connected),
 	.btx_req(btx_req), .btx_len(btx_len), .btx_addr(btx_addr),
 	.btx_rd(btx_rd), .btx_q(btx_q), .btx_ack(btx_ack), .btx_done(btx_done),
 	.brx_start(brx_start), .brx_len(brx_len), .brx_valid(brx_valid),
@@ -86,7 +89,7 @@ reg        ack_r;
 assign m_ack = ack_r;
 always @(posedge clk) begin
 	if (reset) ack_r <= 0;
-	else if (!m_req) ack_r <= 0;
+	else if (!m_req || !m_addr_valid) ack_r <= 0;
 	else if (!ack_r) begin
 		if (m_we) begin
 			if (m_be[3]) ram[m_addr[13:0]][31:24] <= m_din[31:24];
@@ -350,6 +353,34 @@ initial begin
 	check(ddr[MB_RXRPTR/8] == 64'd3, "ring consumed while in loopback");
 	rd8(15'h6002, v);
 	check(!v[7], "no delivery while in loopback (wire disconnected)");
+
+	// Top-level "Ethernet cable = Disconnected" uses the same effective
+	// connected signal as Network=Off: the mailbox is disabled, BMAP reports
+	// no link, and external-wire transmits complete with 16 collisions.
+	cable_connected = 0;
+	bridge_enable = 0;
+	repeat (80) @(posedge clk);
+	check(ddr[MB_MAGIC/8] == 0, "cable disconnected invalidates mailbox");
+
+	wr8(15'h6000, 8'h0f);        // clear sticky TX error bits
+	wr8(15'h6004, 8'h02);        // TXMODE_DIS_LOOP: external wire
+	wr32(15'h0110, 32'h00380000);
+	wr32(15'h4310, TX_BASE);
+	wr32(15'h4114, (TX_BASE + PKT_LEN + 32'd15) | 32'h80000000);
+	wr32(15'h0110, 32'h00050000);
+	repeat (8000) @(posedge clk);
+	rd8(15'h6000, v);
+	check(v[1] && !v[5] && !btx_req,
+	      "disconnected cable reports 16 collisions and no bridge transmit");
+	check(ddr[MB_TXWPTR/8] == 0,
+	      "disconnected cable publishes no TX frame");
+
+	cable_connected = 1;
+	bridge_enable = 1;
+	repeat (80) @(posedge clk);
+	check(ddr[MB_MAGIC/8] == 64'h4E58544554483031 &&
+	      ddr[MB_TXWPTR/8] == 0 && ddr[MB_RXWPTR/8] == 0 &&
+	      ddr[MB_RXRPTR/8] == 0, "cable reconnect starts an empty ring");
 
 	// Turning networking off invalidates the mailbox and then becomes
 	// completely quiescent.  Re-enabling starts a fresh empty generation.

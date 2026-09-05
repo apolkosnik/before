@@ -92,8 +92,10 @@ integer sd_reads = 0, sd_writes = 0;
 reg [31:0] last_lba = 0;
 
 always @(posedge clk) begin
+	// Match hps_io: the final registered buffer-write pulse trails ack.
+	sd_buff_wr <= 0;
 	if (sd_rd && !sd_ack && !sd_rd_act) begin
-		sd_ack <= 1; sd_rd_act <= 1; sd_buff_addr <= 0; sd_buff_wr <= 0;
+		sd_ack <= 1; sd_rd_act <= 1; sd_buff_addr <= 0;
 		last_lba <= sd_lba;
 		sd_reads = sd_reads + 1;
 	end
@@ -101,11 +103,10 @@ always @(posedge clk) begin
 		if (!sd_buff_wr) begin
 			sd_buff_dout <= disk[{sd_lba[11:0], 9'd0} + {23'd0, sd_buff_addr}];
 			sd_buff_wr <= 1;
+			if (sd_buff_addr == 9'd511) begin sd_ack <= 0; sd_rd_act <= 0; end
 		end
 		else begin
-			sd_buff_wr <= 0;
-			if (sd_buff_addr == 9'd511) begin sd_ack <= 0; sd_rd_act <= 0; end
-			else sd_buff_addr <= sd_buff_addr + 1'd1;
+			if (sd_buff_addr != 9'd511) sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
 	end
 	else if (sd_wr && !sd_ack && !sd_wr_act) begin

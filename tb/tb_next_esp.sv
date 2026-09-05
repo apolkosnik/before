@@ -35,7 +35,7 @@ next_scsi #(.CLK_HZ(1000000)) dut
 	.addr(addr), .we(we), .be(be),
 	.wdata(wdata), .rdata(rdata),
 	.m_req(), .m_we(), .m_addr(), .m_be(), .m_din(),
-	.m_dout(32'd0), .m_ack(1'b0),
+	.m_dout(32'd0), .m_ack(1'b0), .m_err(1'b0),
 	.int_scsi(),
 	.int_scsi_dma(),
 	.img_mounted(6'b000000), .img_readonly(1'b0), .img_size(64'd0),

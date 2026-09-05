@@ -41,6 +41,7 @@ wire        led;
 wire [31:0] dbg_pc;
 wire        dbg_halted;
 wire  [2:0] dbg_ipl;
+reg  [10:0] ps2 = 0;
 
 // exactly the FPGA parameterization: virtual microsecond of 50 clocks,
 // no pacing (the physical simulation clock rate is immaterial, the
@@ -56,8 +57,9 @@ next_system #(
 	.clk(clk),
 	.clk_vid(clk),   // both domains on one clock in simulation
 	.reset(reset),
-	.ps2_key(11'd0),
+		.ps2_key(ps2),
 	.boot_sel(bootfd ? 3'd2 : bootsd ? 3'd1 : 3'd0),
+	.enet_connected(net_enable),
 	.fimg_mounted({1'b0, fimg_mounted}), .fsd_unit(), .fimg_readonly(1'b0),
 	.fimg_size(bootfd ? 64'd1474560 : 64'd0),
 	.fsd_lba(fsd_lba), .fsd_rd(fsd_rd), .fsd_wr(fsd_wr), .fsd_ack(fsd_ack),
@@ -346,7 +348,10 @@ always @(posedge clk) begin
 			if ((cpu_addr[31:24] == 8'h02) &&
 			    (cpu_addr[16:12] == 5'h0d) && is_write) seen_scr2_wr <= 1;
 
-			if (is_io_cyc) begin
+			// After a second bus error the machine is in the monitor,
+			// which bit-bangs the RTC forever: recording that scrolls
+			// the conversation that caused the fault out of the ring.
+			if (is_io_cyc && berr_count < 2) begin
 				iolog[iolog_n % 1024] <= {is_write, cpu_addr[30:0], is_write ? cpu_dout : cpu_din, dbg_pc[15:0]};
 				iolog_n = iolog_n + 1;
 			end
@@ -372,6 +377,8 @@ always @(posedge clk) begin
 end
 
 time delay_t0 = 0;
+reg trace_post_delay = 0;
+initial trace_post_delay = $test$plusargs("postdelaytrace");
 
 // POST sub-test tracing: entry PCs and the return-value check PCs of
 // the system test master at 0x469c (see ROMV66 listing), logging D0
@@ -414,8 +421,8 @@ task post_trace;
 			end
 			32'h01001330: $display("[%0t] POST: system test passed path", $time);
 			32'h01003d78: $display("[%0t] POST: event counter measured delay(1000) = %0d us", $time, dbg_d0);
-			32'h010024d2: delay_t0 = $time;   // delay() body entry (past the arg<=3 early out)
-			32'h010024fc: if (delay_t0 != 0) begin
+				32'h010024d2: if (trace_post_delay) delay_t0 = $time;   // delay() body entry
+				32'h010024fc: if (trace_post_delay && delay_t0 != 0) begin
 				$display("[%0t] POST: delay() took %0d ns", $time, ($time - delay_t0) / 1000);
 				delay_t0 = 0;
 			end
@@ -499,6 +506,179 @@ endtask
 integer errors = 0;
 longint run_cycles;
 reg     halt_run = 0;
+reg     stop_at_kernel = 0;
+reg     saw_kernel = 0;
+integer typew_delay_mc = 0;
+integer typesd_delay_mc = 0;
+
+initial stop_at_kernel = $test$plusargs("stopkernel");
+
+//----------------------------------------------------------------------------
+// Resident-kernel-text write watch.
+//
+// The 2026-09-04 MiSTer post-mortem found the running kernel's text at guest
+// physical 0x04014740..0x0401aa4f overwritten with kernel-pointer data and a
+// large zero fill (not disk sectors), which sent execution to 0x3c014d9c
+// (0x04014d9c with bits 27-29 set) and panicked in the MMU table walk.  Kernel
+// text is never written by correct software once the image is running, so any
+// write into the guard window AFTER the kernel takes control names the faulty
+// master and address directly - which a post-mortem cannot.
+//
+//   +guardlo=<hex byte>  window start (default 0x04014740)
+//   +guardhi=<hex byte>  window end,  inclusive (default 0x0401aa4f)
+//   +guardhalt           stop the run on the first hit (freeze for inspection)
+//----------------------------------------------------------------------------
+reg [31:0] guard_lo = 32'h04014740;
+reg [31:0] guard_hi = 32'h0401aa4f;
+reg        guard_halt = 0;
+reg        guard_armed = 0;         // set once the kernel is executing
+integer    guard_hits = 0;
+// first offending writes: {master[2:0], addr[28:0]} plus data and pc
+reg [31:0] guard_addr [0:31];
+reg [31:0] guard_data [0:31];
+reg [31:0] guard_pc   [0:31];
+reg [2:0]  guard_who  [0:31];       // 0 CPU, 1 walker, 2 ENET, 3 MO, 4 SND, 5 SCSI
+reg [31:0] guard_va   [0:31];       // CPU logical (pre-translate) addr at the hit
+reg [31:0] guard_pa   [0:31];       // CPU MMU physical output at the hit
+// ring of recent CPU RAM writes, to see the access pattern into the window
+integer    cwr_n = 0;
+reg [31:0] cwr_pa   [0:63];
+reg [31:0] cwr_va   [0:63];
+reg [31:0] cwr_data [0:63];
+reg [31:0] cwr_pc   [0:63];
+
+initial begin
+	if ($value$plusargs("guardlo=%h", guard_lo)) ;
+	if ($value$plusargs("guardhi=%h", guard_hi)) ;
+	guard_halt = $test$plusargs("guardhalt");
+end
+
+// Arm only once the kernel is running: the ROM's SCSI load legitimately fills
+// this text during boot, so the window is fair game until control transfers.
+always @(posedge clk) if (!reset && saw_kernel) guard_armed <= 1;
+
+// Panic detector: a fetch outside every region this machine can execute from
+// (ROM 0x00-0x01, RAM 0x04-0x07, RAM mirrors 0x10-0x1F) is the wild jump that
+// the hardware panic showed (pc=0x3c014d9c).  Latch and optionally halt.
+reg        wildpc_seen = 0;
+reg [31:0] wildpc_val = 0;
+reg        wildpc_halt = 0;
+initial wildpc_halt = $test$plusargs("wildhalt");
+wire wild_pc = !( dbg_pc < 32'h02000000 ||
+                 (dbg_pc >= 32'h04000000 && dbg_pc < 32'h08000000) ||
+                 (dbg_pc >= 32'h10000000 && dbg_pc < 32'h20000000) );
+always @(posedge clk) if (!reset && guard_armed && wild_pc && !wildpc_seen) begin
+	wildpc_seen <= 1;
+	wildpc_val  <= dbg_pc;
+	$display("[%0t] WILDPC: kernel fetch from unmapped %08x (panic jump)", $time, dbg_pc);
+	if (wildpc_halt) halt_run <= 1;
+end
+
+always @(posedge clk) if (!reset && guard_armed) begin : guard_watch
+	reg [31:0] gaddr;
+	reg [2:0]  who;
+	if (dut.ram_req && dut.ram_we && dut.ram_ack) begin
+		gaddr = 32'h04000000 | ({8'd0, dut.ram_addr} << 2);
+		// classify the master owning this acknowledged RAM write
+		if (dut.state == 2'd3) begin           // S_RAM_E: a DMA channel
+			who = (dut.dma_grant == 2'd0) ? 3'd2 :   // ENET
+			      (dut.dma_grant == 2'd1) ? 3'd3 :   // MO
+			      (dut.dma_grant == 2'd2) ? 3'd4 :   // SND
+			                                3'd5;    // SCSI
+		end
+		else who = dut.walker_busy ? 3'd1 : 3'd0;    // MMU walker vs CPU
+		// keep a rolling history of CPU stores to RAM (the suspect master)
+		if (who == 3'd0) begin
+			cwr_pa[cwr_n % 64]   <= gaddr;
+			cwr_va[cwr_n % 64]   <= dut.cpu.mmu_addr_log;
+			cwr_data[cwr_n % 64] <= dut.ram_din;
+			cwr_pc[cwr_n % 64]   <= dbg_pc;
+			cwr_n = cwr_n + 1;
+		end
+		if (gaddr >= guard_lo && gaddr <= guard_hi) begin
+			if (guard_hits < 32) begin
+				guard_addr[guard_hits] <= gaddr;
+				guard_data[guard_hits] <= dut.ram_din;
+				guard_pc[guard_hits]   <= dbg_pc;
+				guard_who[guard_hits]  <= who;
+				guard_va[guard_hits]   <= dut.cpu.mmu_addr_log;
+				guard_pa[guard_hits]   <= dut.cpu.mmu_addr_phys;
+			end
+			$display("[%0t] GUARD: write into resident kernel text addr=%08x data=%08x master=%0d pc=%08x va=%08x pa=%08x",
+			         $time, gaddr, dut.ram_din, who, dbg_pc,
+			         dut.cpu.mmu_addr_log, dut.cpu.mmu_addr_phys);
+			guard_hits = guard_hits + 1;
+			if (guard_halt) halt_run <= 1;
+		end
+	end
+end
+
+task key_event;
+	input make;
+	input ext;
+	input [7:0] code;
+	begin
+		@(posedge clk);
+		ps2 <= {~ps2[10], make, ext, code};
+		repeat (1000000) @(posedge clk);
+	end
+endtask
+
+task type_key;
+	input ext;
+	input [7:0] code;
+	begin
+		key_event(1'b1, ext, code);
+		key_event(1'b0, ext, code);
+	end
+endtask
+
+task type_shift_key;
+	input [7:0] code;
+	begin
+		key_event(1'b1, 1'b0, 8'h12); // left shift down
+		type_key(1'b0, code);
+		key_event(1'b0, 1'b0, 8'h12); // left shift up
+	end
+endtask
+
+initial begin
+	if ($value$plusargs("typew_mc=%d", typew_delay_mc)) begin
+		repeat (typew_delay_mc) begin
+			repeat (1000000) @(posedge clk);
+		end
+		$display("[%0t] BOOT: typing w<return>", $time);
+		type_key(1'b0, 8'h1D); // w
+		type_key(1'b0, 8'h5A); // return
+	end
+end
+
+initial begin
+	if ($value$plusargs("typesd_mc=%d", typesd_delay_mc)) begin
+		repeat (typesd_delay_mc) begin
+			repeat (1000000) @(posedge clk);
+		end
+		$display("[%0t] BOOT: typing sd(0,0,0)<return>", $time);
+		type_key(1'b0, 8'h1B);       // s
+		type_key(1'b0, 8'h23);       // d
+		type_shift_key(8'h46);       // (
+		type_key(1'b0, 8'h45);       // 0
+		type_key(1'b0, 8'h41);       // ,
+		type_key(1'b0, 8'h45);       // 0
+		type_key(1'b0, 8'h41);       // ,
+		type_key(1'b0, 8'h45);       // 0
+		type_shift_key(8'h45);       // )
+		type_key(1'b0, 8'h5A);       // return
+	end
+end
+
+// A real NeXTSTEP image leaves the ROM at 0x01xxxxxx and begins executing
+// the loaded kernel at 0x04xxxxxx.  This is the decisive end condition for
+// the disk-boot regression and avoids simulating an arbitrary time beyond it.
+always @(posedge clk) if (!reset && bootsd && dbg_pc[31:24] == 8'h04) begin
+	saw_kernel <= 1;
+	if (stop_at_kernel) halt_run <= 1;
+end
 
 task check;
 	input cond;
@@ -547,8 +727,9 @@ initial for (fdi = 0; fdi < 2880*512; fdi = fdi + 1)
 reg fsd_act = 0;
 integer fsd_reads = 0;
 always @(posedge clk) begin
+	fsd_buff_wr <= 0;
 	if (fsd_rd && !fsd_ack && !fsd_act) begin
-		fsd_ack <= 1; fsd_act <= 1; fsd_buff_addr <= 0; fsd_buff_wr <= 0;
+		fsd_ack <= 1; fsd_act <= 1; fsd_buff_addr <= 0;
 		fsd_reads = fsd_reads + 1;
 		if (fsd_reads < 40)
 			$display("[%0t] FD: read lba %0d", $time, fsd_lba);
@@ -557,11 +738,10 @@ always @(posedge clk) begin
 		if (!fsd_buff_wr) begin
 			fsd_buff_dout <= fdisk[{fsd_lba[11:0], 9'd0} + {23'd0, fsd_buff_addr}];
 			fsd_buff_wr <= 1;
+			if (fsd_buff_addr == 9'd511) begin fsd_ack <= 0; fsd_act <= 0; end
 		end
 		else begin
-			fsd_buff_wr <= 0;
-			if (fsd_buff_addr == 9'd511) begin fsd_ack <= 0; fsd_act <= 0; end
-			else fsd_buff_addr <= fsd_buff_addr + 1'd1;
+			if (fsd_buff_addr != 9'd511) fsd_buff_addr <= fsd_buff_addr + 1'd1;
 		end
 	end
 end
@@ -584,8 +764,19 @@ end
 // what the ROM programs into the shared channel, and what the transfer
 // does with it: this is the accounting the ROM checks afterwards
 reg [31:0] dnext_d = 0, dlimit_d = 0;
+reg [31:0] scdma_addr [0:63];
+reg [31:0] scdma_data [0:63];
+integer scdma_n = 0;
 reg  [7:0] dcsr_d = 0;
 always @(posedge clk) if (bootfd && !reset) begin
+	// SCSI DMA channel writes to memory: address and data, frozen at
+	// the fatal bus error, to see what READ CAPACITY delivered.
+	if (berr_count < 2 && dut.scsi.m_req && dut.scsi.m_we && dut.scsi.m_ack
+	    && scdma_n < 64) begin
+		scdma_addr[scdma_n] <= {dut.scsi.m_addr, 2'b00};
+		scdma_data[scdma_n] <= dut.scsi.m_din;
+		scdma_n = scdma_n + 1;
+	end
 	if (dut.scsi.d_next != dnext_d && dut.scsi.flp_active)
 		dnext_d <= dut.scsi.d_next;
 	if (dut.scsi.d_limit != dlimit_d) begin
@@ -662,11 +853,11 @@ integer sd_reads = 0;
 reg sd_lba0 = 0;
 
 always @(posedge clk) begin
+	sd_buff_wr <= 0;
 	if (sd_rd && !sd_ack) begin
 		sd_ack <= 1;
 		sd_rd_act <= 1;
 		sd_buff_addr <= 0;
-		sd_buff_wr <= 0;
 		sd_reads = sd_reads + 1;
 		if (sd_lba == 0) sd_lba0 <= 1;
 		if (img_fd != 0) begin
@@ -682,14 +873,13 @@ always @(posedge clk) begin
 			              ? fbuf[sd_buff_addr]
 			              : disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}];
 			sd_buff_wr <= 1;
-		end
-		else begin
-			sd_buff_wr <= 0;
 			if (sd_buff_addr == 9'd511) begin
 				sd_ack <= 0;
 				sd_rd_act <= 0;
 			end
-			else sd_buff_addr <= sd_buff_addr + 1'd1;
+		end
+		else begin
+			if (sd_buff_addr != 9'd511) sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
 	end
 	else if (sd_wr && !sd_ack) begin
@@ -917,6 +1107,35 @@ initial begin
 		      "a stale mailbox injects no frames into the guest");
 	end
 
+	if (saw_kernel) begin : guard_report
+		integer gg;
+		reg [8*6:1] mname;
+		$display("=== resident kernel text guard %08x..%08x: %0d write(s) after handoff ===",
+		         guard_lo, guard_hi, guard_hits);
+		for (gg = 0; gg < guard_hits && gg < 32; gg = gg + 1) begin
+			case (guard_who[gg])
+				3'd0: mname = "CPU   "; 3'd1: mname = "WALKER";
+				3'd2: mname = "ENET  "; 3'd3: mname = "MO    ";
+				3'd4: mname = "SND   "; 3'd5: mname = "SCSI  ";
+				default: mname = "?     ";
+			endcase
+			$display("  [%0d] %0s pa=%08x data=%08x pc=%08x va=%08x mmu_pa=%08x",
+			         gg, mname, guard_addr[gg], guard_data[gg], guard_pc[gg],
+			         guard_va[gg], guard_pa[gg]);
+		end
+		begin : cwr_dump
+			integer q, base;
+			base = (cwr_n > 24) ? cwr_n - 24 : 0;
+			$display("--- last %0d CPU RAM stores before the trip (va -> pa) ---",
+			         cwr_n - base);
+			for (q = base; q < cwr_n; q = q + 1)
+				$display("    va=%08x -> pa=%08x data=%08x pc=%08x",
+				         cwr_va[q % 64], cwr_pa[q % 64], cwr_data[q % 64], cwr_pc[q % 64]);
+		end
+		check(guard_hits == 0,
+		      "no master writes into resident kernel text after the kernel runs");
+	end
+
 
 	if (bootfd) begin
 		$display("floppy register accesses: %0d, sectors fetched: %0d",
@@ -924,12 +1143,18 @@ initial begin
 		fb_dump;
 	end
 
-	if (bootsd) begin
+	if (bootsd) begin : scdma_dump
+		integer kk;
+		$display("=== SCSI DMA channel writes to memory (frozen at berr) ===");
+		for (kk = 0; kk < scdma_n && kk < 64; kk = kk + 1)
+			$display("  [%0d] addr=%08x data=%08x", kk, scdma_addr[kk], scdma_data[kk]);
 		$display("SD reads: %0d, SCSI DMA words to memory: %0d",
 		         sd_reads, scsi_dma_writes);
 		check(saw_esp_sel, "boot: ROM selected the SCSI disk");
 		check(sd_lba0, "boot: sector 0 fetched from the SD image");
 		check(scsi_dma_writes >= 128, "boot: a full sector reached memory by DMA");
+		if (img_fd != 0)
+			check(saw_kernel, "boot: real disk image transferred control to the kernel");
 		fb_dump;
 	end
 

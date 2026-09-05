@@ -253,12 +253,14 @@ reg  [7:0] sbuf [0:1023];
 reg  [7:0] sbuf_q;
 reg        sd_rd_act;
 
-wire        in_sd  = (sd_rd | sd_wr | sd_ack);
+// hps_io's block-write strobe is pipelined and can remain asserted for the
+// final byte after sd_ack falls.  sd_rd_act is ownership latched from this
+// drive's ack, so it admits that tail without accepting another slot's data.
+wire        in_sd_read = ((est == E_RD_GO) || (est == E_RD_ACK)) &&
+                         (sd_rd_act || sd_ack);
+wire        in_sd  = (sd_rd_act | sd_rd | sd_wr | sd_ack);
 wire  [9:0] s_addr = in_sd ? {1'b0, sd_buff_addr} : buf_addr;
-// only this drive's acknowledged transfer may fill the buffer: the
-// host's buffer bus is shared, and the strobe alone says nothing
-// about whose sector is streaming
-wire        s_we   = in_sd ? (sd_buff_wr & sd_rd_act & sd_ack) : buf_we;
+wire        s_we   = in_sd ? (sd_buff_wr & in_sd_read) : buf_we;
 wire  [7:0] s_wd   = in_sd ? sd_buff_dout : buf_wdata;
 
 assign buf_q       = sbuf_q;
@@ -570,13 +572,13 @@ always @(posedge clk) begin
 			end
 			else begin
 				sd_rd <= 1;
-				sd_rd_act <= 1;
 				est <= E_RD_GO;
 			end
 		end
 
 		E_RD_GO: if (sd_ack) begin
 			sd_rd <= 0;
+			sd_rd_act <= 1;
 			est <= E_RD_ACK;
 		end
 

@@ -13,11 +13,19 @@
 //  The initiator command set is the one Previous emulates: select
 //  with/without ATN reads the CDB from the FIFO, the target executes
 //  the command, transfer info moves data through the DMA channel,
-//  ICCS collects status and message, message accepted disconnects.
+//  ICCS collects status and message; message accepted reports the ESP's
+//  disconnected interrupt after the command-complete message is accepted.
 //  Selecting an absent target times out with a disconnect interrupt.
 //============================================================================
 
-module next_scsi #(parameter CLK_HZ = 50000000)
+module next_scsi #(
+	parameter CLK_HZ = 50000000,
+	// One bit per SCSI target: set means the target is a CD-ROM (SONY
+	// CDU-541: INQUIRY type 0x05, removable, 2048-byte sectors) instead of
+	// a 512-byte fixed disk.  The NeXT install floppy scans the bus for a
+	// type-0x05 device, so a data-CD image must present as one.
+	parameter [5:0] CD_UNITS = 6'b000000
+)
 (
 	input         clk,
 	input         reset,
@@ -36,11 +44,15 @@ module next_scsi #(parameter CLK_HZ = 50000000)
 	// DMA master port (32-bit words in main RAM)
 	output reg        m_req,
 	output reg        m_we,
-	output reg [23:0] m_addr,
+	// Preserve the complete word address through arbitration.  Truncating
+	// this to the RAM aperture here silently wrapped bad DMA descriptors
+	// into unrelated RAM, including MMU tables.
+	output reg [29:0] m_addr,
 	output reg  [3:0] m_be,
 	output reg [31:0] m_din,
 	input      [31:0] m_dout,
 	input             m_ack,
+	input             m_err,
 
 	// The floppy shares this DMA channel: when the controller switches
 	// it over, the engine moves the floppy's sector buffer instead of
@@ -144,6 +156,11 @@ assign sd_unit = t_unit;
 wire        disk_present = disk_present_v[t_unit];
 wire        disk_ro      = disk_ro_v[t_unit];
 wire [31:0] img_blocks   = img_blocks_v[t_unit];
+// A CD-ROM target reports the CD-ROM INQUIRY device type (0x05) so the
+// install media scan finds it, and is read-only, but is otherwise a normal
+// 512-byte-block target: the boot/installer reads SCSI devices in 512-byte
+// blocks and a CD ISO reads back correctly that way.
+wire        t_is_cd      = CD_UNITS[t_unit];
 
 reg  [7:0] t_status;             // status byte for ICCS
 reg  [7:0] t_message;            // message byte for ICCS
@@ -179,8 +196,12 @@ reg        g_run = 0;
 reg  [7:0] d_csr;
 reg [31:0] d_next, d_limit, d_start, d_stop;
 reg        d_dev2m;             // last DMA CSR write bit 2
-reg        dma_flush_pending;
+// ESPCTRL_FLUSH is a CPU write but the RAM port is asynchronous.  The ROM
+// can issue several pumps before the first RAM acknowledgement, so retain
+// every write instead of collapsing them into one pending bit.
+reg  [3:0] dma_flush_count;
 reg  [4:0] dma_flush_return;
+reg        dma_flush_active;    // current memory request is a queued FLUSH
 reg  [1:0] dma_irq_resume;      // 1: retained DI bytes, 2: retained DO bytes
 // saved registers: plain storage on the non-turbo board (the engine
 // never writes them, DMA_Saved_*_Read/Write in dma.c)
@@ -252,6 +273,10 @@ localparam GAP_US    = 9'd100;    // ESP_IO tick
 reg  [8:0] gap_us;
 
 reg [31:0] sd_lba_r;
+// hps_io pipelines sd_buff_wr beyond the cycle which drops sd_ack.  Keep
+// ownership through that falling edge so the final byte of the block is not
+// discarded, while still rejecting the shared stream before our ack arrives.
+reg        sd_read_owned;
 assign sd_lba = sd_lba_r;
 
 //----------------------------------------------------------------------------
@@ -354,10 +379,11 @@ assign rdata = sel_esp ? {`ESP_READ(a_even), `ESP_READ(a_odd)} :
 // data buffer port
 //----------------------------------------------------------------------------
 
-// The buffer bus from the host is one stream shared by every image
-// slot; only this device's ack says the bytes are for it.  Waiting is
-// not enough - while one device waits, another's sector streams past.
-wire in_sd_rd = ((xst == X_SD_RD_GO) || (xst == X_SD_RD_ACK)) && sd_ack;
+// The buffer bus from the host is one stream shared by every image slot.
+// sd_ack identifies the owner at the start, then sd_read_owned covers the
+// delayed final write strobe after hps_io has lowered sd_ack.
+wire in_sd_rd = ((xst == X_SD_RD_GO) || (xst == X_SD_RD_ACK)) &&
+                (sd_ack || sd_read_owned);
 wire in_sd_wr = (xst == X_SD_WR_GO) || (xst == X_SD_WR_ACK);
 
 reg        eng_we;
@@ -391,7 +417,11 @@ function automatic [7:0] inq_byte;
 	input [7:0] i;
 	begin
 		case (i)
-			8'd00: inq_byte = (t_lun != 0) ? 8'h7F : 8'h00; // disk / not present
+			// byte 0: peripheral device type - 0x05 CD-ROM, else 0x00 disk
+			8'd00: inq_byte = (t_lun != 0) ? 8'h7F :
+			                  t_is_cd ? 8'h05 : 8'h00;
+			// byte 1: RMB (removable) set for the CD-ROM
+			8'd01: inq_byte = t_is_cd ? 8'h80 : 8'h00;
 			8'd02: inq_byte = 8'h01;   // ANSI SCSI-1
 			8'd03: inq_byte = 8'h01;   // SCSI-1 response format
 			8'd04: inq_byte = 8'h31;   // additional length
@@ -399,14 +429,24 @@ function automatic [7:0] inq_byte;
 			8'd08: inq_byte = "P"; 8'd09: inq_byte = "r"; 8'd10: inq_byte = "e";
 			8'd11: inq_byte = "v"; 8'd12: inq_byte = "i"; 8'd13: inq_byte = "o";
 			8'd14: inq_byte = "u"; 8'd15: inq_byte = "s";
-			8'd16: inq_byte = "H"; 8'd17: inq_byte = "D"; 8'd18: inq_byte = "D";
-			8'd32: inq_byte = "B";
+			// product id: "CD-ROM" for the optical target, "HDD" otherwise
+			8'd16: inq_byte = t_is_cd ? "C" : "H";
+			8'd17: inq_byte = t_is_cd ? "D" : "D";
+			8'd18: inq_byte = t_is_cd ? "-" : "D";
+			8'd19: inq_byte = t_is_cd ? "R" : " ";
+			8'd20: inq_byte = t_is_cd ? "O" : " ";
+			8'd21: inq_byte = t_is_cd ? "M" : " ";
+			8'd32: inq_byte = t_is_cd ? "1" : "B";
 			default: inq_byte = (i >= 8'd16 && i <= 8'd31) ? " " : 8'h00;
 		endcase
 	end
 endfunction
 
 wire [31:0] last_lba = img_blocks - 32'd1;
+// The CD-ROM reports the CD-ROM device type for the install-media scan, but
+// is read as 512-byte blocks like a disk: the NeXT boot/installer reads SCSI
+// targets with a 512-byte block size, and a CD ISO on a 512-byte target reads
+// back correctly (ISO9660's 2048-byte logical block is four host blocks).
 
 function automatic [7:0] cap_byte;
 	input [7:0] i;
@@ -530,7 +570,7 @@ function automatic [7:0] mode_byte;
 			// header and block descriptor
 			case (i)
 				8'd0: mode_byte = ms_total - 8'd1;
-				8'd2: mode_byte = disk_ro ? 8'h80 : 8'h00;
+				8'd2: mode_byte = (disk_ro || t_is_cd) ? 8'h80 : 8'h00;
 				8'd3: mode_byte = 8'h08; // reference retains this even with DBD
 				8'd5: mode_byte = img_blocks[23:16];
 				8'd6: mode_byte = img_blocks[15:8];
@@ -632,6 +672,36 @@ task automatic dma_hit_limit;
 	end
 endtask
 
+// Previous stops the channel and reports COMPLETE|BUSEXC when a DMA
+// memory access faults.  Keep SUPDATE intact, as its DMA_CSR exception
+// path does, but never advance NEXT or consume buffered data.
+task automatic dma_bus_exception;
+	begin
+		d_csr[0] <= 0;
+		d_csr[3] <= 1;
+		d_csr[4] <= 1;
+		gap_us <= GAP_US;
+	end
+endtask
+
+task automatic esp_disconnect_reset;
+	begin
+		cmd_busy <= 0;
+		phase <= PHASE_DO;
+		intstatus <= INTR_DC;
+		dma_flush_count <= 0;
+		dma_flush_return <= X_IDLE;
+		dma_flush_active <= 0;
+		dma_irq_resume <= 0;
+		dly_us <= ESP_DELAY_US;
+		xst <= X_INT_WAIT;
+		m_req <= 0;
+		sd_rd <= 0;
+		sd_wr <= 0;
+		sd_read_owned <= 0;
+	end
+endtask
+
 task automatic hard_reset;
 	begin
 		cmd_busy <= 0;
@@ -644,8 +714,9 @@ task automatic hard_reset;
 		status <= status & ~(STAT_INT|STAT_VGC|STAT_PE|STAT_GE|STAT_TC);
 		intstatus <= 8'h00;
 		mode_dma <= 0;
-		dma_flush_pending <= 0;
+		dma_flush_count <= 0;
 		dma_flush_return <= X_IDLE;
+		dma_flush_active <= 0;
 		dma_irq_resume <= 0;
 		counter <= 0;
 		seqstep <= 8'h00;
@@ -657,6 +728,7 @@ task automatic hard_reset;
 		m_req <= 0;
 		sd_rd <= 0;
 		sd_wr <= 0;
+		sd_read_owned <= 0;
 	end
 endtask
 
@@ -699,6 +771,12 @@ wire [2:0] cmd_lun = sel_atn ? t_lun : cdb1[7:5];
 wire cpu_fifo_access = sel_esp &&
 	((be[1] && a_even == 6'h02) || (be[0] && a_odd == 6'h02));
 
+wire cpu_flush_write = sel_esp && we && be[1] && (a_even == 6'h20) &&
+                       wdata[10] && d_csr[0] && d_dev2m &&
+                       (d_next < d_limit);
+wire dma_flush_done = (xst == X_DI_WR) && m_req && m_ack &&
+                      dma_flush_active;
+
 // Execute the active (bottom) rank.  Writes to the command register are
 // queued separately below so a command cannot preempt an in-flight one.
 task automatic start_command;
@@ -728,7 +806,8 @@ task automatic start_command;
 			7'h03: begin                  // reset SCSI bus
 				cmd_busy <= 0;
 				mode_dma <= 0;
-				dma_flush_pending <= 0;
+				dma_flush_count <= 0;
+				dma_flush_active <= 0;
 				dma_irq_resume <= 0;
 				counter <= 0;
 				seqstep <= 8'h00;
@@ -739,6 +818,7 @@ task automatic start_command;
 				m_req <= 0;
 				sd_rd <= 0;
 				sd_wr <= 0;
+				sd_read_owned <= 0;
 				if (!configuration[6]) begin         // !CFG1_RESREPT
 					intstatus <= INTR_RST;
 					phase <= PHASE_DO;
@@ -776,12 +856,7 @@ task automatic start_command;
 				xst <= X_ICCS1;
 			end
 			7'h12: begin                 // message accepted
-				cmd_busy <= 0;
-				dma_irq_resume <= 0;
-				phase <= PHASE_DO;
-				intstatus <= INTR_DC;
-				dly_us <= ESP_DELAY_US;
-				xst <= X_INT_WAIT;
+				esp_disconnect_reset;
 			end
 			7'h18: begin                 // transfer pad
 				pad_mode <= 1;
@@ -795,8 +870,10 @@ task automatic start_command;
 				m_req <= 0;
 				sd_rd <= 0;
 				sd_wr <= 0;
+				sd_read_owned <= 0;
 				seqstep <= 8'h00;
-				dma_flush_pending <= 0;
+				dma_flush_count <= 0;
+				dma_flush_active <= 0;
 				dma_irq_resume <= 0;
 				sel_atn <= v[1];
 				cdb_n <= 0;
@@ -836,9 +913,7 @@ endtask
 task automatic reg_write;
 	input [5:0] a;
 	input [7:0] v;
-	reg   [4:0] dma_head;
 	begin
-		dma_head = dma_buf_limit - dma_buf_size;
 		case (a)
 			6'h00: wr_tcl <= v;
 			6'h01: wr_tch <= v;
@@ -872,21 +947,7 @@ task automatic reg_write;
 				// dma_esp_flush_buffer(): only an enabled device-to-memory
 				// channel with room in its window may drain one padded word.
 				if (v[2] && d_csr[0] && d_dev2m && d_next < d_limit) begin
-					dma_flush_pending <= 1;
-					dma_flush_return <= xst;
-					case (dma_buf_size)
-						5'd0: word_buf <= 32'h00000000;
-						5'd1: word_buf <= {dma_buf[dma_head[3:0]], 24'h000000};
-						5'd2: word_buf <= {dma_buf[dma_head[3:0]],
-						                      dma_buf[dma_head[3:0] + 1'd1], 16'h0000};
-						5'd3: word_buf <= {dma_buf[dma_head[3:0]],
-						                      dma_buf[dma_head[3:0] + 1'd1],
-						                      dma_buf[dma_head[3:0] + 4'd2], 8'h00};
-						default: word_buf <= {dma_buf[dma_head[3:0]],
-						                     dma_buf[dma_head[3:0] + 1'd1],
-						                     dma_buf[dma_head[3:0] + 4'd2],
-						                     dma_buf[dma_head[3:0] + 4'd3]};
-					endcase
+					if (dma_flush_count == 0) dma_flush_return <= xst;
 					xst <= X_DI_WR;
 				end
 			end
@@ -930,8 +991,9 @@ always @(posedge clk) begin
 		lba <= 0; blockcounter <= 0;
 		d_csr <= 0;
 		d_dev2m <= 0;
-		dma_flush_pending <= 0;
+		dma_flush_count <= 0;
 		dma_flush_return <= X_IDLE;
+		dma_flush_active <= 0;
 		dma_irq_resume <= 0;
 		d_next <= 0; d_limit <= 0; d_start <= 0; d_stop <= 0;
 		s_next <= 0; s_limit <= 0; s_start <= 0; s_stop <= 0;
@@ -954,6 +1016,7 @@ always @(posedge clk) begin
 		dly_us <= 0;
 		sd_lba_r <= 0;
 		sd_rd <= 0; sd_wr <= 0;
+		sd_read_owned <= 0;
 		m_req <= 0; m_we <= 0; m_addr <= 0; m_be <= 0; m_din <= 0;
 		eng_we <= 0; eng_addr <= 0; eng_wd <= 0;
 		tickcnt <= 0;
@@ -963,6 +1026,16 @@ always @(posedge clk) begin
 		eng_we <= 0;
 		flp_done <= 0;
 		if (tick && gap_us != 0) gap_us <= gap_us - 1'd1;
+
+		// A FLUSH write is synchronous in Previous, but this memory port can
+		// stall for many CPU cycles.  Count each accepted write, including
+		// writes arriving while an earlier flush is still outstanding.
+		case ({cpu_flush_write, dma_flush_done})
+			2'b10: if (dma_flush_count != 4'hF)
+				dma_flush_count <= dma_flush_count + 1'd1;
+			2'b01: dma_flush_count <= dma_flush_count - 1'd1;
+			default: ;
+		endcase
 
 		// The floppy holds its request up until it sees the sector
 		// completed, so a level test would restart the channel on the
@@ -1125,7 +1198,7 @@ always @(posedge clk) begin
 							lba <= (cdb0 == 8'h0A) ? {11'd0, cdb1[4:0], cdb2, cdb3}
 							                       : {cdb2, cdb3, cdb4, cdb5};
 							blockcounter <= (cdb0 == 8'h0A) ? cnt6 : cnt10;
-							if (disk_ro) begin
+							if (disk_ro || t_is_cd) begin
 								t_status <= STAT_CHECK_COND;
 								sense_code[t_unit] <= SC_WRITE_PROTECT;
 								sense_valid[t_unit] <= 0;
@@ -1269,12 +1342,14 @@ always @(posedge clk) begin
 			sd_rd <= 1;
 			if (sd_ack) begin
 				sd_rd <= 0;
+				sd_read_owned <= 1;
 				xst <= X_SD_RD_ACK;
 			end
 		end
 
 		X_SD_RD_ACK: begin
 			if (!sd_ack) begin
+				sd_read_owned <= 0;
 				buf_pos <= 0;
 				buf_limit <= 10'd512;
 				t_status <= STAT_GOOD;
@@ -1442,19 +1517,33 @@ always @(posedge clk) begin
 		// this state but writes exactly one padded word and then returns.
 		X_DI_WR: begin
 			if (!m_req) begin
-				if (dma_flush_pending) begin
+				if (dma_flush_count != 0) begin
 					m_req <= 1;
 					m_we <= 1;
-					m_addr <= d_next[25:2];
+					m_addr <= d_next[31:2];
 					m_be <= 4'hF;
-					m_din <= word_buf;
+					dma_flush_active <= 1;
+					case (dma_buf_size)
+						5'd0: m_din <= 32'h00000000;
+						5'd1: m_din <= {dma_buf[dma_buf_head[3:0]], 24'h000000};
+						5'd2: m_din <= {dma_buf[dma_buf_head[3:0]],
+						                    dma_buf[dma_buf_head[3:0] + 1'd1], 16'h0000};
+						5'd3: m_din <= {dma_buf[dma_buf_head[3:0]],
+						                    dma_buf[dma_buf_head[3:0] + 1'd1],
+						                    dma_buf[dma_buf_head[3:0] + 4'd2], 8'h00};
+						default: m_din <= {dma_buf[dma_buf_head[3:0]],
+						                  dma_buf[dma_buf_head[3:0] + 1'd1],
+						                  dma_buf[dma_buf_head[3:0] + 4'd2],
+						                  dma_buf[dma_buf_head[3:0] + 4'd3]};
+					endcase
 				end
 				else if (d_csr[0] && gap_us == 0 && d_next < d_limit &&
 				         dma_buf_size >= 4) begin
 					m_req <= 1;
 					m_we <= 1;
-					m_addr <= d_next[25:2];
+					m_addr <= d_next[31:2];
 					m_be <= 4'hF;
+					dma_flush_active <= 0;
 					m_din <= {dma_buf[dma_buf_head[3:0]],
 					          dma_buf[dma_buf_head[3:0] + 1'd1],
 					          dma_buf[dma_buf_head[3:0] + 4'd2],
@@ -1471,8 +1560,18 @@ always @(posedge clk) begin
 					else xst <= X_DI_CHK;
 				end
 			end
+			else if (m_err) begin
+				m_req <= 0;
+				dma_flush_active <= 0;
+				dma_bus_exception;
+				dma_flush_count <= 0;
+				dma_irq_resume <= 0;
+				flp_active <= 0;
+				xst <= X_IDLE;
+			end
 			else if (m_ack) begin
 				m_req <= 0;
+				dma_flush_active <= 0;
 				// A malformed, non-word-aligned limit must not carry next past
 				// the value software subtracts to calculate bytes transferred.
 				d_next <= (d_next + 32'd4 > d_limit) ? d_limit
@@ -1482,17 +1581,24 @@ always @(posedge clk) begin
 					dma_buf_limit <= 0;
 				end
 				else dma_buf_size <= dma_buf_size - 5'd4;
-				if (dma_flush_pending) begin
-					dma_flush_pending <= 0;
-					if (d_next + 32'd4 >= d_limit) dma_hit_limit;
-					if (dma_irq_resume == 2'd1) begin
-						if (dma_buf_size <= 4) dma_irq_resume <= 0;
-						// A control-register FLUSH returns after one word;
-						// it must not fall through and drain a retained full
-						// buffer as though a new ESP I/O event had arrived.
-						xst <= X_IDLE;
+				if (dma_flush_active) begin
+					if (d_next + 32'd4 >= d_limit) begin
+						dma_hit_limit;
+						// Further queued pumps cannot write this completed
+						// window.  A chained window is re-armed by software.
+						dma_flush_count <= 0;
+						if (dma_irq_resume == 2'd1 && dma_buf_size <= 4)
+							dma_irq_resume <= 0;
+						xst <= (dma_irq_resume == 2'd1) ? X_IDLE
+						                                     : dma_flush_return;
 					end
-					else xst <= dma_flush_return;
+					else if (dma_irq_resume == 2'd1) begin
+						if (dma_buf_size <= 4) dma_irq_resume <= 0;
+						// Each queued control-register write drains one word.
+						xst <= (dma_flush_count > 1) ? X_DI_WR : X_IDLE;
+					end
+					else xst <= (dma_flush_count > 1) ? X_DI_WR
+					                                      : dma_flush_return;
 				end
 				else if (dma_irq_resume == 2'd1 && dma_buf_size <= 4) begin
 					if (d_next + 32'd4 >= d_limit) dma_hit_limit;
@@ -1562,9 +1668,16 @@ always @(posedge clk) begin
 				if (d_csr[0] && d_next < d_limit && gap_us == 0) begin
 					m_req <= 1;
 					m_we <= 0;
-					m_addr <= d_next[25:2];
+					m_addr <= d_next[31:2];
 					m_be <= 4'hF;
 				end
+			end
+			else if (m_err) begin
+				m_req <= 0;
+				dma_bus_exception;
+				dma_irq_resume <= 0;
+				flp_active <= 0;
+				xst <= X_IDLE;
 			end
 			else if (m_ack) begin
 				m_req <= 0;
@@ -1804,8 +1917,11 @@ always @(posedge clk) begin
 			end
 		end
 
-		// DMA_CSR_Write latches direction on every write, including zero.
-		if (sel_csr & we) begin
+		// DMA_CSR_Write is a 32-bit register whose command byte is in the
+		// upper 16-bit bus beat.  The 68040 follows that with a zero lower
+		// beat at addr+2; treating that second beat as another CSR write
+		// cleared DEV2M just before the ROM pumped ESPCTRL_FLUSH.
+		if (sel_csr & we & !addr[1]) begin
 			d_dev2m <= csr_or[2];
 			if (csr_or != 0) begin
 				if (csr_or[4]) d_csr <= d_csr & ~8'b00001011; // RESET
@@ -1813,12 +1929,21 @@ always @(posedge clk) begin
 					dma_status <= 0;
 					dma_buf_size <= 0;
 					dma_buf_limit <= 0;
-					dma_flush_pending <= 0;
+					dma_flush_count <= 0;
+					dma_flush_active <= 0;
 					dma_flush_return <= X_IDLE;
 					dma_irq_resume <= 0;
 				end
 				if (csr_or[1]) d_csr[1] <= 1;                 // SETSUPDATE
-				if (csr_or[0]) d_csr[0] <= 1;                 // SETENABLE
+				if (csr_or[0]) begin                            // SETENABLE
+					// Previous rejects a non-longword NEXT or a LIMIT that is
+					// not on its 16-byte burst boundary.  Report it through
+					// the hardware-visible exception bits instead of allowing
+					// a partial/wrapped transfer.
+					if (d_next[1:0] != 0 || d_limit[3:0] != 0)
+						dma_bus_exception;
+					else d_csr[0] <= 1;
+				end
 				if (csr_or[3]) d_csr[3] <= 0;                 // CLRCOMPLETE
 			end
 		end
@@ -1845,8 +1970,9 @@ always @(posedge clk) begin
 			dma_status <= 0;
 			dma_buf_size <= 0;
 			dma_buf_limit <= 0;
-			dma_flush_pending <= 0;
+			dma_flush_count <= 0;
 			dma_flush_return <= X_IDLE;
+			dma_flush_active <= 0;
 			dma_irq_resume <= 0;
 			if (!addr[1]) begin if (be[1]) d_next[31:24] <= wdata[15:8]; if (be[0]) d_next[23:16] <= wdata[7:0]; end
 			else begin

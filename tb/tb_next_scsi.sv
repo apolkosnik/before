@@ -32,16 +32,21 @@ reg  [15:0] wdata = 0;
 wire [15:0] rdata;
 
 wire        m_req, m_we, m_ack;
-wire [23:0] m_addr;
+wire [29:0] m_addr;
 wire  [3:0] m_be;
 wire [31:0] m_din;
 reg  [31:0] m_dout;
+wire        m_addr_valid = (m_addr[29:24] == 6'd0) ||
+                           (m_addr[29:24] == 6'd1);
+wire        m_err = m_req && !m_addr_valid;
+integer     m_err_count = 0;
 
 wire int_scsi, int_scsi_dma;
 
 reg         img_mounted = 0;
 reg  [63:0] img_size = 0;
 reg         img_mounted2 = 0;
+reg         img_mounted_cd = 0;   // target 3, the CD-ROM
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
 reg         sd_ack = 0;
@@ -76,15 +81,15 @@ integer seize = 0;
 always @(posedge clk)
 	if (!reset && scsi_busy && dut.flp_active) seize = seize + 1;
 
-next_scsi #(.CLK_HZ(1000000)) dut
+next_scsi #(.CLK_HZ(1000000), .CD_UNITS(6'b001000)) dut   // target 3 is a CD-ROM
 (
 	.clk(clk), .reset(reset),
 	.sel_esp(sel_esp), .sel_csr(sel_csr), .sel_sptr(sel_sptr), .sel_ptr(sel_ptr), .sel_ini(sel_ini),
 	.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
-	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
+	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(m_err),
 	.int_scsi(int_scsi), .int_scsi_dma(int_scsi_dma),
-	.img_mounted({4'b0000, img_mounted2, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
+	.img_mounted({2'b00, img_mounted_cd, 1'b0, img_mounted2, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
 	.sd_unit(),
 	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
@@ -100,11 +105,14 @@ next_scsi #(.CLK_HZ(1000000)) dut
 
 reg [31:0] ram [0:16383];
 reg        ack_r;
+reg        hold_m_ack = 0;
 assign m_ack = ack_r;
 
 always @(posedge clk) begin
+	if (m_err) m_err_count <= m_err_count + 1;
 	if (reset) ack_r <= 0;
-	else if (!m_req) ack_r <= 0;
+	else if (hold_m_ack) ack_r <= 0;
+	else if (!m_req || !m_addr_valid) ack_r <= 0;
 	else if (!ack_r) begin
 		if (m_we) begin
 			if (m_be[3]) ram[m_addr[13:0]][31:24] <= m_din[31:24];
@@ -136,6 +144,8 @@ localparam DISK_BLOCKS = 8;
 
 reg [7:0] disk  [0:DISK_BLOCKS*512-1];
 reg [7:0] disk2 [0:DISK_BLOCKS*512-1];   // SCSI target 1
+localparam CD_SECTORS = 4;               // 4 x 2048-byte CD sectors = 16 host blocks
+reg [7:0] cd [0:CD_SECTORS*2048-1];      // SCSI target 2, the CD-ROM
 
 // disk byte pattern: block ^ offset, distinct per position
 function [7:0] pat;
@@ -148,6 +158,8 @@ endfunction
 
 integer sdi;
 initial begin
+	for (sdi = 0; sdi < CD_SECTORS*2048; sdi = sdi + 1)
+		cd[sdi] = sdi[7:0] ^ sdi[15:8] ^ 8'hA5;    // distinct CD content
 	for (sdi = 0; sdi < DISK_BLOCKS*512; sdi = sdi + 1) begin
 		disk[sdi]  = pat(sdi / 512, sdi % 512);
 		disk2[sdi] = ~pat(sdi / 512, sdi % 512);   // the other disk
@@ -156,26 +168,29 @@ end
 
 // serve sd_rd / sd_wr with the hps_io handshake
 always @(posedge clk) begin
+	// hps_io registers sd_buff_wr separately from sd_ack.  Its final write
+	// pulse is therefore observed by the device one clock after ack falls.
+	sd_buff_wr <= 0;
 	if (sd_rd && !sd_ack) begin
 		sd_ack <= 1;
 		sd_buff_addr <= 0;
-		sd_buff_wr <= 0;
 	end
 	else if (sd_ack && sd_rd_active) begin
 		// one byte every other cycle
 		if (!sd_buff_wr && sd_buff_addr <= 9'd511) begin
-			sd_buff_dout <= (dut.sd_unit == 3'd1)
+			sd_buff_dout <= (dut.sd_unit == 3'd3)
+			              ? cd   [{sd_lba[3:0], 9'd0} + {23'd0, sd_buff_addr}]
+			              : (dut.sd_unit == 3'd1)
 			              ? disk2[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}]
 			              : disk [{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}];
 			sd_buff_wr <= 1;
-		end
-		else begin
-			sd_buff_wr <= 0;
 			if (sd_buff_addr == 9'd511) begin
 				sd_ack <= 0;
 				sd_rd_active <= 0;
 			end
-			else sd_buff_addr <= sd_buff_addr + 1'd1;
+		end
+		else begin
+			if (sd_buff_addr != 9'd511) sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
 	end
 	else if (sd_ack && sd_wr_active) begin
@@ -261,6 +276,22 @@ task sptr_wr32;
 	end
 endtask
 
+task rd_ptr32;
+	input [5:0] a;
+	output [31:0] v;
+	begin
+		@(posedge clk);
+		sel_ptr <= 1; addr <= a; we <= 0; be <= 2'b11;
+		@(posedge clk);
+		#1 v[31:16] = rdata;
+		addr <= a + 6'd2;
+		@(posedge clk);
+		#1 v[15:0] = rdata;
+		sel_ptr <= 0;
+		@(posedge clk);
+	end
+endtask
+
 task sptr_rd32;
 	input [5:0] a;
 	output [31:0] v;
@@ -293,6 +324,11 @@ task csr_cmd;
 	begin
 		@(posedge clk);
 		sel_csr <= 1; addr <= 6'h00; we <= 1; be <= 2'b11; wdata <= {8'h00, v};
+		@(posedge clk);
+		// The real 68040 writes the 32-bit CSR in two 16-bit bus beats.
+		// Its lower half is zero and must not be interpreted as a second
+		// direction write that clears the upper beat's DEV2M bit.
+		addr <= 6'h02; wdata <= 16'h0000;
 		@(posedge clk);
 		sel_csr <= 0; we <= 0;
 	end
@@ -386,6 +422,20 @@ task select_atn10;
 	end
 endtask
 
+task select_atn10_target;
+	input [2:0] target;
+	input [7:0] c0, c1, c2, c3, c4, c5, c6, c7, c8, c9;
+	begin
+		esp_wr8(6'h02, 8'h80);
+		esp_wr8(6'h02, c0); esp_wr8(6'h02, c1); esp_wr8(6'h02, c2);
+		esp_wr8(6'h02, c3); esp_wr8(6'h02, c4); esp_wr8(6'h02, c5);
+		esp_wr8(6'h02, c6); esp_wr8(6'h02, c7); esp_wr8(6'h02, c8);
+		esp_wr8(6'h02, c9);
+		esp_wr8(6'h04, {5'd0, target});
+		esp_wr8(6'h03, 8'h42);
+	end
+endtask
+
 // ICCS + message accepted, returns the status byte
 task finish_command;
 	output [7:0] sts;
@@ -399,6 +449,7 @@ task finish_command;
 		esp_wr8(6'h03, 8'h12);       // message accepted
 		wait_irq;
 		read_intr(v);
+		check(v == 8'h20, "message accepted: disconnected interrupt");
 	end
 endtask
 
@@ -914,6 +965,8 @@ initial begin
 		      "queued ICCS returns target status and command-complete message");
 		esp_wr8(6'h03, 8'h12);
 		wait_irq; read_intr(intr);
+		check(intr == 8'h20,
+		      "queued message accepted raises disconnected interrupt");
 	end
 	else begin
 		esp_wr8(6'h03, 8'h02);
@@ -1565,9 +1618,9 @@ initial begin
 	      dut.sense_valid[0] && dut.sense_info[0] == 8,
 	      "dma end crossing: check condition identifies LBA 8");
 
-	// esp_message_accepted() disconnects the target after the command-
-	// complete message: INTR_DC is reported and the reference leaves its
-	// disconnected bus phase at PHASE_DO.
+	// esp_message_accepted() raises the disconnected interrupt in Previous.
+	// The ROM boot path waits for this final completion indication after it
+	// accepts the command-complete message.
 	select_atn6(8'h00, 0, 0, 0, 0, 0);
 	wait_irq; read_intr(intr);
 	esp_wr8(6'h03, 8'h11);       // initiator command complete
@@ -1577,10 +1630,10 @@ initial begin
 	esp_wr8(6'h03, 8'h12);       // message accepted
 	wait_irq; read_intr(intr);
 	check(intr == 8'h20,
-	      "message accepted: reports disconnect interrupt");
+	      "message accepted: raises disconnected interrupt");
 	esp_rd8(6'h04, v);
-	check(v[2:0] == 3'd0,
-	      "message accepted: leaves the reference disconnected phase");
+	check(!int_scsi,
+	      "message accepted: interrupt status read lowers IRQ");
 
 	// A SCSI bus reset reports reset-detected and leaves the disconnected
 	// phase at data-out in esp_bus_reset().
@@ -1591,6 +1644,211 @@ initial begin
 	check(intr == 8'h80, "SCSI bus reset reports reset detected");
 	esp_rd8(6'h04, v);
 	check(v[2:0] == 3'd0, "SCSI bus reset leaves the data-out phase");
+
+	//------------------------------------------------------------
+	// The ROM's label read: a READ of a whole sector with the ESP
+	// counter and the DMA window both cut to 0x50 - the ROM only
+	// wants the first 80 bytes.  80 is five full 16 byte bursts, so
+	// nothing here is unaligned; every byte the ESP passes must reach
+	// memory and the transfer must complete, not stall part way with
+	// the tail held in the channel.
+	//------------------------------------------------------------
+	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'hDEADBEEF;
+	select_atn6(8'h08, 8'h00, 8'h00, 8'h02, 8'h01, 8'h00);   // READ lba 2
+	wait_irq;
+	read_intr(intr);
+	ptr_wr32(6'h10, 32'h00007000);
+	ptr_wr32(6'h14, 32'h00007050);           // 80 byte window
+	csr_cmd(8'h11);
+	esp_wr8(6'h00, 8'h50);                   // ESP count 80
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);                   // transfer info, DMA
+	wait_irq;
+	read_intr(intr);
+	ok = 1;
+	for (i = 0; i < 80; i = i + 1)
+		if (ram_byte(32'h00007000 + i) !== pat(2, i)) begin
+			if (ok) $display("  label byte %0d: got %02x want %02x",
+			                 i, ram_byte(32'h00007000 + i), pat(2, i));
+			ok = 0;
+		end
+	check(ok, "label read: all 80 bytes reach memory");
+	rd_ptr32(6'h10, d);
+	check(d == 32'h00007050, "label read: next rests on the limit");
+
+	//------------------------------------------------------------
+	// The same label read the way the v66 ROM drives it: ESPCTRL
+	// written first with CLK20 | ENABLE_INT | MODE_DMA | DMA_READ
+	// (0xB8), which routes transfer information down the memory DMA
+	// path.  This is the route the ROM takes on every disk boot.
+	//------------------------------------------------------------
+	esp_wr8(6'h20, 8'hB8);                   // ESPCTRL, as the ROM sets it
+	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'hDEADBEEF;
+	select_atn6(8'h08, 8'h00, 8'h00, 8'h02, 8'h01, 8'h00);
+	wait_irq;
+	read_intr(intr);
+	ptr_wr32(6'h10, 32'h00007800);
+	ptr_wr32(6'h14, 32'h00007850);           // 80 byte window
+	csr_cmd(8'h11);
+	esp_wr8(6'h00, 8'h50);
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	wait_irq;
+	read_intr(intr);
+	ok = 1;
+	for (i = 0; i < 80; i = i + 1)
+		if (ram_byte(32'h00007800 + i) !== pat(2, i)) begin
+			if (ok) $display("  ROM-route byte %0d: got %02x want %02x",
+			                 i, ram_byte(32'h00007800 + i), pat(2, i));
+			ok = 0;
+		end
+	check(ok, "ROM route: all 80 bytes reach memory with MODE_DMA set");
+	rd_ptr32(6'h10, d);
+	check(d == 32'h00007850, "ROM route: next rests on the limit");
+	esp_wr8(6'h20, 8'h00);                   // back to the bench default
+
+	//------------------------------------------------------------
+	// READ CAPACITY the way the v66 ROM takes it: the response is 8
+	// bytes, half a burst, so it sits in the channel until the ROM
+	// pumps ESPCTRL FLUSH - each pump drains one longword, padded
+	// with zeroes, as dma_esp_flush_buffer does.  The ROM builds its
+	// label buffer from the block size in this response; a flush that
+	// assembles the word wrongly hands it a wild pointer.
+	//------------------------------------------------------------
+	esp_wr8(6'h20, 8'hB8);
+	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'hDEADBEEF;
+	select_atn10(8'h25, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00,
+	             8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq;
+	read_intr(intr);
+	ini_wr32(32'h00007900);                  // seed next via the init reg
+	ptr_wr32(6'h14, 32'h00007910);           // a one-burst window
+	csr_cmd(8'h15);                          // SETENABLE | DEV2M
+	esp_wr8(6'h00, 8'h08);                   // ESP count 8
+	esp_wr8(6'h01, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	wait_irq;
+	read_intr(intr);
+
+	// The real RAM path may be busy for several CPU writes.  Queue all four
+	// ROM pumps while acknowledgements are held off, then ensure that each
+	// one drains a distinct padded longword when RAM resumes.
+	csr_cmd(8'h05);                          // enabled, DEV2M
+	hold_m_ack = 1;
+	for (i = 0; i < 4; i = i + 1) begin
+		esp_wr8(6'h20, 8'h34);               // FLUSH set
+		esp_wr8(6'h20, 8'h30);               // FLUSH clear
+	end
+	repeat (4) @(posedge clk);
+	check(dut.dma_flush_count == 4 && m_req,
+	      "capacity flush: all ROM pumps queue while RAM is stalled");
+	hold_m_ack = 0;
+	repeat (80) @(posedge clk);
+
+	rd_ptr32(6'h10, d);
+	$display("  after flush pumps: next=%08x  mem=%02x %02x %02x %02x %02x %02x %02x %02x",
+	         d, ram_byte(32'h00007900), ram_byte(32'h00007901),
+	         ram_byte(32'h00007902), ram_byte(32'h00007903),
+	         ram_byte(32'h00007904), ram_byte(32'h00007905),
+	         ram_byte(32'h00007906), ram_byte(32'h00007907));
+	ok = (ram_byte(32'h00007900) == 8'h00) && (ram_byte(32'h00007901) == 8'h00) &&
+	     (ram_byte(32'h00007902) == 8'h00) && (ram_byte(32'h00007903) == 8'h07) &&
+	     (ram_byte(32'h00007904) == 8'h00) && (ram_byte(32'h00007905) == 8'h00) &&
+	     (ram_byte(32'h00007906) == 8'h02) && (ram_byte(32'h00007907) == 8'h00);
+	check(ok, "capacity flush: the 8 byte response lands intact");
+	check(d == 32'h00007910, "capacity flush: every queued pump advances next");
+	check(ram_byte(32'h00007908) == 0 && ram_byte(32'h00007909) == 0 &&
+	      ram_byte(32'h0000790A) == 0 && ram_byte(32'h0000790B) == 0 &&
+	      ram_byte(32'h0000790C) == 0 && ram_byte(32'h0000790D) == 0 &&
+	      ram_byte(32'h0000790E) == 0 && ram_byte(32'h0000790F) == 0,
+	      "capacity flush: surplus pumps write padded zero words");
+	finish_command(sts);
+	esp_wr8(6'h20, 8'h00);
+
+	//------------------------------------------------------------
+	// Bad channel windows must be visible errors, never truncated RAM
+	// accesses.  The standalone bench treats address regions 0 and 1 as
+	// RAM so its compact test pointers still work; region 2 exercises the
+	// same high-bit rejection next_system applies to anything outside 0x04-
+	// 0x07ffffff.
+	//------------------------------------------------------------
+	csr_cmd(8'h30);
+	ini_wr32(BUF + 32'd1);
+	ptr_wr32(6'h14, BUF + 32'd16);
+	csr_cmd(8'h11);
+	repeat (4) @(posedge clk);
+	check(!dut.d_csr[0] && dut.d_csr[3] && dut.d_csr[4] &&
+	      dut.d_next == BUF + 32'd1,
+	      "misaligned SCSI DMA window completes with BUSEXC without moving next");
+
+	csr_cmd(8'h30);
+	ini_wr32(32'h08000000);
+	ptr_wr32(6'h14, 32'h08000010);
+	csr_cmd(8'h15);
+	flush_dma_in_words(1);
+	repeat (4) @(posedge clk);
+	check(m_err_count != 0 && m_addr == 30'h02000000,
+	      "SCSI DMA preserves invalid high address bits through its master port");
+	check(!dut.d_csr[0] && dut.d_csr[3] && dut.d_csr[4] &&
+	      dut.d_next == 32'h08000000,
+	      "rejected SCSI DMA access completes with BUSEXC and cannot advance");
+
+	//------------------------------------------------------------
+	// CD-ROM target (target 3): reports the CD-ROM device type (0x05) so the
+	// install-media scan finds it, but is read as a 512-byte-block device
+	// like a disk (the NeXT boot/installer reads SCSI targets in 512-byte
+	// blocks; a CD ISO reads back correctly that way).  cd[] is
+	// CD_SECTORS*2048 bytes = 16 host blocks.
+	//------------------------------------------------------------
+	img_size = CD_SECTORS * 2048;            // 8192 bytes = 16 host blocks
+	img_mounted_cd = 1; @(posedge clk); img_mounted_cd = 0;
+	repeat (4) @(posedge clk);
+
+	// INQUIRY: device type 0x05, removable, product "CD-ROM"
+	select_atn6_target(3'd3, 8'h12, 8'h00, 8'h00, 8'h00, 8'd54, 8'h00);
+	wait_irq; read_intr(intr);
+	for (i = 0; i < 16; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	ti_dma_in(17'd54, BUF, BUF + 32'd64);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF) == 8'h05, "cd inquiry: device type 0x05 (CD-ROM)");
+	check(ram_byte(BUF + 1) == 8'h80, "cd inquiry: removable media bit set");
+	check(ram_byte(BUF + 16) == "C" && ram_byte(BUF + 17) == "D" &&
+	      ram_byte(BUF + 18) == "-" && ram_byte(BUF + 19) == "R" &&
+	      ram_byte(BUF + 20) == "O" && ram_byte(BUF + 21) == "M",
+	      "cd inquiry: product id CD-ROM");
+	finish_command(sts);
+
+	// READ CAPACITY: 512-byte blocks like a disk
+	select_atn6_target(3'd3, 8'h25, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	for (i = 0; i < 4; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	ti_dma_in(17'd8, BUF, BUF + 32'd16);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 3) == (CD_SECTORS*4 - 1),
+	      "cd read capacity: last 512-byte block");
+	check(ram_byte(BUF + 6) == 8'h02, "cd read capacity: block length 512");
+	finish_command(sts);
+
+	// READ(10) four 512-byte blocks at lba 4 and verify (disk-style)
+	select_atn10_target(3'd3, 8'h28, 8'h00, 8'h00, 8'h00, 8'h00, 8'h04,
+	                    8'h00, 8'h00, 8'h04, 8'h00);   // lba 4, count 4
+	wait_irq; read_intr(intr);
+	for (i = 0; i < 512; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	ti_dma_in(17'd2048, BUF, BUF + 32'd2048);
+	read_intr(intr);
+	ok = 1;
+	for (i = 0; i < 2048; i = i + 1)
+		if (ram_byte(BUF + i) !== cd[4*512 + i]) begin
+			if (ok) $display("  cd read byte %0d: got %02x want %02x",
+			                 i, ram_byte(BUF + i), cd[4*512 + i]);
+			ok = 0;
+		end
+	check(ok, "cd read(10): four 512-byte blocks reach memory (disk-style)");
+	check(dut.d_next == BUF + 32'd2048, "cd read(10): 2048-byte read reaches limit");
+	finish_command(sts);
+
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

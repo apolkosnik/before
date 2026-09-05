@@ -53,6 +53,7 @@ vbuild() {
 
 echo "== verilating benches =="
 vbuild tb_next_rtc       tb_next_rtc.sv $RTL/next_scr.sv
+vbuild tb_next_bmap      tb_next_bmap.sv $RTL/next_bmap.sv
 vbuild tb_next_scc       tb_next_scc.sv $RTL/next_scc.sv
 vbuild tb_next_esp       tb_next_esp.sv $RTL/next_scsi.sv
 vbuild tb_next_floppy    tb_next_floppy.sv $RTL/next_floppy.sv
@@ -77,16 +78,17 @@ echo "== checking the OSD image slots =="
 python3 check_osd.py || exit 1
 
 echo "== linting the emu top =="
-if verilator --lint-only -Wno-fatal -I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC 2>&1 \
-     | grep -E "^%Error" | grep -vE "MODMISSING|Exiting due to" | grep -q .; then
+fail=0
+verilator --lint-only -Wno-fatal -I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC \
+	> "$WORK/vl_emu_lint.log" 2>&1 || true
+if grep -E "^%Error" "$WORK/vl_emu_lint.log" \
+     | grep -vE "MODMISSING|Exiting due to" | grep -q .; then
 	echo "*** NeXT.sv lint FAILED"
-	verilator --lint-only -Wno-fatal -I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC 2>&1 \
-		| grep -E "^%Error" | grep -vE "MODMISSING|Exiting due to" | head -5
+	grep -E "^%Error" "$WORK/vl_emu_lint.log" \
+		| grep -vE "MODMISSING|Exiting due to" | head -5
 	fail=1
 fi
-
 echo "== running =="
-fail=0
 run() {
 	name=$1; shift
 	echo "--- $name ---"
@@ -97,6 +99,7 @@ run() {
 }
 
 run tb_rtc       "$WORK/vl_tb_next_rtc/tb_next_rtc"
+run tb_bmap      "$WORK/vl_tb_next_bmap/tb_next_bmap"
 run tb_scc       "$WORK/vl_tb_next_scc/tb_next_scc"
 run tb_esp       "$WORK/vl_tb_next_esp/tb_next_esp"
 run tb_scsi      "$WORK/vl_tb_next_scsi/tb_next_scsi"
@@ -131,12 +134,19 @@ fi
 
 if [ "${1:-}" = "bootsd" ]; then
 	echo "--- SCSI boot path: POST plus disk boot (about 7 minutes) ---"
-	if ! "$WORK/vl_tb_next_boot/tb_next_boot" +bootsd +mcycles=1600 \
-		| tee "$WORK/tb_bootsd.log" | grep -q "boot: ROM selected the SCSI disk"; then
-		echo "*** SCSI boot path FAILED (see tb/$WORK/tb_bootsd.log)"
-		fail=1
+	# The bench asserts the real thing - sectors fetched from the image
+	# and a full sector reaching memory by DMA - and prints ALL PASS
+	# only when they hold.  Selection alone is not boot: the ROM prints
+	# that and can still bus-error on the next command, which is exactly
+	# how a broken disk path slipped through as a pass.
+	"$WORK/vl_tb_next_boot/tb_next_boot" +bootsd +mcycles=1600 \
+		| tee "$WORK/tb_bootsd.log" > /dev/null
+	if grep -q "ALL PASS" "$WORK/tb_bootsd.log"; then
+		grep -E "passed path|BOOT:|boot:|SD reads" "$WORK/tb_bootsd.log" | head -12
 	else
-		grep -E "passed path|BOOT:|boot:" "$WORK/tb_bootsd.log" | head -12
+		echo "*** SCSI boot path FAILED (see tb/$WORK/tb_bootsd.log)"
+		grep -E "FAIL:|berr_events|SD reads" "$WORK/tb_bootsd.log" | head -8
+		fail=1
 	fi
 fi
 

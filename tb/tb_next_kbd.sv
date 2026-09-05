@@ -40,7 +40,7 @@ next_kms_snd #(.CLK_HZ(1000000)) dut
 	.sel_csr(1'b0), .sel_sptr(1'b0), .sel_ptr(1'b0), .sel_ini(1'b0),
 	.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
 	.m_req(), .m_we(), .m_addr(), .m_be(), .m_din(),
-	.m_dout(32'd0), .m_ack(1'b0),
+	.m_dout(32'd0), .m_ack(1'b0), .m_err(1'b0),
 	.int_snd_ovrun(), .int_snd_out_dma(),
 	.int_keymouse(int_keymouse)
 );

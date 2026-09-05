@@ -19,7 +19,11 @@
 //  directly (IntRegStatWrite in sysReg.c replaces the register content).
 //============================================================================
 
-module next_intc
+module next_intc #(
+	// Non-turbo NeXT systems force these interrupt sources enabled on
+	// every mask write (INT_NONMASKABLE in Previous sysReg.c).
+	parameter [31:0] FORCED_MASK = 32'h80027640
+)
 (
 	input         clk,
 	input         reset,
@@ -63,8 +67,8 @@ always @(posedge clk) begin
 
 		if (sel & we) begin
 			if (reg_mask) begin
-				if (addr1) mask[15:0]  <= wmerged_lo;
-				else       mask[31:16] <= wmerged_hi;
+				if (addr1) mask[15:0]  <= wmerged_lo | FORCED_MASK[15:0];
+				else       mask[31:16] <= wmerged_hi | FORCED_MASK[31:16];
 			end
 			else begin
 				if (addr1) stat[15:0]  <= wmerged_lo;

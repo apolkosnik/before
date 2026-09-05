@@ -25,22 +25,26 @@ reg  [15:0] wdata = 0;
 wire [15:0] rdata;
 
 wire        m_req, m_we, m_ack;
-wire [23:0] m_addr;
+wire [29:0] m_addr;
 wire  [3:0] m_be;
 wire [31:0] m_din;
 reg  [31:0] m_dout;
+wire        m_addr_valid = (m_addr[29:24] == 6'd1);
+wire        m_err = m_req && !m_addr_valid;
+integer     m_err_count = 0;
 
 wire int_en_tx, int_en_rx, int_en_tx_dma, int_en_rx_dma;
+reg  cable_connected = 0;
 
 // short tick for simulation speed: 500 "us" = 500 cycles
 next_enet_dma #(.CLK_HZ(1000000)) dut
-(
-	.clk(clk), .reset(reset),
-	.sel(sel), .addr(addr), .we(we), .be(be),
-	.wdata(wdata), .rdata(rdata),
-	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
-	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
-	.tpe_select(1'b0),
+	(
+		.clk(clk), .reset(reset),
+		.sel(sel), .addr(addr), .we(we), .be(be),
+		.wdata(wdata), .rdata(rdata),
+		.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
+		.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(m_err),
+	.tpe_select(1'b0), .cable_connected(cable_connected),
 	.btx_req(), .btx_len(), .btx_addr(11'd0), .btx_rd(1'b0),
 	.btx_q(), .btx_ack(), .btx_done(1'b0),
 	.brx_start(1'b0), .brx_len(11'd0), .brx_valid(1'b0),
@@ -55,8 +59,15 @@ reg        ack_r;
 assign m_ack = ack_r;
 
 always @(posedge clk) begin
-	if (reset) ack_r <= 0;
-	else if (!m_req) ack_r <= 0;
+	if (reset) begin
+		ack_r <= 0;
+		m_err_count <= 0;
+	end
+	else if (m_err) begin
+		m_err_count <= m_err_count + 1;
+		ack_r <= 0;
+	end
+	else if (!m_req || !m_addr_valid) ack_r <= 0;
 	else if (!ack_r) begin
 		if (m_we) begin
 			if (m_be[3]) ram[m_addr[13:0]][31:24] <= m_din[31:24];
@@ -162,6 +173,7 @@ endtask
 integer i;
 reg [7:0] v;
 reg [31:0] l;
+integer err_before;
 reg ok;
 
 localparam PKT_LEN = 100;
@@ -184,7 +196,8 @@ initial begin
 	reset = 0;
 	repeat (10) @(posedge clk);
 
-	// MB8795 setup: MAC, modes, start (reset register released)
+	// MB8795 setup: MAC, modes, start (reset register released).
+	// The external cable is disconnected, but local loopback still works.
 	wr8(15'h6008, 8'h00); wr8(15'h6009, 8'h00); wr8(15'h600a, 8'h0f);
 	wr8(15'h600b, 8'h01); wr8(15'h600c, 8'h02); wr8(15'h600d, 8'h03);
 	wr8(15'h6004, 8'h00);        // TX mode: loopback enabled (DIS_LOOP clear)
@@ -279,11 +292,44 @@ initial begin
 	wr8(15'h6003, 8'h8f);        // rx mask: enable
 	repeat (2) @(posedge clk);
 	check(int_en_rx == 1, "rx interrupt raised once unmasked");
-	wr8(15'h6002, 8'h8f);        // clear rx status bits
-	repeat (2) @(posedge clk);
-	check(int_en_rx == 0, "rx interrupt released after status clear");
+		wr8(15'h6002, 8'h8f);        // clear rx status bits
+		repeat (2) @(posedge clk);
+		check(int_en_rx == 0, "rx interrupt released after status clear");
 
-	if (errors == 0) $display("ALL PASS");
+		// Invalid high DMA pointers must not wrap into low RAM.  The address
+		// below is the same shape as the NeXT kernel panic VA; the master
+		// should present its full byte-address[31:2] and take BUSEXC.
+		err_before = m_err_count;
+		wr32(15'h0110, 32'h00380000);
+		wr32(15'h4310, 32'h3C014D9C);
+		wr32(15'h4114, 32'hBC014DB0); // EN_EOP | (bad address + 20)
+		wr32(15'h0110, 32'h00010000);
+		repeat (2000) @(posedge clk);
+		rd32(15'h0110, l);
+		check(m_err_count > err_before && m_addr == 30'h0F005367,
+		      "EN_TX invalid high address reports BUSEXC without 24-bit wrap");
+		check(l[28] && l[27] && !l[24],
+		      "EN_TX CSR: BUSEXC and COMPLETE set, ENABLE clear");
+
+		err_before = m_err_count;
+		wr8(15'h6002, 8'h8f);
+		wr32(15'h0150, 32'h00380000);
+		wr32(15'h4350, 32'h3C014D9C);
+		wr32(15'h4154, 32'h3C014E04);
+		wr32(15'h4144, 32'h3C014E04);
+		wr32(15'h0150, 32'h00050000);
+		wr32(15'h0110, 32'h00380000);
+		wr32(15'h4310, TX_BASE);
+		wr32(15'h4114, (TX_BASE + PKT_LEN + 32'd15) | 32'h80000000);
+		wr32(15'h0110, 32'h00010000);
+		repeat (8000) @(posedge clk);
+		rd32(15'h0150, l);
+		check(m_err_count > err_before && m_addr == 30'h0F005367,
+		      "EN_RX invalid high address reports BUSEXC without 24-bit wrap");
+		check(l[28] && l[27] && !l[24],
+		      "EN_RX CSR: BUSEXC and COMPLETE set, ENABLE clear");
+
+		if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);
 	$finish;
 end

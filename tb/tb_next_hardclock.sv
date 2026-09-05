@@ -128,6 +128,9 @@ initial begin
 
 	// unmask INT_TIMER
 	intc_write_mask(32'h20000000);
+	repeat (2) @(posedge clk);
+	check(intc.mask == 32'hA0027640,
+	      "non-turbo interrupt mask forces the Previous non-maskable sources");
 
 	// latch = 100 us: bytes 0 (high) and 1 (low) then CSR latch+enable
 	timer_write(3'd0, 2'b11, {8'h00, 8'd100});

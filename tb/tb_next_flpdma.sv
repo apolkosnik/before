@@ -46,7 +46,7 @@ wire  [9:0] flp_addr;
 wire  [7:0] flp_bwdata, flp_bq;
 
 wire        m_req, m_we, m_ack;
-wire [23:0] m_addr;
+wire [29:0] m_addr;
 wire  [3:0] m_be;
 wire [31:0] m_din;
 reg  [31:0] m_dout;
@@ -84,7 +84,7 @@ next_scsi #(.CLK_HZ(1000000)) scsi
 	.sel_ptr(s_ptr), .sel_ini(s_ini),
 	.addr(s_addr), .we(s_we), .be(s_be), .wdata(s_wdata), .rdata(s_rdata),
 	.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
-	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack),
+	.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(1'b0),
 	.flp_select(flp_select), .flp_req(flp_req), .flp_wr(flp_wr),
 	.flp_len(flp_len), .flp_addr(flp_addr), .flp_bwe(flp_bwe),
 	.flp_bwdata(flp_bwdata), .flp_bq(flp_bq), .flp_done(flp_done),
@@ -108,7 +108,7 @@ assign m_ack = ack_r;
 // channel's next pointer.  Two faults make it cry overflow: a write
 // landing outside the buffer the driver programmed, and a next pointer
 // carried past limit.  Watch for both continuously, not at the end.
-wire [31:0] m_byte = {6'd0, m_addr, 2'b00};
+wire [31:0] m_byte = {m_addr, 2'b00};
 reg  [31:0] win_lo = 0, win_hi = 32'hFFFFFFFF;
 integer     stray_wr = 0, overrun = 0;
 
@@ -169,19 +169,19 @@ reg sd_rd_act = 0;
 integer sd_reads = 0;
 
 always @(posedge clk) begin
+	fsd_buff_wr <= 0;
 	if (fsd_rd && !fsd_ack && !sd_rd_act) begin
-		fsd_ack <= 1; sd_rd_act <= 1; fsd_buff_addr <= 0; fsd_buff_wr <= 0;
+		fsd_ack <= 1; sd_rd_act <= 1; fsd_buff_addr <= 0;
 		sd_reads = sd_reads + 1;
 	end
 	else if (fsd_ack && sd_rd_act) begin
 		if (!fsd_buff_wr) begin
 			fsd_buff_dout <= disk[{fsd_lba[11:0], 9'd0} + {23'd0, fsd_buff_addr}];
 			fsd_buff_wr <= 1;
+			if (fsd_buff_addr == 9'd511) begin fsd_ack <= 0; sd_rd_act <= 0; end
 		end
 		else begin
-			fsd_buff_wr <= 0;
-			if (fsd_buff_addr == 9'd511) begin fsd_ack <= 0; sd_rd_act <= 0; end
-			else fsd_buff_addr <= fsd_buff_addr + 1'd1;
+			if (fsd_buff_addr != 9'd511) fsd_buff_addr <= fsd_buff_addr + 1'd1;
 		end
 	end
 end

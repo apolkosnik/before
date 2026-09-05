@@ -54,6 +54,10 @@ module next_system #(
 	// boot device menu (to the NVRAM boot command, see next_scr)
 	input   [2:0] boot_sel,
 
+	// external ethernet cable/backend state.  Internal loopback remains
+	// available inside next_enet_dma when this is false.
+	input         enet_connected,
+
 
 	// floppy image (MiSTer SD block interface, slot 1)
 	// optical drives (od0, od1)
@@ -170,33 +174,33 @@ reg [31:0] dma_snoop_addr;
 
 // ethernet DMA master port (driven by next_enet_dma below)
 wire        en_m_req, en_m_we;
-wire [23:0] en_m_addr;
+wire [29:0] en_m_addr;
 wire  [3:0] en_m_be;
 wire [31:0] en_m_din;
-wire        en_m_ack;
+wire        en_m_ack, en_m_err;
 wire        int_en_tx, int_en_rx, int_en_tx_dma, int_en_rx_dma;
 
 // MO/ECC DMA master port (driven by next_mo below)
 wire        mo_m_req, mo_m_we;
-wire [23:0] mo_m_addr;
+wire [29:0] mo_m_addr;
 wire  [3:0] mo_m_be;
 wire [31:0] mo_m_din;
-wire        mo_m_ack;
+wire        mo_m_ack, mo_m_err;
 wire        int_disk, int_disk_dma;
 
 // SCSI DMA master port (driven by next_scsi below)
 wire        sc_m_req, sc_m_we;
-wire [23:0] sc_m_addr;
+wire [29:0] sc_m_addr;
 wire  [3:0] sc_m_be;
 wire [31:0] sc_m_din;
-wire        sc_m_ack;
+wire        sc_m_ack, sc_m_err;
 
 // KMS/sound DMA master port (driven by next_kms_snd below)
 wire        sn_m_req, sn_m_we;
-wire [23:0] sn_m_addr;
+wire [29:0] sn_m_addr;
 wire  [3:0] sn_m_be;
 wire [31:0] sn_m_din;
-wire        sn_m_ack;
+wire        sn_m_ack, sn_m_err;
 wire        int_snd_ovrun, int_snd_out_dma, int_keymouse;
 
 wire  [2:0] ipl_level;
@@ -334,6 +338,18 @@ assign mo_m_ack = (state == S_RAM_E) && (dma_grant == G_MO) && ram_ack;
 assign sn_m_ack = (state == S_RAM_E) && (dma_grant == G_SND) && ram_ack;
 assign sc_m_ack = (state == S_RAM_E) && (dma_grant == G_SCSI) && ram_ack;
 
+// DMA can reach physical main RAM only.  Keep the six high address
+// bits emitted by the controller until here; otherwise any invalid pointer
+// aliases modulo 64 MB and can overwrite unrelated data or MMU tables.
+wire en_m_is_ram = en_m_addr[29:24] == 6'b000001;
+wire mo_m_is_ram = mo_m_addr[29:24] == 6'b000001;
+wire sn_m_is_ram = sn_m_addr[29:24] == 6'b000001;
+wire sc_m_is_ram = sc_m_addr[29:24] == 6'b000001;
+assign en_m_err = en_m_req && !en_m_is_ram;
+assign mo_m_err = mo_m_req && !mo_m_is_ram;
+assign sn_m_err = sn_m_req && !sn_m_is_ram;
+assign sc_m_err = sc_m_req && !sc_m_is_ram;
+
 always @(posedge clk) begin
 	mem_ready  <= 0;
 	walker_ack <= 0;
@@ -369,40 +385,48 @@ always @(posedge clk) begin
 				end
 			end
 			else if (en_m_req && !cpu_req && !berr_hold) begin
-				ram_req  <= 1;
-				ram_we   <= en_m_we;
-				ram_be   <= en_m_be;
-				ram_addr <= en_m_addr;
-				ram_din  <= en_m_din;
-				dma_grant <= G_ENET;
-				state    <= S_RAM_E;
+				if (en_m_is_ram) begin
+					ram_req  <= 1;
+					ram_we   <= en_m_we;
+					ram_be   <= en_m_be;
+					ram_addr <= en_m_addr[23:0];
+					ram_din  <= en_m_din;
+					dma_grant <= G_ENET;
+					state    <= S_RAM_E;
+				end
 			end
 			else if (mo_m_req && !cpu_req && !berr_hold) begin
-				ram_req  <= 1;
-				ram_we   <= mo_m_we;
-				ram_be   <= mo_m_be;
-				ram_addr <= mo_m_addr;
-				ram_din  <= mo_m_din;
-				dma_grant <= G_MO;
-				state    <= S_RAM_E;
+				if (mo_m_is_ram) begin
+					ram_req  <= 1;
+					ram_we   <= mo_m_we;
+					ram_be   <= mo_m_be;
+					ram_addr <= mo_m_addr[23:0];
+					ram_din  <= mo_m_din;
+					dma_grant <= G_MO;
+					state    <= S_RAM_E;
+				end
 			end
 			else if (sn_m_req && !cpu_req && !berr_hold) begin
-				ram_req  <= 1;
-				ram_we   <= sn_m_we;
-				ram_be   <= sn_m_be;
-				ram_addr <= sn_m_addr;
-				ram_din  <= sn_m_din;
-				dma_grant <= G_SND;
-				state    <= S_RAM_E;
+				if (sn_m_is_ram) begin
+					ram_req  <= 1;
+					ram_we   <= sn_m_we;
+					ram_be   <= sn_m_be;
+					ram_addr <= sn_m_addr[23:0];
+					ram_din  <= sn_m_din;
+					dma_grant <= G_SND;
+					state    <= S_RAM_E;
+				end
 			end
 			else if (sc_m_req && !cpu_req && !berr_hold) begin
-				ram_req  <= 1;
-				ram_we   <= sc_m_we;
-				ram_be   <= sc_m_be;
-				ram_addr <= sc_m_addr;
-				ram_din  <= sc_m_din;
-				dma_grant <= G_SCSI;
-				state    <= S_RAM_E;
+				if (sc_m_is_ram) begin
+					ram_req  <= 1;
+					ram_we   <= sc_m_we;
+					ram_be   <= sc_m_be;
+					ram_addr <= sc_m_addr[23:0];
+					ram_din  <= sc_m_din;
+					dma_grant <= G_SCSI;
+					state    <= S_RAM_E;
+				end
 			end
 			else if (cpu_req && !berr_hold) begin
 				if (!d_any) berr_hold <= 1;
@@ -686,7 +710,9 @@ next_enet_dma #(.CLK_HZ(CLK_HZ)) enet
 	.m_din(en_m_din),
 	.m_dout(ram_dout),
 	.m_ack(en_m_ack),
+	.m_err(en_m_err),
 	.tpe_select(bmap_tpe_select),
+	.cable_connected(enet_connected),
 	.btx_req(btx_req),
 	.btx_len(btx_len),
 	.btx_addr(btx_addr),
@@ -707,7 +733,7 @@ next_enet_dma #(.CLK_HZ(CLK_HZ)) enet
 );
 
 // MO drive controller with the ECC buffer engine (a RAM bus master)
-next_mo #(.CLK_HZ(CLK_HZ)) mo
+next_mo #(.CLK_HZ(CLK_HZ), .DRIVE_CONNECTED(2'b01)) mo
 (
 	.clk(clk),
 	.reset(dev_reset),
@@ -727,6 +753,7 @@ next_mo #(.CLK_HZ(CLK_HZ)) mo
 	.m_din(mo_m_din),
 	.m_dout(ram_dout),
 	.m_ack(mo_m_ack),
+	.m_err(mo_m_err),
 	.int_disk(int_disk),
 	.int_disk_dma(int_disk_dma),
 	.mo_gpo(),
@@ -767,6 +794,7 @@ next_kms_snd #(.CLK_HZ(CLK_HZ)) kms_snd
 	.m_din(sn_m_din),
 	.m_dout(ram_dout),
 	.m_ack(sn_m_ack),
+	.m_err(sn_m_err),
 	.int_snd_ovrun(int_snd_ovrun),
 	.int_snd_out_dma(int_snd_out_dma),
 	.int_keymouse(int_keymouse)
@@ -819,7 +847,7 @@ next_floppy #(.CLK_HZ(CLK_HZ)) floppy
 // SCSI controller, disk target and DMA channel
 wire esp_int_scsi, int_scsi_dma;
 
-next_scsi #(.CLK_HZ(CLK_HZ)) scsi
+next_scsi #(.CLK_HZ(CLK_HZ), .CD_UNITS(6'b001000)) scsi   // target 3 is the CD-ROM (NeXT convention)
 (
 	.clk(clk),
 	.reset(dev_reset),
@@ -840,6 +868,7 @@ next_scsi #(.CLK_HZ(CLK_HZ)) scsi
 	.m_din(sc_m_din),
 	.m_dout(ram_dout),
 	.m_ack(sc_m_ack),
+	.m_err(sc_m_err),
 	.flp_select(flp_select),
 	.flp_req(flp_req),
 	.flp_wr(flp_wr),
@@ -889,6 +918,7 @@ next_bmap bmap
 	.be(lanes),
 	.wdata(cpu_dout),
 	.rdata(bmap_rdata),
+	.tpe_link(enet_connected),
 	.tpe_select(bmap_tpe_select)
 );
 

@@ -40,3 +40,5 @@ c5_pin_model_dump.txt
 **/.DS_Store
 tb/build
 quartus_build.log
+build_quartus.log
+build_quartus.pid
