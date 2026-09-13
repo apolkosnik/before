@@ -13,9 +13,9 @@
 #   ./run_tests.sh bootsd  additionally boots with a mounted disk image
 #                          and checks the ROM's SCSI boot path
 #   ./run_tests.sh bootcd  additionally mounts a disk on target 0 and the
-#                          image on the CD-ROM slot (target 3), boot device
-#                          at CD-ROM, and checks the NVRAM "sd(1,0,0)" steers
-#                          the ROM to select and query target 3
+#                          image on the CD-ROM slot (target 3), then checks
+#                          the exact NVRAM "sd(1,0,0)" command and the ROM's
+#                          target-3 INQUIRY (selection/probe, not a CD boot)
 #   ./run_tests.sh post    additionally runs the full power-on system
 #                          test to the "System test passed" path
 #                          (about 5 seconds of machine time)
@@ -131,6 +131,7 @@ run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"
 run tb_video     "$WORK/vl_tb_next_video/tb_next_video"
 run tb_boot      "$WORK/vl_tb_next_boot/tb_next_boot"
+run tb_boot_mounts "$WORK/vl_tb_next_boot/tb_next_boot" +mountpolicy
 run tb_boot_noet "$WORK/vl_tb_next_boot/tb_next_boot" +netoff
 run tb_recording "$WORK/vl_tb_next_recording/tb_next_recording"
 run tb_recording_abort "$WORK/vl_tb_next_recording/tb_next_recording" +abortonly
@@ -151,7 +152,7 @@ if [ "${1:-}" = "post" ]; then
 fi
 
 if [ "${1:-}" = "bootcd" ]; then
-	echo "--- CD-ROM boot device: NVRAM sd(1,0,0) steers the ROM to target 3 (about 7 minutes) ---"
+	echo "--- CD-ROM probe: NVRAM sd(1,0,0) and target-3 INQUIRY (about 7 minutes) ---"
 	# The boot device menu at CD-ROM puts the ROM's "sd(N,0,0)" command in
 	# NVRAM, N being the CD-ROM's scan-order unit (the ROM numbers disks
 	# in the order it finds them, not by target).  The bench mounts a disk
@@ -162,10 +163,10 @@ if [ "${1:-}" = "bootcd" ]; then
 	"$WORK/vl_tb_next_boot/tb_next_boot" +bootcd +mcycles=1600 \
 		| tee "$WORK/tb_bootcd.log" > /dev/null
 	if grep -q "ALL PASS" "$WORK/tb_bootcd.log"; then
-		grep -E "passed path|BOOT:|boot:|SD reads" "$WORK/tb_bootcd.log" | head -12
+		grep -E "passed path|BOOT:|CD probe:" "$WORK/tb_bootcd.log" | head -12
 	else
-		echo "*** CD-ROM boot path FAILED (see tb/$WORK/tb_bootcd.log)"
-		grep -E "FAIL:|berr_events|SD reads|target" "$WORK/tb_bootcd.log" | head -8
+		echo "*** CD-ROM probe FAILED (see tb/$WORK/tb_bootcd.log)"
+		grep -E "FAIL:|NVRAM command|target" "$WORK/tb_bootcd.log" | head -8
 		fail=1
 	fi
 fi

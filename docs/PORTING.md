@@ -131,12 +131,17 @@ passed path, about 5 minutes):
 2. (done) SCSI: ESP (53C90) + DMA channel + disk image from the
    MiSTer SD card (hps_io block access) in next_scsi.sv.
 3. (in progress) Boot NeXTSTEP from the SCSI disk: the OSD "Boot
-   device" option loads the NVRAM boot command on reset (Auto picks
-   "sd" when an image is mounted, else the ROM default order, which
-   tries the network first - that is why an idle machine shows
-   "Loading from network").  The ROM's SCSI boot path (select, sector
-   reads by DMA) runs in simulation with "./run_tests.sh bootsd"; a
-   real NeXTSTEP image is needed for an actual boot.
+   device" setting is evaluated and written to battery-backed NVRAM on a
+   user reset. Auto selects a mounted SCSI hard disk on target 0, 1, or 2,
+   then a valid floppy, and otherwise writes an empty command for the ROM's
+   default order. Explicit choices write Disk (`sd`), Floppy (`fd`), Network
+   (`en`), ROM Default (empty), Optical (`od`), or a qualified CD-ROM probe
+   command. The v66 ROM does not complete a direct CD boot: installation
+   boots the installer floppy with the CD as root media. A guest CPU `RESET`
+   resets devices without rewriting NVRAM; use a user reset to apply the OSD
+   choice. The ROM's SCSI boot path (select, sector reads by DMA) runs in
+   simulation with "./run_tests.sh bootsd"; a real NeXTSTEP image is needed
+   for an actual boot.
 4. (done) KMS mouse input: PS/2 packets become NeXT mouse reports.
 5. (done) Sound output path, mouse input, and the printer DMA channel
    (next_printer.sv). The printer command/response protocol, SCC serial

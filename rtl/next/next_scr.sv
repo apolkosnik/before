@@ -34,7 +34,8 @@ module next_scr #(
 )
 (
 	input         clk,
-	input         reset,
+	input         reset,          // device reset, including a CPU RESET instruction
+	input         config_reset,   // external/user reset: apply the OSD boot policy
 
 	// register access
 	input         sel,
@@ -49,11 +50,12 @@ module next_scr #(
 	input  [31:0] scr1,
 
 
-	// boot device menu: 0 = Auto (disk when an image is mounted, else
-	// the ROM default order), 1 = Disk, 2 = Network, 3 = ROM Default.
-	// Loaded into the NVRAM boot command on reset.
+	// boot device menu: 0 = Auto, 1 = Disk, 2 = Floppy, 3 = Network,
+	// 4 = ROM Default, 5 = Optical, 6 = CD-ROM probe.  Auto is resolved
+	// when config_reset applies it: an HDD on targets 0-2, then a valid
+	// floppy, otherwise the ROM's default order.  A CPU-only RESET leaves
+	// the battery-backed NVRAM untouched.
 	input   [2:0] boot_sel,
-	input         disk_mounted,
 	input         floppy_mounted,
 	input   [2:0] sd_lower_mounted,   // SCSI disks at targets 0-2, below the CD-ROM
 
@@ -151,16 +153,11 @@ wire       rtc_bit_out = rtc_is_write ? rtc_bit_in : rtc_val_cur[rtc_bit_idx[2:0
 wire [7:0] rtc_wr_byte = {rtc_val_cur[6:0], rtc_bit_in};
 
 integer i;
-reg [2:0] bootdev_d = 3'd7;   // no real selection: forces the first load
 
-// effective boot device: 1 = SCSI disk ("sd"), 2 = ethernet ("en"),
-// 3 = empty boot command (the ROM walks its device table, network
-// first).  Auto picks the disk exactly when an image is mounted.
 // 0 = Auto, 1 = Disk, 2 = Floppy, 3 = Network, 4 = ROM Default,
-// 5 = Optical, 6 = CD-ROM.  The numbering is append-only so a saved
-// setting keeps its meaning.  nvram_init() in the reference spells the
+// 5 = Optical, 6 = CD-ROM.  nvram_init() in the reference spells the
 // devices sd, fd, en and od, with an empty command for the ROM.  Auto
-// prefers a mounted SCSI disk, then a mounted floppy, and otherwise
+// prefers a mounted fixed SCSI disk, then a mounted floppy, and otherwise
 // leaves the command empty for the ROM's own device order.
 //
 // A bare "sd" boots the first SCSI disk the ROM finds, which with a
@@ -176,74 +173,100 @@ reg [2:0] bootdev_d = 3'd7;   // no real selection: forces the first load
 // sd(1,0,0) beside a disk on target 0, and so on.
 wire [1:0] cd_unit = {1'b0, sd_lower_mounted[0]} + {1'b0, sd_lower_mounted[1]} +
                      {1'b0, sd_lower_mounted[2]};
-reg  [1:0] cd_unit_d = 2'd0;
+wire       hdd_mounted = |sd_lower_mounted;
 wire [2:0] bootdev = (boot_sel == 3'd0)
-                     ? (disk_mounted   ? 3'd1 :
-                        floppy_mounted ? 3'd2 : 3'd4)
-                     : boot_sel;
+	                     ? (hdd_mounted    ? 3'd1 :
+	                        floppy_mounted ? 3'd2 : 3'd4)
+	                     : boot_sel;
 
-// nvram_default[] from Previous rtcnvram.c with the boot command from
-// the OSD (nvram_init() semantics) and the matching checksum: 16-bit
-// one's-complement sum over bytes 0-29, complemented, at bytes 30/31
-function automatic [7:0] nv_init;
-	input [4:0] i;
+// Bytes 18-29 are the monitor's boot command.  Keep their construction
+// separate from the rest of NVRAM so applying an OSD choice cannot erase
+// guest-owned volume, brightness, network or diagnostic state.
+function automatic [7:0] boot_byte;
+	input [4:0] a;
 	input [2:0] dev;
 	input [1:0] cdu;      // CD-ROM scan-order unit, the N of "sd(N,0,0)"
 	begin
-		case (i)
-			5'd0:  nv_init = 8'h94;
-			5'd1:  nv_init = 8'h0F;
-			5'd2:  nv_init = 8'h40;
-			5'd14: nv_init = 8'h4B;
-			5'd18: nv_init = (dev == 3'd1) ? "s" :
+		case (a)
+			5'd18: boot_byte = (dev == 3'd1) ? "s" :
 			                 (dev == 3'd2) ? "f" :
 			                 (dev == 3'd3) ? "e" :
 			                 (dev == 3'd5) ? "o" :
 			                 (dev == 3'd6) ? "s" : 8'h00;
-			5'd19: nv_init = (dev == 3'd1) ? "d" :
+			5'd19: boot_byte = (dev == 3'd1) ? "d" :
 			                 (dev == 3'd2) ? "d" :
 			                 (dev == 3'd3) ? "n" :
 			                 (dev == 3'd5) ? "d" :
 			                 (dev == 3'd6) ? "d" : 8'h00;
 			// CD-ROM: the rest of "sd(N,0,0)", bytes 20-26; N is the digit
 			// at byte 21 (0-3), and the LUN at byte 23 is always 0
-			5'd20: nv_init = (dev == 3'd6) ? "(" : 8'h00;
-			5'd21: nv_init = (dev == 3'd6) ? ("0" + {6'd0, cdu}) : 8'h00;
-			5'd22: nv_init = (dev == 3'd6) ? "," : 8'h00;
-			5'd23: nv_init = (dev == 3'd6) ? "0" : 8'h00;
-			5'd24: nv_init = (dev == 3'd6) ? "," : 8'h00;
-			5'd25: nv_init = (dev == 3'd6) ? "0" : 8'h00;
-			5'd26: nv_init = (dev == 3'd6) ? ")" : 8'h00;
-			5'd30: nv_init = (dev == 3'd1) ? 8'h6D :
-			                 (dev == 3'd2) ? 8'h7A :
-			                 (dev == 3'd3) ? 8'h7B :
-			                 (dev == 3'd5) ? 8'h71 :
-			                 (dev == 3'd6) ? 8'hC3 : 8'hE0;
-			5'd31: nv_init = (dev == 3'd1) ? 8'h8B :
-			                 (dev == 3'd2) ? 8'h8B :
-			                 (dev == 3'd3) ? 8'h81 :
-			                 (dev == 3'd5) ? 8'h8B :
-			                 (dev == 3'd6) ? (8'hFA - {6'd0, cdu}) : 8'hEF;   // sd(N,0,0): FA-N
-			default: nv_init = 8'h00;
+			5'd20: boot_byte = (dev == 3'd6) ? "(" : 8'h00;
+			5'd21: boot_byte = (dev == 3'd6) ? ("0" + {6'd0, cdu}) : 8'h00;
+			5'd22: boot_byte = (dev == 3'd6) ? "," : 8'h00;
+			5'd23: boot_byte = (dev == 3'd6) ? "0" : 8'h00;
+			5'd24: boot_byte = (dev == 3'd6) ? "," : 8'h00;
+			5'd25: boot_byte = (dev == 3'd6) ? "0" : 8'h00;
+			5'd26: boot_byte = (dev == 3'd6) ? ")" : 8'h00;
+			default: boot_byte = 8'h00;
 		endcase
 	end
 endfunction
+
+// Previous's nvram_checksum(): 16-bit one's-complement sum over bytes
+// 0-29, complemented.  Bytes 0-17 come from the live battery-backed
+// image; bytes 18-29 are the command being applied on this reset.
+function automatic [15:0] boot_checksum;
+	input [2:0] dev;
+	input [1:0] cdu;
+	integer k;
+	reg [19:0] sum;
+	reg [16:0] fold1, fold2;
+	begin
+		sum = 20'd0;
+		for (k = 0; k < 18; k = k + 2)
+			sum = sum + {4'd0, nvram[k], nvram[k+1]};
+		for (k = 18; k < 30; k = k + 2)
+			sum = sum + {4'd0, boot_byte(k[4:0], dev, cdu),
+			                   boot_byte(k[4:0] + 5'd1, dev, cdu)};
+		fold1 = {1'b0, sum[15:0]} + {13'd0, sum[19:16]};
+		fold2 = {1'b0, fold1[15:0]} + fold1[16];
+		boot_checksum = ~fold2[15:0];
+	end
+endfunction
+
+// Full defaults exist only at FPGA configuration, just as battery-backed
+// storage acquires an initial image only when the core itself starts.
+integer init_i;
+initial begin
+	for (init_i = 0; init_i < 32; init_i = init_i + 1) nvram[init_i] = 8'h00;
+	nvram[0]  = 8'h94;
+	nvram[1]  = 8'h0F;
+	nvram[2]  = 8'h40;
+	nvram[14] = 8'h4B;
+	nvram[30] = 8'hE0;
+	nvram[31] = 8'hEF;
+end
+
+reg boot_init = 1'b1;
 
 always @(posedge clk) begin
 	//------------------------------------------------------------
 	// The NVRAM is battery backed on the real machine: it survives a
 	// reset, and dev_reset here carries the CPU's RESET instruction,
 	// which both the ROM and the system software execute during
-	// start-up.  Re-initialising it there threw away everything the
-	// guest had written.  Load it at power-on and whenever the boot
-	// device selection changes, and let guest writes below stand.
+	// start-up.  Apply the external OSD policy only at FPGA power-on or
+	// a user/configuration reset.  Preserve bytes 0-17, replace only the
+	// command, and checksum the resulting live image.
 	//------------------------------------------------------------
-	bootdev_d <= bootdev;
-	cd_unit_d <= cd_unit;
-	// reload on a boot device change, and on a mount that moves the
-	// CD-ROM's scan-order unit while CD-ROM boot is selected
-	if (bootdev != bootdev_d || (bootdev == 3'd6 && cd_unit != cd_unit_d))
-		for (i = 0; i < 32; i = i + 1) nvram[i] <= nv_init(i[4:0], bootdev, cd_unit);
+	boot_init <= 1'b0;
+	if (boot_init || config_reset) begin : apply_boot_policy
+		reg [15:0] checksum;
+		checksum = boot_checksum(bootdev, cd_unit);
+		for (i = 18; i < 30; i = i + 1)
+			nvram[i] <= boot_byte(i[4:0], bootdev, cd_unit);
+		nvram[30] <= checksum[15:8];
+		nvram[31] <= checksum[7:0];
+	end
 
 	// The time of day keeps counting across a reset.  dev_reset carries
 	// the CPU's RESET instruction, and the ROM's clock test waits up to

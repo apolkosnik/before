@@ -61,12 +61,12 @@ next_system #(
 		.ps2_mouse(25'd0),
 	.boot_sel(bootfd ? 3'd2 : bootcd ? 3'd6 : bootsd ? 3'd1 : 3'd0),
 	.enet_connected(net_enable),
-	.fimg_mounted({1'b0, fimg_mounted}), .fsd_unit(), .fimg_readonly(1'b0),
-	.fimg_size(bootfd ? 64'd1474560 : 64'd0),
+	.fimg_mounted(fimg_mounted), .fsd_unit(), .fimg_readonly(1'b0),
+	.fimg_size(fimg_bytes),
 	.fsd_lba(fsd_lba), .fsd_rd(fsd_rd), .fsd_wr(fsd_wr), .fsd_ack(fsd_ack),
 	.fsd_buff_addr(fsd_buff_addr), .fsd_buff_dout(fsd_buff_dout),
 	.fsd_buff_din(fsd_buff_din), .fsd_buff_wr(fsd_buff_wr),
-	.img_mounted({2'b00, cimg_mounted, 2'b00, img_mounted}),   // bit 3 = CD-ROM slot (target 3)
+	.img_mounted({2'b00, cimg_mounted, img_mounted}),   // bit 3 = CD-ROM slot (target 3)
 	.sd_unit(),
 	.img_readonly(1'b0),
 	.img_size(img_bytes),
@@ -759,12 +759,18 @@ reg        bootsd = 0;
 // CD-ROM slot (target 3) with the boot device menu at CD-ROM.  The
 // ROM's "sd(unit,lun,part)" numbers disks in scan order, so the CD-ROM
 // behind a disk is unit 1 and the NVRAM must carry "sd(1,0,0)" (what
-// NeXTSTEP itself calls it).  The pass criterion is that the boot
-// sector is read from target 3, not from the disk a bare "sd" picks.
+// NeXTSTEP itself calls it).  This is a selection/probe test: the v66
+// ROM must consume that exact command and issue an INQUIRY to target 3.
+// It does not read a boot sector from a type-05 CD-ROM.
 //----------------------------------------------------------------------------
 
 reg        bootcd = 0;
 reg        cimg_mounted = 0;
+reg        bootcd_nvram_ok = 0;
+
+// +mountpolicy exercises next_system's per-slot media bookkeeping while
+// reset is held.  The state is restored to empty before the ROM starts.
+reg        mountpolicy = 0;
 
 //----------------------------------------------------------------------------
 // +bootfd: a 1.44 MB floppy on the second image slot with the boot
@@ -773,7 +779,8 @@ reg        cimg_mounted = 0;
 //----------------------------------------------------------------------------
 
 reg         bootfd = 0;
-reg         fimg_mounted = 0;
+reg   [1:0] fimg_mounted = 0;
+reg  [63:0] fimg_bytes = 0;
 wire [31:0] fsd_lba;
 wire        fsd_rd, fsd_wr;
 reg         fsd_ack = 0;
@@ -854,7 +861,7 @@ always @(posedge clk) if (bootfd && !reset) begin
 	end
 end
 
-reg        img_mounted = 0;
+reg  [2:0] img_mounted = 0;
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
 reg         sd_ack = 0;
@@ -1056,7 +1063,6 @@ end
 
 // ESP activity trace: selection commands and DMA writes to memory
 reg saw_esp_sel = 0;
-reg [2:0] esp_sel_target = 3'd7;   // target of the ROM's first selection
 integer scsi_dma_writes = 0;
 integer scsi_cmds = 0;             // SCSI commands traced after the boot selection
 reg [7:0] esp_cmd_d = 0;
@@ -1069,7 +1075,6 @@ always @(posedge clk) if (!reset && (bootsd || bootcd)) begin
 				$display("[%0t] BOOT: ESP select command %02x, target %0d (present %0d)",
 				         $time, dut.scsi.command0, dut.scsi.selectbusid[2:0],
 				         dut.scsi.disk_present_v[dut.scsi.selectbusid[2:0]]);
-				esp_sel_target <= dut.scsi.selectbusid[2:0];
 			end
 			else if (scsi_cmds <= 24)
 				$display("[%0t] SCSI: select target %0d (present %0d)", $time,
@@ -1082,25 +1087,19 @@ always @(posedge clk) if (!reset && (bootsd || bootcd)) begin
 		scsi_dma_writes = scsi_dma_writes + 1;
 end
 
-// the SCSI unit that served the first sector read after the boot selection:
-// for +bootsd this is the disk on target 0.
-reg [2:0] cd_rd_unit = 3'd7;
-always @(posedge clk) if (!reset && (bootsd || bootcd) && saw_esp_sel &&
-                          sd_rd && cd_rd_unit == 3'd7)
-	cd_rd_unit <= dut.scsi.t_unit;
-
 // +bootcd verifies the NVRAM boot command: sd(1,0,0) must steer the ROM to
-// SELECT and QUERY SCSI target 3 (unit 1 in scan order, behind the disk on
+// SELECT and INQUIRY SCSI target 3 (unit 1 in scan order, behind the disk on
 // target 0).  It does not assert a completed boot: the Rev 2.5 v66 ROM's
 // sd() blk0-boot path drives a direct-access (type 0) device, and re-issues
 // INQUIRY without reading a sector when the target reports the CD-ROM type
 // (0x05) - which the CD must report so the floppy installer's "Searching
 // for CD-ROM drives" scan finds it.  Booting the install medium therefore
 // runs the documented way: boot the floppy, root on the CD (sd1a).
-reg saw_t3_cmd = 0;
+reg saw_t3_inquiry = 0;
 always @(posedge clk) if (!reset && bootcd && saw_esp_sel &&
-                          dut.scsi.phase == 3'd3 && dut.scsi.t_unit == 3'd3)
-	saw_t3_cmd <= 1;
+                          dut.scsi.phase == 3'd3 && dut.scsi.t_unit == 3'd3 &&
+                          dut.scsi.cdb0 == 8'h12 && dut.scsi.cdb1[7:5] == 3'd0)
+	saw_t3_inquiry <= 1;
 
 // SCSI conversation trace after the ROM's boot selection: one line per
 // command as the target enters its status phase (opcode + status), and
@@ -1153,15 +1152,103 @@ initial begin
 		$dumpvars(0, tb_next_boot);
 	end
 
-	if ($test$plusargs("bootfd")) bootfd = 1;
+	if ($test$plusargs("bootfd")) begin
+		bootfd = 1;
+		fimg_bytes = 64'd1474560;
+	end
+	if ($test$plusargs("mountpolicy")) mountpolicy = 1;
 	if ($test$plusargs("netoff")) net_enable = 0;
+
+	if (mountpolicy) begin
+		// HDD targets retain independent state: ejecting target 0 must not
+		// erase target 2, and the CD event at target 3 must not count as an
+		// HDD for Auto boot policy.
+		img_bytes = 64'd1048576;
+		@(posedge clk); img_mounted <= 3'b001;
+		@(posedge clk); img_mounted <= 3'b000;
+		repeat (2) @(posedge clk);
+		check(dut.sd_lower_mounted == 3'b001,
+		      "mount policy: target-0 HDD state is recorded");
+
+		@(posedge clk); img_mounted <= 3'b100;
+		@(posedge clk); img_mounted <= 3'b000;
+		repeat (2) @(posedge clk);
+		check(dut.sd_lower_mounted == 3'b101,
+		      "mount policy: multiple HDD targets are retained independently");
+
+		img_bytes = 64'd0;
+		@(posedge clk); img_mounted <= 3'b001;
+		@(posedge clk); img_mounted <= 3'b000;
+		repeat (2) @(posedge clk);
+		check(dut.sd_lower_mounted == 3'b100,
+		      "mount policy: ejecting one HDD preserves another target");
+
+		img_bytes = 64'd1048576;
+		@(posedge clk); cimg_mounted <= 1'b1;
+		@(posedge clk); cimg_mounted <= 1'b0;
+		repeat (2) @(posedge clk);
+		check(dut.sd_lower_mounted == 3'b100,
+		      "mount policy: target-3 CD is excluded from Auto HDD state");
+
+		img_bytes = 64'd0;
+		@(posedge clk); img_mounted <= 3'b100;
+		@(posedge clk); img_mounted <= 3'b000;
+		repeat (2) @(posedge clk);
+		check(dut.sd_lower_mounted == 3'b000,
+		      "mount policy: HDD state is empty while the CD remains mounted");
+		check(dut.scr.nvram[18] == 8'h00 && dut.scr.nvram[19] == 8'h00,
+		      "mount policy: CD-only Auto leaves the boot command empty");
+
+		@(posedge clk); cimg_mounted <= 1'b1;
+		@(posedge clk); cimg_mounted <= 1'b0;
+		repeat (2) @(posedge clk);
+		check(!dut.scsi.disk_present_v[3],
+		      "mount policy: target-3 CD state is cleared by its eject event");
+		img_bytes = 64'd1048576;
+
+		// The two floppy drives are independent as well; Auto remains on
+		// floppy until the last valid image is ejected.
+		fimg_bytes = 64'd1474560;
+		@(posedge clk); fimg_mounted <= 2'b01;
+		@(posedge clk); fimg_mounted <= 2'b00;
+		repeat (2) @(posedge clk);
+		check(dut.floppy_mounted_v == 2'b01 && dut.floppy_mounted,
+		      "mount policy: first floppy state is recorded");
+
+		@(posedge clk); fimg_mounted <= 2'b10;
+		@(posedge clk); fimg_mounted <= 2'b00;
+		repeat (2) @(posedge clk);
+		check(dut.floppy_mounted_v == 2'b11 && dut.floppy_mounted,
+		      "mount policy: both floppy states are retained independently");
+
+		fimg_bytes = 64'd0;
+		@(posedge clk); fimg_mounted <= 2'b01;
+		@(posedge clk); fimg_mounted <= 2'b00;
+		repeat (2) @(posedge clk);
+		check(dut.floppy_mounted_v == 2'b10 && dut.floppy_mounted,
+		      "mount policy: ejecting one floppy preserves the other");
+
+		@(posedge clk); fimg_mounted <= 2'b10;
+		@(posedge clk); fimg_mounted <= 2'b00;
+		repeat (2) @(posedge clk);
+		check(dut.floppy_mounted_v == 2'b00 && !dut.floppy_mounted,
+		      "mount policy: floppy state returns empty after the final eject");
+
+		fimg_bytes = 64'd12345;
+		@(posedge clk); fimg_mounted <= 2'b01;
+		@(posedge clk); fimg_mounted <= 2'b00;
+		repeat (2) @(posedge clk);
+		check(dut.floppy_mounted_v == 2'b00 && !dut.floppy_mounted,
+		      "mount policy: unsupported floppy size is not treated as mounted");
+		fimg_bytes = bootfd ? 64'd1474560 : 64'd0;
+	end
 
 	if ($test$plusargs("bootsd")) begin
 		bootsd = 1;
 		@(posedge clk);
-		img_mounted <= 1;
+		img_mounted <= 3'b001;
 		@(posedge clk);
-		img_mounted <= 0;
+		img_mounted <= 3'b000;
 	end
 
 	if ($test$plusargs("bootcd")) begin
@@ -1169,9 +1256,9 @@ initial begin
 		// a disk on target 0 as well, so the CD-ROM is the SECOND disk in
 		// the ROM's scan order and the NVRAM command must be sd(1,0,0)
 		@(posedge clk);
-		img_mounted <= 1;
+		img_mounted <= 3'b001;
 		@(posedge clk);
-		img_mounted <= 0;
+		img_mounted <= 3'b000;
 		@(posedge clk);
 		cimg_mounted <= 1;
 		@(posedge clk);
@@ -1180,15 +1267,35 @@ initial begin
 
 
 	repeat (20) @(posedge clk);
+	if (bootcd) begin
+		// Capture the command while the external reset is still applying the
+		// boot policy, before the ROM gets an opportunity to modify NVRAM.
+		bootcd_nvram_ok = dut.scr.nvram[18] == "s" &&
+		                     dut.scr.nvram[19] == "d" &&
+		                     dut.scr.nvram[20] == "(" &&
+		                     dut.scr.nvram[21] == "1" &&
+		                     dut.scr.nvram[22] == "," &&
+		                     dut.scr.nvram[23] == "0" &&
+		                     dut.scr.nvram[24] == "," &&
+		                     dut.scr.nvram[25] == "0" &&
+		                     dut.scr.nvram[26] == ")" &&
+		                     dut.scr.nvram[27] == 8'h00 &&
+		                     dut.scr.nvram[28] == 8'h00 &&
+		                     dut.scr.nvram[29] == 8'h00;
+		$display("BOOT: NVRAM command %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+		         dut.scr.nvram[18], dut.scr.nvram[19], dut.scr.nvram[20],
+		         dut.scr.nvram[21], dut.scr.nvram[22], dut.scr.nvram[23],
+		         dut.scr.nvram[24], dut.scr.nvram[25], dut.scr.nvram[26]);
+	end
 	reset = 0;
 
 	// the medium arrives once the machine is running, the way the OSD
 	// delivers it: a mount pulse during reset is simply not seen
 	if (bootfd) begin
 		repeat (20) @(posedge clk);
-		fimg_mounted <= 1;
+		fimg_mounted <= 2'b01;
 		@(posedge clk);
-		fimg_mounted <= 0;
+		fimg_mounted <= 2'b00;
 	end
 
 	// run length: +cycles=<n> for a small count, or +mcycles=<n> for
@@ -1272,7 +1379,14 @@ initial begin
 		fb_dump;
 	end
 
-	if (bootsd || bootcd) begin : scdma_dump
+	if (bootcd) begin
+		check(bootcd_nvram_ok,
+		      "CD probe: config reset generated exact NVRAM command sd(1,0,0)");
+		check(saw_t3_inquiry,
+		      "CD probe: ROM issued a LUN-0 INQUIRY to SCSI target 3");
+	end
+
+	if (bootsd) begin : scdma_dump
 		integer kk;
 		check(!wildpc_seen, "supervisor PC did not reach the panic target");
 		$display("=== SCSI DMA channel writes to memory (frozen at berr) ===");
@@ -1280,15 +1394,7 @@ initial begin
 			$display("  [%0d] addr=%08x data=%08x", kk, scdma_addr[kk], scdma_data[kk]);
 		$display("SD reads: %0d, SCSI DMA words to memory: %0d",
 		         sd_reads, scsi_dma_writes);
-		// sd(1,0,0) must steer the ROM to target 3 (unit 1, behind the disk
-		// on target 0) - selecting and querying it, not the disk a bare "sd"
-		// or a wrong unit would pick.  (The v66 ROM does not blk0-boot a
-		// type-05 CD-ROM; see saw_t3_cmd above.)
-		if (bootcd)
-			check(saw_t3_cmd,
-			      "boot: sd(1,0,0) steered the ROM to select and query SCSI target 3, the CD-ROM");
-		else
-			check(saw_esp_sel, "boot: ROM selected the SCSI disk");
+		check(saw_esp_sel, "boot: ROM selected the SCSI disk");
 		check(sd_lba0, "boot: sector 0 fetched from the SD image");
 		check(scsi_dma_writes >= 128, "boot: a full sector reached memory by DMA");
 		if (img_fd != 0)

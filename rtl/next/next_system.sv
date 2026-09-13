@@ -691,28 +691,39 @@ assign io_rdata = io_enet  ? enet_rdata :
 // system control registers and RTC
 wire timer_ipl7, softint1, softint2;
 
-// survives reset: the mount pulse fires once at OSD time, usually
-// before the user resets into the new configuration
-reg disk_mounted = 0;
-always @(posedge clk) if (|img_mounted) disk_mounted <= (img_size != 0);
-
-reg floppy_mounted = 0;
-always @(posedge clk) if (|fimg_mounted) floppy_mounted <= (fimg_size != 0);
-
 // SCSI disks mounted below the CD-ROM's target 3 (OSD slots S0-S2 are
 // targets 0-2).  The ROM's "sd(unit,lun,part)" numbers disks in scan
 // order, so the CD-ROM's unit is the count of these; next_scr uses it
-// to spell the CD-ROM boot command.
+// to spell the CD-ROM boot command.  This state survives reset: the
+// mount pulse fires once at OSD time, usually before the user resets into
+// the new configuration.  It is also the authoritative Auto-boot HDD
+// presence, so target 3's CD-ROM can never be mistaken for a fixed disk.
 reg [2:0] sd_lower_mounted = 3'b000;
 integer smk;
 always @(posedge clk)
 	for (smk = 0; smk < 3; smk = smk + 1)
 		if (img_mounted[smk]) sd_lower_mounted[smk] <= (img_size != 0);
 
+// Keep each floppy's insertion state independently.  A mount event names
+// only the drive that changed, and a later eject from the other drive must
+// not clear Auto's view of this one.  Match next_floppy's accepted media
+// exactly; a nonzero file of an unsupported size is still an empty drive.
+wire floppy_image_valid = (fimg_size == 64'd737280)  ||
+                           (fimg_size == 64'd1474560) ||
+                           (fimg_size == 64'd2949120);
+reg [1:0] floppy_mounted_v = 2'b00;
+integer fmk;
+always @(posedge clk)
+	for (fmk = 0; fmk < 2; fmk = fmk + 1)
+		if (fimg_mounted[fmk]) floppy_mounted_v[fmk] <= floppy_image_valid;
+
+wire floppy_mounted = |floppy_mounted_v;
+
 next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 (
 	.clk(clk),
 	.reset(dev_reset),
+	.config_reset(reset),
 	.sel(io_scr),
 	.reg_id(io_scr1 ? 2'd0 : io_sid ? 2'd1 : 2'd2),
 	.addr1(cpu_addr[1]),
@@ -722,7 +733,6 @@ next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 	.rdata(scr_rdata),
 	.scr1(32'h00012052),         // 25MHz NeXTcube 68040, 100ns memory
 	.boot_sel(boot_sel),
-	.disk_mounted(disk_mounted),
 	.floppy_mounted(floppy_mounted),
 	.sd_lower_mounted(sd_lower_mounted),
 	.timer_ipl7(timer_ipl7),

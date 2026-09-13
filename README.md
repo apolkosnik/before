@@ -28,11 +28,20 @@ Output: `output_files/NeXT.rbf`.
 
 ## Boot device
 
-The ROM picks its boot device from the NVRAM boot command.  The OSD
-"Boot device" option loads it at reset: Auto (boot from the SCSI disk
-whenever an image is mounted in the "SCSI Disk" slot, otherwise the
-ROM default order, which tries the network first), Disk, Network, or
-ROM Default.  Mount the image first, then reset the machine.
+The ROM picks its boot device from the battery-backed NVRAM boot command.
+The OSD "Boot device" setting is evaluated and applied on a user reset, so
+mount images before resetting the machine. Auto selects the first mounted
+SCSI hard disk on target 0, 1, or 2; if none is mounted it selects a valid
+floppy, and otherwise leaves the boot command empty for the ROM's default
+order. The explicit choices are Disk (`sd`), Floppy (`fd`), Network (`en`),
+ROM Default (empty command), Optical (`od`), and CD-ROM probe (a qualified
+SCSI target command).
+
+The v66 ROM does not complete a direct boot from CD-ROM. To install from CD,
+select Floppy and boot the installer floppy; the CD is then used as the root
+media. CD-ROM probe only makes the ROM probe the selected CD target. A guest
+CPU `RESET` instruction resets devices but preserves the NVRAM boot command;
+use a user reset to apply a changed OSD selection.
 
 ## Network
 

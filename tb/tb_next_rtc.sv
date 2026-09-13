@@ -9,9 +9,12 @@
 //  Checks against the nvram_default[] content from Previous rtcnvram.c:
 //    - NVRAM byte 0 reads 0x94, byte 1 reads 0x0F
 //    - checksum bytes 30/31 carry the one's-complement sum
-//    - the boot device menu loads the NVRAM boot command on reset
-//      ("sd"/"en"/empty per selection, Auto follows the mounted disk)
-//      with the matching checksum
+//    - a user/configuration reset applies the selected boot policy while
+//      a CPU RESET leaves the battery-backed NVRAM alone
+//    - Auto is resolved from the mounted HDD/floppy state at that reset
+//    - CD-ROM probe commands cover scan-order units 0 through 3
+//    - applying a boot policy preserves unrelated bytes and recomputes
+//      the checksum from their live values
 //    - burst read auto-increments the address
 //    - a write to NVRAM byte 5 reads back
 //    - SCR1 reads the machine id
@@ -25,10 +28,11 @@ reg clk = 0;
 always #5 clk = ~clk;
 
 reg reset = 1;
+reg config_reset = 1;
 
 reg   [2:0] boot_sel = 0;
-reg         disk_mounted = 0;
 reg         floppy_mounted = 0;
+reg   [2:0] sd_lower_mounted = 0;
 reg         sel = 0;
 reg   [1:0] reg_id = 0;
 reg         addr1 = 0;
@@ -40,12 +44,12 @@ wire [15:0] rdata;
 // CLK_HZ of 1000 puts a clock second within reach of a simulation
 next_scr #(.CLK_HZ(1000)) dut
 (
-	.clk(clk), .reset(reset),
+	.clk(clk), .reset(reset), .config_reset(config_reset),
 	.sel(sel), .reg_id(reg_id), .addr1(addr1), .we(we), .be(be),
 	.wdata(wdata), .rdata(rdata),
 	.scr1(32'h00012052),
-	.boot_sel(boot_sel), .disk_mounted(disk_mounted),
-	.floppy_mounted(floppy_mounted),
+	.boot_sel(boot_sel), .floppy_mounted(floppy_mounted),
+	.sd_lower_mounted(sd_lower_mounted),
 	.timer_ipl7(), .led(), .rom_overlay(),
 	.softint1(), .softint2()
 );
@@ -128,7 +132,7 @@ task check;
 endtask
 
 reg [7:0] b0, b1, b30, b31, wb;
-reg [7:0] c18, c19;
+reg [7:0] boot_cmd [0:11];
 reg [7:0] r_sec, r_min, r_hour, r_wday, r_mday, r_month, r_year;
 reg [15:0] w;
 
@@ -161,25 +165,105 @@ task write_clock;
 	end
 endtask
 
-// reset with a menu selection, then read boot command and checksum
-task boot_variant;
-	input [2:0] bsel;
-	input mounted;
+// Read all 12 boot-command bytes and the stored checksum.  Reading the
+// complete field catches stale suffixes when a long CD command is replaced
+// by a short command.
+task read_boot_state;
+	integer j;
 	begin
-		boot_sel = bsel;
-		disk_mounted = mounted;
-		reset = 1;
-		repeat (5) @(posedge clk);
-		reset = 0;
-		repeat (5) @(posedge clk);
 		rtc_send_byte(8'h12);
-		rtc_recv_byte(c18);
-		rtc_recv_byte(c19);
+		for (j = 0; j < 12; j = j + 1) rtc_recv_byte(boot_cmd[j]);
 		rtc_stop;
 		rtc_send_byte(8'h1E);
 		rtc_recv_byte(b30);
 		rtc_recv_byte(b31);
 		rtc_stop;
+	end
+endtask
+
+task write_nvram_byte;
+	input [4:0] a;
+	input [7:0] v;
+	begin
+		rtc_send_byte({3'b100, a});
+		rtc_send_byte(v);
+		rtc_stop;
+	end
+endtask
+
+task read_nvram_byte;
+	input  [4:0] a;
+	output [7:0] v;
+	begin
+		rtc_send_byte({3'b000, a});
+		rtc_recv_byte(v);
+		rtc_stop;
+	end
+endtask
+
+// A CPU RESET resets the RTC serial engine but must not apply OSD policy.
+task cpu_reset;
+	begin
+		reset = 1;
+		repeat (5) @(posedge clk);
+		reset = 0;
+		repeat (5) @(posedge clk);
+	end
+endtask
+
+// A user/configuration reset both resets devices and applies the boot policy.
+task user_reset;
+	begin
+		reset = 1;
+		config_reset = 1;
+		repeat (5) @(posedge clk);
+		reset = 0;
+		config_reset = 0;
+		repeat (5) @(posedge clk);
+	end
+endtask
+
+task boot_variant;
+	input [2:0] bsel;
+	input [2:0] hdds;
+	input floppy;
+	begin
+		boot_sel = bsel;
+		sd_lower_mounted = hdds;
+		floppy_mounted = floppy;
+		user_reset;
+		read_boot_state;
+	end
+endtask
+
+task check_short_command;
+	input [7:0] c0;
+	input [7:0] c1;
+	input [639:0] name;
+	begin
+		check(boot_cmd[0] == c0 && boot_cmd[1] == c1 &&
+		      boot_cmd[2] == 0 && boot_cmd[3] == 0 &&
+		      boot_cmd[4] == 0 && boot_cmd[5] == 0 &&
+		      boot_cmd[6] == 0 && boot_cmd[7] == 0 &&
+		      boot_cmd[8] == 0 && boot_cmd[9] == 0 &&
+		      boot_cmd[10] == 0 && boot_cmd[11] == 0, name);
+	end
+endtask
+
+task check_cd_command;
+	input [1:0] unit_no;
+	input [7:0] checksum_lo;
+	begin
+		$display("CD-ROM scan-order unit %0d", unit_no);
+		check(boot_cmd[0] == "s" && boot_cmd[1] == "d" &&
+		      boot_cmd[2] == "(" && boot_cmd[3] == ("0" + {6'd0, unit_no}) &&
+		      boot_cmd[4] == "," && boot_cmd[5] == "0" &&
+		      boot_cmd[6] == "," && boot_cmd[7] == "0" &&
+		      boot_cmd[8] == ")" && boot_cmd[9] == 0 &&
+		      boot_cmd[10] == 0 && boot_cmd[11] == 0,
+		      "CD-ROM command is sd(N,0,0) with a cleared suffix");
+		check(b30 == 8'hC3 && b31 == checksum_lo,
+		      "CD-ROM command checksum matches its scan-order unit");
 	end
 endtask
 
@@ -191,6 +275,7 @@ initial begin
 
 	repeat (10) @(posedge clk);
 	reset = 0;
+	config_reset = 0;
 	repeat (10) @(posedge clk);
 
 	// SCR1 through the register interface
@@ -232,18 +317,11 @@ initial begin
 	$display("nvram[5]=%02x after write", wb);
 	check(wb == 8'h5A, "NVRAM write/readback");
 
-	// The chip is battery backed, and the reset that reaches it carries
-	// the CPU's RESET instruction, which the ROM and the system software
-	// both execute while starting up.  A guest's byte must still be
-	// there afterwards.
-	reset = 1;
-	repeat (5) @(posedge clk);
-	reset = 0;
-	repeat (5) @(posedge clk);
-	rtc_send_byte(8'h05);
-	rtc_recv_byte(wb);
-	rtc_stop;
-	check(wb == 8'h5A, "an NVRAM byte survives a reset");
+	// The chip is battery backed.  A CPU RESET instruction resets the
+	// serial interface, but must not alter a guest-written NVRAM byte.
+	cpu_reset;
+	read_nvram_byte(5'd5, wb);
+	check(wb == 8'h5A, "an NVRAM byte survives a CPU reset");
 
 
 	// The ROM's clock test waits up to 1100 ms for the seconds register
@@ -263,40 +341,121 @@ initial begin
 	$display("seconds %02x -> %02x across a reset", r_sec, r_min);
 	check(r_min != r_sec, "the seconds keep counting across a reset");
 
-	// boot device menu variants
-	boot_variant(3'd0, 1'b0);    // Auto, no disk: empty command
-	check(c18 == 8'h00 && c19 == 8'h00, "Auto without disk: empty boot command");
-	check(b30 == 8'hE0 && b31 == 8'hEF, "Auto without disk: checksum");
+	// Applying a policy must derive its checksum from the live NVRAM, not
+	// a fixed per-command constant.  Byte 5 contributes as the low byte of
+	// a checksum word: 6D8B - 005A = 6D31 for the "sd" command.
+	boot_sel = 3'd1;
+	repeat (10) @(posedge clk);
+	read_boot_state;
+	check_short_command(8'h00, 8'h00,
+	                    "changing the OSD selection does not immediately rewrite NVRAM");
+	user_reset;
+	read_boot_state;
+	check_short_command("s", "d", "user reset applies the Disk command");
+	check(b30 == 8'h6D && b31 == 8'h31,
+	      "boot checksum includes a preserved guest NVRAM byte");
+	read_nvram_byte(5'd5, wb);
+	check(wb == 8'h5A, "user reset preserves unrelated NVRAM bytes");
 
-	boot_variant(3'd0, 1'b1);    // Auto with a disk: "sd"
-	check(c18 == "s" && c19 == "d", "Auto with disk: boot command sd");
-	check(b30 == 8'h6D && b31 == 8'h8B, "Auto with disk: checksum");
+	// Restore the unrelated byte so the remaining checks can use the
+	// reference command checksums directly.
+	write_nvram_byte(5'd5, 8'h00);
+	user_reset;
+	read_boot_state;
+	check(b30 == 8'h6D && b31 == 8'h8B,
+	      "an unchanged policy is reapplied and its checksum recomputed");
 
-	boot_variant(3'd3, 1'b1);    // Network: "en"
-	check(c18 == "e" && c19 == "n", "Network: boot command en");
+	// Simulate a guest replacing the boot command and leaving a stale
+	// suffix.  A CPU RESET preserves it; the next user reset reapplies the
+	// selected policy and clears all twelve command bytes first.
+	write_nvram_byte(5'd18, "e");
+	write_nvram_byte(5'd19, "n");
+	write_nvram_byte(5'd20, "X");
+	cpu_reset;
+	read_boot_state;
+	check(boot_cmd[0] == "e" && boot_cmd[1] == "n" && boot_cmd[2] == "X",
+	      "CPU reset preserves a guest-modified boot command");
+	user_reset;
+	read_boot_state;
+	check_short_command("s", "d",
+	                    "user reset restores the selected command and clears its suffix");
+	check(b30 == 8'h6D && b31 == 8'h8B,
+	      "user reset restores the selected command checksum");
+
+	// Auto is sampled only on a user reset.  Hot media changes and a CPU
+	// RESET do not silently replace the guest's battery-backed command.
+	boot_variant(3'd0, 3'b000, 1'b0);
+	check_short_command(8'h00, 8'h00, "Auto without media: empty boot command");
+	check(b30 == 8'hE0 && b31 == 8'hEF, "Auto without media: checksum");
+	sd_lower_mounted = 3'b001;
+	repeat (10) @(posedge clk);
+	cpu_reset;
+	read_boot_state;
+	check_short_command(8'h00, 8'h00,
+	                    "hot HDD insertion and CPU reset leave Auto command unchanged");
+	user_reset;
+	read_boot_state;
+	check_short_command("s", "d", "user reset resolves Auto to a mounted HDD");
+	check(b30 == 8'h6D && b31 == 8'h8B, "Auto with HDD: checksum");
+
+	sd_lower_mounted = 3'b000;
+	floppy_mounted = 1;
+	repeat (10) @(posedge clk);
+	read_boot_state;
+	check_short_command("s", "d", "hot media change does not immediately rerun Auto");
+	user_reset;
+	read_boot_state;
+	check_short_command("f", "d", "user reset resolves Auto to a mounted floppy");
+	check(b30 == 8'h7A && b31 == 8'h8B, "Auto with only a floppy: checksum");
+
+	// A hot OSD change is policy, not an immediate NVRAM write.
+	boot_sel = 3'd3;
+	repeat (10) @(posedge clk);
+	read_boot_state;
+	check_short_command("f", "d", "hot OSD change leaves the current command intact");
+	user_reset;
+	read_boot_state;
+	check_short_command("e", "n", "user reset applies the Network command");
 	check(b30 == 8'h7B && b31 == 8'h81, "Network: checksum");
 
-	boot_variant(3'd4, 1'b1);    // ROM Default: empty even with a disk
-	check(c18 == 8'h00 && c19 == 8'h00, "ROM Default: empty boot command");
+	boot_variant(3'd4, 3'b111, 1'b1); // ROM Default ignores mounted media
+	check_short_command(8'h00, 8'h00, "ROM Default: empty boot command");
+	check(b30 == 8'hE0 && b31 == 8'hEF, "ROM Default: checksum");
 
-	boot_variant(3'd1, 1'b0);    // Disk forced, even without an image
-	check(c18 == "s" && c19 == "d", "Disk: boot command sd");
+	boot_variant(3'd1, 3'b000, 1'b0); // Disk forced without an image
+	check_short_command("s", "d", "Disk: boot command sd");
+	check(b30 == 8'h6D && b31 == 8'h8B, "Disk: checksum");
 
-	// Floppy, and Auto falling through to a mounted floppy
-	boot_variant(3'd2, 1'b0);
-	check(c18 == "f" && c19 == "d", "Floppy: boot command fd");
+	boot_variant(3'd2, 3'b000, 1'b0); // Floppy forced without an image
+	check_short_command("f", "d", "Floppy: boot command fd");
 	check(b30 == 8'h7A && b31 == 8'h8B, "Floppy: checksum");
-	floppy_mounted = 1;
-	boot_variant(3'd0, 1'b0);    // Auto: no disk, but a floppy
-	check(c18 == "f" && c19 == "d", "Auto with only a floppy: boot command fd");
-	floppy_mounted = 0;
 
 	// Optical.  nvram_init() in the reference spells it od, alongside
-	// sd, fd and en; without it the menu could not ask the ROM to
-	// boot from a drive the machine has.
-	boot_variant(3'd5, 1'b0);
-	check(c18 == "o" && c19 == "d", "Optical: boot command od");
+	// sd, fd and en.
+	boot_variant(3'd5, 3'b000, 1'b0);
+	check_short_command("o", "d", "Optical: boot command od");
 	check(b30 == 8'h71 && b31 == 8'h8B, "Optical: checksum");
+
+	// CD-ROM is a qualified SCSI probe command.  Its unit is the count of
+	// mounted HDD targets below target 3.  Cover every representable count,
+	// including a hot count change that must wait for user reset.
+	boot_variant(3'd6, 3'b000, 1'b0);
+	check_cd_command(2'd0, 8'hFA);
+	sd_lower_mounted = 3'b001;
+	repeat (10) @(posedge clk);
+	read_boot_state;
+	check_cd_command(2'd0, 8'hFA);
+	user_reset;
+	read_boot_state;
+	check_cd_command(2'd1, 8'hF9);
+	boot_variant(3'd6, 3'b011, 1'b0);
+	check_cd_command(2'd2, 8'hF8);
+	boot_variant(3'd6, 3'b111, 1'b0);
+	check_cd_command(2'd3, 8'hF7);
+
+	// Replacing the longest command must clear its tail.
+	boot_variant(3'd1, 3'b000, 1'b0);
+	check_short_command("s", "d", "short command clears the previous CD-ROM suffix");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);
