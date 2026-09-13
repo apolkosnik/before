@@ -111,6 +111,7 @@ i2s i2s
 spdif toslink
 (
 	.rst_i(reset),
+	.sample_rate_96k(sample_rate),
 
 	.clk_i(clk),
 	.bit_out_en_i(mclk_ce),

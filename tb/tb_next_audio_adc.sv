@@ -19,9 +19,10 @@ initial begin
  repeat(10000)@(negedge clk);
  check(dut.raw==2048,"LTC2308 reads the serial 12-bit sample");
  check(pcm==0,"constant ADC bias produces silence");
- level=2304;repeat(4000)@(negedge clk);
+ // Allow the 2.5 ms FIR group delay plus its step response.
+ level=2304;repeat(28000)@(negedge clk);
  check(pcm>1500 && pcm<2100,"positive ADC amplitude survives averaging and DC removal");
- level=1792;repeat(4000)@(negedge clk);
+ level=1792;repeat(28000)@(negedge clk);
  check(pcm< -1500 && pcm> -2400,"negative ADC amplitude remains signed");
  reset=1;repeat(10)@(negedge clk);level=3000;reset=0;
  repeat(10000)@(negedge clk);

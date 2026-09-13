@@ -42,8 +42,11 @@ does not hide the other.
 
 `next_audio_adc.sv` uses the framework's `ltc2308` controller, channel 0,
 in the existing 28 MHz system clock domain. It samples at 64,096 Hz,
-removes the input's DC bias, and averages groups of eight before passing
-signed PCM to the codec. The codec converts samples to mu-law and packs
+removes the input's DC bias, and applies a 321-tap low-pass FIR before
+decimating by eight and passing signed PCM to the codec. The quantized
+filter preserves 0–3,400 Hz with less than 0.09 dB ripple and rejects
+4,006–32,048 Hz by more than 65 dB. Its group delay is approximately 2.5 ms.
+The codec converts samples to mu-law and packs
 four samples, oldest first, into each DMA memory word. Silence encodes
 as `ff ff ff ff`.
 
@@ -51,6 +54,12 @@ The ADC controller's sample toggle is initialized on reset, making its
 startup deterministic. The input filter discards the startup conversion
 pipeline and acquires the DC bias before emitting audio. The ADC and DMA
 use the same clock domain.
+
+The ADC interface uses 7 MHz SCK and holds CONVST high for 2 microseconds.
+It waits another two system clocks after CONVST falls before capturing
+the MSB. `NeXT.sdc` constrains the FPGA portions of the external I/O paths;
+`tb/check_adc_timing.tcl` checks their fitted timing at every available corner.
+See [audio fixes](AUDIO_FIXES.md) for the timing budget and validation.
 
 MiSTer's [ADC test core](https://github.com/MiSTer-devel/ADCTest_MiSTer)
 demonstrates full-amplitude ADC audio sampling. This path uses the raw

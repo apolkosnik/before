@@ -25,7 +25,8 @@
 // Sampling rate = ADC_RATE/NUM_CH
 // ADC_RATE max is ~500KHz
 // CLK_RATE max is ~80MHz
-module ltc2308 #(parameter NUM_CH = 2, ADC_RATE = 96000, CLK_RATE = 50000000)
+module ltc2308 #(parameter NUM_CH = 2, ADC_RATE = 96000, CLK_RATE = 50000000,
+                         SCK_DIV = 1, CONV_WAIT_NS = 1600, LONG_CONVST = 0)
 (
 	input        reset,
 	input        clk,
@@ -36,7 +37,8 @@ module ltc2308 #(parameter NUM_CH = 2, ADC_RATE = 96000, CLK_RATE = 50000000)
 	output reg   [(NUM_CH*12)-1:0] dout // 12 bits per channel (unsigned)
 );
 
-localparam TCONV = CLK_RATE/625000;
+// Round up rather than starting a read before the maximum conversion time.
+localparam TCONV = (64'(CLK_RATE)*CONV_WAIT_NS+999999999)/1000000000;
 
 reg  sck;
 wire sdo = cfg[5];
@@ -59,8 +61,9 @@ always @(posedge clk) begin
 	reg  [7:0] tconv;
 	reg  [3:0] bitcnt;
 	reg [10:0] adcin;
+	reg [$clog2(SCK_DIV+1)-1:0] sck_count;
 
-	convst <= 0;
+	if (!LONG_CONVST) convst <= 0;
 
 	if(reset) begin
 		sum    <= 0;
@@ -71,6 +74,8 @@ always @(posedge clk) begin
 		dout   <= 0;
 		dout_sync <= 0;
 		pin    <= NUM_CH[2:0]-1'd1;
+		convst <= 0;
+		sck_count <= 0;
 	end
 	else begin
 		sum <= next_sum;
@@ -83,21 +88,30 @@ always @(posedge clk) begin
 			if(!next_pin) dout_sync <= ~dout_sync;
 		end
 
-		if(tconv) tconv <= tconv - 1'd1;
-		else if(bitcnt) begin
-			sck <= ~sck;
-
-			if(sck) cfg <= cfg<<1;
-			else begin
-				adcin <= {adcin[9:0],sdi};
-				bitcnt <= bitcnt - 1'd1;
-				if(bitcnt == 1) begin
-					dout[pin*12 +:12] <= {adcin,sdi};
-					pin <= next_pin;
-				end
-			end
-		end
-		else sck <= 0;
+        if (tconv != 0) begin
+            tconv <= tconv - 1'd1;
+            if (tconv == 1) begin
+                convst <= 0;
+                // Allow SDO to enable after long CONVST before its MSB
+                // is captured. Later half-clocks use the same divider.
+                sck_count <= LONG_CONVST ? SCK_DIV-1 : 0;
+            end
+        end else if (bitcnt != 0 || sck) begin
+            if (sck_count != 0) sck_count <= sck_count - 1'd1;
+            else begin
+                sck_count <= SCK_DIV-1;
+                sck <= ~sck;
+                if (sck) cfg <= cfg<<1;
+                else begin
+                    adcin <= {adcin[9:0],sdi};
+                    bitcnt <= bitcnt - 1'd1;
+                    if (bitcnt == 1) begin
+                        dout[pin*12 +:12] <= {adcin,sdi};
+                        pin <= next_pin;
+                    end
+                end
+            end
+        end else begin sck <= 0; sck_count <= 0; end
 	end
 end
 

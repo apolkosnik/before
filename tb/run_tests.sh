@@ -72,6 +72,8 @@ vbuild tb_next_mo        tb_next_mo.sv $RTL/next_mo.sv $RTL/next_rs.sv
 vbuild tb_next_snd       tb_next_snd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_snd_in    tb_next_snd_in.sv $RTL/next_snd_in.sv $RTL/next_kms_snd.sv
 vbuild tb_next_audio_adc tb_next_audio_adc.sv $RTL/next_audio_adc.sv ../sys/ltc2308.sv
+vbuild tb_next_sound_output tb_next_sound_output.sv $RTL/next_kms_snd.sv
+vbuild tb_next_adc_timing tb_next_adc_timing.sv ../sys/ltc2308.sv
 vbuild tb_next_printer   tb_next_printer.sv $RTL/next_printer.sv
 vbuild tb_next_kbd       tb_next_kbd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_hardclock tb_next_hardclock.sv $RTL/next_timer.sv $RTL/next_intc.sv
@@ -122,6 +124,8 @@ run tb_mo        "$WORK/vl_tb_next_mo/tb_next_mo"
 run tb_snd       "$WORK/vl_tb_next_snd/tb_next_snd"
 run tb_snd_in    "$WORK/vl_tb_next_snd_in/tb_next_snd_in"
 run tb_audio_adc "$WORK/vl_tb_next_audio_adc/tb_next_audio_adc"
+run tb_sound_output "$WORK/vl_tb_next_sound_output/tb_next_sound_output"
+run tb_adc_timing "$WORK/vl_tb_next_adc_timing/tb_next_adc_timing"
 run tb_printer   "$WORK/vl_tb_next_printer/tb_next_printer"
 run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"

@@ -50,6 +50,9 @@ Digital IO, or supplied by the separate input adapter). The default
 **Silence** option allows recording without an external audio source.
 Recording uses the NeXT mono codec at 8,012 Hz. See
 [audio input](docs/AUDIO_INPUT.md) for the DMA fix and validation.
+Playback supports normal 44.1 kHz stereo and the NeXT's 22.05 kHz repeat
+and zero-fill modes, guest volume controls, and de-emphasis. See
+[audio fixes](docs/AUDIO_FIXES.md) for the audit results and tests.
 
 ## Boot ROM
 

@@ -34,6 +34,7 @@ module spdif
 (
     input           clk_i,
     input           rst_i,
+    input           sample_rate_96k,
 
     // SPDIF bit output enable
     // Single cycle pulse synchronous to clk_i which drives
@@ -178,6 +179,8 @@ begin
         channel_status_bit_r = 1'b1;
     else if (subframe_count_q[8:1] == 8'd25) // frame 24 to 27 => sample frequency, 0100 = 48kHz, 0000 = 44kHz (l2r)
         channel_status_bit_r = 1'b1;
+    else if (subframe_count_q[8:1] == 8'd27)
+        channel_status_bit_r = sample_rate_96k; // IEC958: 0x2 = 48k, 0xA = 96k
     else
         channel_status_bit_r = 1'b0; // everything else defaults to 0        
 end

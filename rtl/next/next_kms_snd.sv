@@ -13,8 +13,7 @@
 //  - the command/data pair: a write to the data register executes the
 //    command in the command byte (KMS_Data_Write -> KMS_command);
 //    implemented commands are the sound out enable/disable family
-//    (KMSCMD_SND_OUT with SIO_ENABLE), the volume/control accesses as
-//    no-ops, and reset
+//    (including repeat/zero-fill modes), volume/control accesses, and reset
 //  - the sound out engine: while enabled, a pending DMA buffer is
 //    consumed from memory one 16-bit-stereo frame at a time (the frame
 //    is {L,R}, big-endian, as snd.c reads it) into an audio FIFO that a
@@ -87,8 +86,8 @@ module next_kms_snd #(
 	input         sndin_overrun,
 
 	// signed 16-bit stereo audio out, driven at the NeXT's 44.1 kHz rate
-	output reg signed [15:0] audio_l,
-	output reg signed [15:0] audio_r
+	output wire signed [15:0] audio_l,
+	output wire signed [15:0] audio_r
 );
 
 localparam SNDOUT_DMA_ENABLE   = 8'h80, SNDOUT_DMA_REQUEST = 8'h40,
@@ -141,6 +140,22 @@ wire mouse_enabled =
 
 reg       sndout_active;
 reg       snd_underrun;
+reg [1:0] sndout_mode;
+reg repeat_phase;
+reg [31:0] repeat_frame;
+reg dma_cancelled;
+reg [5:0] attenuation_l, attenuation_r;
+reg [4:0] volume_bits;
+reg [10:0] volume_shift;
+reg [7:0] gpo;
+
+// A 16-bit write to the last two data bytes must include BOTH new bytes
+// when executing the command (nonblocking updates have not landed yet).
+wire kms_execute = sel_kms && we && addr[3:1] == 3'd3 && be[0];
+wire [31:0] command_data = {kms_data[31:16],
+                            be[1] ? wdata[15:8] : kms_data[15:8], wdata[7:0]};
+wire kms_reset_command = kms_execute && st_cmd == 8'hff && command_data == 32'hffffffff;
+wire output_command = kms_execute && (st_cmd & 8'hc7) == 8'h07;
 
 assign int_snd_ovrun = snd_underrun | sndin_overrun;
 
@@ -206,17 +221,36 @@ wire [32:0] sr_sum = {1'b0, sr_acc} + AUDIO_SR;
 wire        sample_tick = (sr_sum >= CLK_REAL_HZ);
 
 // stereo audio FIFO: the sound-out DMA fills it, the sample tick drains it
-// into audio_l/r.  A full FIFO stalls the DMA, pacing it to 44.1 kHz.
+// into audio_l/r. A full FIFO stalls DMA; doubled modes consume one frame
+// per two output ticks.
 localparam AF_DEPTH = 256, AF_AW = 8;
 reg [31:0]      afifo [0:AF_DEPTH-1];   // {L[15:0], R[15:0]} per frame
 reg [AF_AW-1:0] af_wr, af_rd;
 reg [AF_AW:0]   af_cnt;
 wire af_full  = (af_cnt == AF_DEPTH);
 wire af_empty = (af_cnt == 0);
-wire af_push  = (est == E_ACK) && m_ack && !m_err;   // one frame per accepted read
-wire af_pop   = sample_tick && !af_empty;
+wire af_push = (est == E_ACK) && m_ack && !m_err && !dma_cancelled && !output_cancel;
+wire af_pop = sample_tick && !af_empty &&
+              (!sndout_mode[0] || !repeat_phase) && !output_flush;
+wire [31:0] output_frame = af_pop ? afifo[af_rd] :
+    (sndout_mode[0] && repeat_phase && !sndout_mode[1]) ? repeat_frame : 32'd0;
 
 wire [7:0] csr_or = (be[1] ? wdata[15:8] : 8'h00) | (be[0] ? wdata[7:0] : 8'h00);
+wire csr_write = sel_csr && we && !addr[1];
+wire dma_reset = csr_write && csr_or[4];
+// DMA reset cancels in-flight reads, but the sound station must still
+// drain frames it already accepted. KMS reset or a fresh start clears the
+// station queue; ordinary stop allows the final buffered samples to play.
+wire output_flush = kms_reset_command || (output_command && st_cmd[3] && !sndout_active);
+wire output_cancel = dma_reset || output_flush;
+
+next_sound_output output_processing (
+    .clk(clk), .reset(reset || output_flush),
+    .sample_strobe(sample_tick), .frame(output_frame),
+    .mute(gpo[4]), .deemphasis(gpo[3]),
+    .attenuation_l(attenuation_l), .attenuation_r(attenuation_r),
+    .audio_l(audio_l), .audio_r(audio_r)
+);
 
 // Sound DMA memory faults are DMA channel errors in Previous.  Do not let
 // high/virtual pointers wrap into the low 64 MB RAM window.
@@ -404,20 +438,29 @@ task automatic kms_response;
 	end
 endtask
 
+task automatic set_volume;
+    input [7:0] value;
+    begin
+        if (value[6]) attenuation_l <= value[5:0] > 43 ? 6'd43 : value[5:0];
+        if (value[7]) attenuation_r <= value[5:0] > 43 ? 6'd43 : value[5:0];
+    end
+endtask
+
 // KMS command execution, KMS_command() in kms.c
 task automatic kms_command;
 	input [7:0] cmd;
+	input [31:0] data;
 	begin
 		if (cmd == 8'hC6) begin
 			// KMSCMD_KBD_RECV: device poll mask
-			km_dev_msk <= {kms_data[31:8], wdata[7:0]};
+			km_dev_msk <= data;
 		end
 		else if (cmd == 8'hC5) begin : kmreg
 			// KMSCMD_KMREG, access_km_reg(): the data long is already
 			// assembled except its lowest byte, which is in this write
 			reg [7:0] reg_addr, reg_data;
-			reg_addr = kms_data[31:24];
-			reg_data = kms_data[23:16];
+			reg_addr = data[31:24];
+			reg_data = data[23:16];
 			if (reg_addr == 8'hEF) begin
 				km_address <= {reg_data[3:1], 1'b0};
 				kms_response({reg_data[3:1], 1'b0});
@@ -431,6 +474,8 @@ task automatic kms_command;
 			// sound out
 			if (cmd & 8'h08) begin       // SIO_ENABLE
 				sndout_active <= 1;
+				sndout_mode <= cmd[5:4];
+				repeat_phase <= 0;
 			end
 			else begin
 				sndout_active <= 0;
@@ -442,8 +487,25 @@ task automatic kms_command;
 			sndin_active <= cmd[3];
 			if (!cmd[3]) sndin_clear <= 1;
 		end
-		// 0xC4/0xC2 volume control, 0xC7 analog sound out, 0xFF reset:
-		// nothing to do yet
+        else if (cmd == 8'hc4) begin
+            gpo <= data[31:24];
+            if (data[24]) begin
+                if (volume_bits == 11 && volume_shift[10:8] == 3'b111)
+                    set_volume(volume_shift[7:0]);
+            end else if (gpo[0]) begin
+                volume_bits <= 0;
+                volume_shift <= 0;
+            end else if (data[26] && !gpo[2]) begin
+                volume_shift <= {volume_shift[9:0], data[25]};
+                // Saturate so an overlong transaction can never wrap to 11.
+                if (volume_bits != 31) volume_bits <= volume_bits + 1'd1;
+            end
+        end else if (cmd == 8'hc2) begin
+            set_volume(data[31:24]);
+            volume_bits <= 0;
+            volume_shift <= 0;
+        end
+        // C7 direct output remains outside the DMA playback path.
 	end
 endtask
 
@@ -460,6 +522,10 @@ always @(posedge clk) begin
 		ps2_toggle_d <= 0;
 		ps2_mouse_tgl_d <= 0;
 		sndout_active <= 0;
+        sndout_mode <= 0; repeat_phase <= 0; repeat_frame <= 0;
+        dma_cancelled <= 0;
+        attenuation_l <= 0; attenuation_r <= 0;
+        volume_bits <= 0; volume_shift <= 0; gpo <= 0;
 		sndin_active <= 0;
 		snd_underrun <= 0;
 		s_csr <= 0;
@@ -471,7 +537,7 @@ always @(posedge clk) begin
 		m_req <= 0;
 		sr_acc <= 0;
 		af_wr <= 0; af_rd <= 0; af_cnt <= 0;
-		audio_l <= 0; audio_r <= 0;
+		m_we <= 0; m_addr <= 0; m_be <= 0; m_din <= 0;
 	end
 	else begin
 		uspresc <= us_tick ? 1'd0 : uspresc + 1'd1;
@@ -482,15 +548,15 @@ always @(posedge clk) begin
 		// DMA's pushed frame.  m_dout carries {L[15:0], R[15:0]}.
 		//------------------------------------------------------------
 		sr_acc <= sample_tick ? (sr_sum[31:0] - CLK_REAL_HZ) : sr_sum[31:0];
-		if (af_pop) begin
-			audio_l <= afifo[af_rd][31:16];
-			audio_r <= afifo[af_rd][15:0];
-			af_rd   <= af_rd + 1'd1;
-		end
-		else if (sample_tick) begin
-			audio_l <= 16'sd0;
-			audio_r <= 16'sd0;
-		end
+		if (sample_tick) begin
+            if (!sndout_mode[0]) repeat_phase <= 0;
+            else if (repeat_phase) repeat_phase <= 0;
+            else if (af_pop) repeat_phase <= 1;
+        end
+        if (af_pop) begin
+            repeat_frame <= afifo[af_rd];
+            af_rd <= af_rd + 1'd1;
+        end
 		if (af_push) begin
 			afifo[af_wr] <= m_dout;
 			af_wr <= af_wr + 1'd1;
@@ -582,7 +648,7 @@ always @(posedge clk) begin
 						4'h7: begin
 							kms_data[7:0] <= v;
 							// KMS_Data_Write executes the pending command
-							kms_command(st_cmd);
+							kms_command(st_cmd, command_data);
 						end
 						4'h8, 4'h9, 4'hA, 4'hB: ;   // km_data is read only
 						default: ;
@@ -591,7 +657,7 @@ always @(posedge clk) begin
 			end
 		end
 
-		if (sel_csr & we & (csr_or != 0)) begin
+		if (csr_write) begin
 			if (csr_or[4]) s_csr <= s_csr & ~8'b00001011;
 			if (csr_or[1]) s_csr[1] <= 1;
 			if (csr_or[0]) s_csr[0] <= 1;
@@ -625,16 +691,15 @@ always @(posedge clk) begin
 		//------------------------------------------------------------
 		case (est)
 		// The DMA fetches one stereo frame at a time and hands it to the
-		// audio FIFO.  A full FIFO holds it off, so the whole channel runs
-		// at the 44.1 kHz drain rate; the completion interrupt therefore
-		// lands at the real playback time instead of a fixed pace.  With no
-		// buffer to play the channel underruns, exactly as before.
+		// audio FIFO. A full FIFO holds it off; source consumption follows
+		// the selected output mode. Completion marks the final DMA fetch,
+		// with up to one FIFO of samples still queued for playback.
 		E_IDLE: begin
-			if (sndout_active) begin
+			if (sndout_active && !output_cancel) begin
 				if (s_csr[0] && s_next < s_limit) begin
 					if (!af_full) est <= E_RD;   // read when the FIFO has room
 				end
-				else if (us_tick) begin
+				else if (af_empty && !repeat_phase && us_tick) begin
 					if (poll != 0) poll <= poll - 1'd1;
 					else begin
 						st_snd <= st_snd | SNDOUT_DMA_UNDERRUN | SNDOUT_DMA_REQUEST;
@@ -646,7 +711,7 @@ always @(posedge clk) begin
 		end
 
 		E_RD: begin
-			if (s_next >= s_limit) est <= E_IDLE;
+			if (s_next >= s_limit || !s_csr[0] || !sndout_active || output_cancel) est <= E_IDLE;
 			else begin
 				m_req <= 1;
 				m_we <= 0;
@@ -656,32 +721,175 @@ always @(posedge clk) begin
 			end
 		end
 
-		E_ACK: if (m_err) begin
-			dma_bus_exception;
-		end
-		else if (m_ack) begin
+		E_ACK: if (m_ack || m_err) begin
 			m_req <= 0;
-			// m_dout = {L,R} is captured into the FIFO by af_push this cycle
-			if ((s_next | 32'd3) + 32'd1 >= s_limit) begin
-				// last frame: dma_sndout_intr -> dma_interrupt(CHANNEL_SOUNDOUT)
-				s_csr[3] <= 1;
-				if (s_csr[1]) begin
-					s_next <= s_start;
-					s_limit <= s_stop;
-					s_csr[1] <= 0;
-				end
+			est <= E_IDLE;
+			dma_cancelled <= 0;
+			if (!dma_cancelled && !output_cancel) begin
+				if (m_err) dma_bus_exception;
 				else begin
-					s_next <= (s_next | 32'd3) + 32'd1;
-					s_csr[0] <= 0;
+					// The accepted stereo frame also enters the FIFO.
+					if ((s_next | 32'd3) + 32'd1 >= s_limit) begin
+						s_csr[3] <= 1;
+						if (s_csr[1]) begin
+							s_next <= s_start;
+							s_limit <= s_stop;
+							s_csr[1] <= 0;
+						end else begin
+							s_next <= (s_next | 32'd3) + 32'd1;
+							s_csr[0] <= 0;
+						end
+					end else s_next <= (s_next | 32'd3) + 32'd1;
 				end
 			end
-			else s_next <= (s_next | 32'd3) + 32'd1;
-			est <= E_IDLE;
 		end
 
 		default: est <= E_IDLE;
 		endcase
+        if (output_flush) begin
+            af_wr <= 0; af_rd <= 0; af_cnt <= 0;
+            repeat_phase <= 0; repeat_frame <= 0;
+        end
+        if (output_cancel && m_req && !m_ack && !m_err) dma_cancelled <= 1;
+        // Last assignment wins over simultaneous command/status activity.
+        // KMS reset stops codec activity, but preserves DMA registers.
+        if (kms_reset_command) begin
+            st_snd <= 0; st_km <= 0; st_tx <= 0; st_cmd <= 0;
+            kms_data <= 0; km_data <= 0; km_address <= 0; km_dev_msk <= 0;
+            mods <= 0; capslock <= 0;
+            sndout_active <= 0; sndin_active <= 0; sndin_clear <= 1;
+            snd_underrun <= 0; sndout_mode <= 0; poll <= 0;
+        end
 	end
 end
 
+endmodule
+
+// 44.1 kHz codec output processing. Q12 filter history preserves fractional
+// feedback; Q17 coefficients follow Previous snd_deemphasis_filter. Three
+// pipeline stages keep the multipliers off the FIFO-to-pin timing path.
+module next_sound_output (
+    input clk, reset, sample_strobe,
+    input [31:0] frame,
+    input mute, deemphasis,
+    input [5:0] attenuation_l, attenuation_r,
+    output reg signed [15:0] audio_l, audio_r
+);
+function automatic [16:0] gain(input [5:0] attenuation);
+    begin
+        case (attenuation)
+            6'd0: gain = 17'd65536;
+            6'd1: gain = 17'd52057;
+            6'd2: gain = 17'd41350;
+            6'd3: gain = 17'd32846;
+            6'd4: gain = 17'd26090;
+            6'd5: gain = 17'd20724;
+            6'd6: gain = 17'd16462;
+            6'd7: gain = 17'd13076;
+            6'd8: gain = 17'd10387;
+            6'd9: gain = 17'd8250;
+            6'd10: gain = 17'd6554;
+            6'd11: gain = 17'd5206;
+            6'd12: gain = 17'd4135;
+            6'd13: gain = 17'd3285;
+            6'd14: gain = 17'd2609;
+            6'd15: gain = 17'd2072;
+            6'd16: gain = 17'd1646;
+            6'd17: gain = 17'd1308;
+            6'd18: gain = 17'd1039;
+            6'd19: gain = 17'd825;
+            6'd20: gain = 17'd655;
+            6'd21: gain = 17'd521;
+            6'd22: gain = 17'd414;
+            6'd23: gain = 17'd328;
+            6'd24: gain = 17'd261;
+            6'd25: gain = 17'd207;
+            6'd26: gain = 17'd165;
+            6'd27: gain = 17'd131;
+            6'd28: gain = 17'd104;
+            6'd29: gain = 17'd83;
+            6'd30: gain = 17'd66;
+            6'd31: gain = 17'd52;
+            6'd32: gain = 17'd41;
+            6'd33: gain = 17'd33;
+            6'd34: gain = 17'd26;
+            6'd35: gain = 17'd21;
+            6'd36: gain = 17'd16;
+            6'd37: gain = 17'd13;
+            6'd38: gain = 17'd10;
+            6'd39: gain = 17'd8;
+            6'd40: gain = 17'd7;
+            6'd41: gain = 17'd5;
+            6'd42: gain = 17'd4;
+            default: gain = 0; // 43 and above are mute
+        endcase
+    end
+endfunction
+reg [2:0] valid;
+reg use_filter, muted;
+reg [16:0] gain_l, gain_r;
+reg signed [27:0] input_l, input_r, previous_l, previous_r;
+reg signed [27:0] history_l, history_r, filtered_l, filtered_r;
+reg signed [45:0] p0_l, p1_l, p2_l, p0_r, p1_r, p2_r;
+reg signed [45:0] volume_l, volume_r;
+wire signed [47:0] sum_l = {{2{p0_l[45]}},p0_l} + {{2{p1_l[45]}},p1_l} + {{2{p2_l[45]}},p2_l};
+wire signed [47:0] sum_r = {{2{p0_r[45]}},p0_r} + {{2{p1_r[45]}},p1_r} + {{2{p2_r[45]}},p2_r};
+function automatic signed [27:0] filter_clip(input signed [47:0] sum);
+    reg signed [47:0] value;
+    begin
+        value = sum >>> 17;
+        if (value > 48'sd134217727) filter_clip = 28'sh7ffffff;
+        else if (value < -48'sd134217728) filter_clip = 28'sh8000000;
+        else filter_clip = value[27:0];
+    end
+endfunction
+function automatic signed [15:0] volume_clip(input signed [45:0] product);
+    reg signed [46:0] value, magnitude;
+    begin
+        // Q12 PCM times Q16 gain. Round symmetrically, then saturate.
+        magnitude = product < 0 ? -{product[45],product} : {product[45],product};
+        value = (magnitude + 47'sd134217728) >>> 28;
+        if (product < 0) value = -value;
+        if (value > 32767) volume_clip = 16'sh7fff;
+        else if (value < -32768) volume_clip = 16'sh8000;
+        else volume_clip = value[15:0];
+    end
+endfunction
+always @(posedge clk) begin
+    if (reset) begin
+        valid <= 0; use_filter <= 0; muted <= 0;
+        gain_l <= 0; gain_r <= 0;
+        input_l <= 0; input_r <= 0; previous_l <= 0; previous_r <= 0;
+        history_l <= 0; history_r <= 0; filtered_l <= 0; filtered_r <= 0;
+        p0_l <= 0; p1_l <= 0; p2_l <= 0; p0_r <= 0; p1_r <= 0; p2_r <= 0;
+        volume_l <= 0; volume_r <= 0; audio_l <= 0; audio_r <= 0;
+    end else begin
+        valid <= {valid[1:0],sample_strobe};
+        if (sample_strobe) begin
+            use_filter <= deemphasis; muted <= mute;
+            gain_l <= gain(attenuation_l); gain_r <= gain(attenuation_r);
+            input_l <= {frame[31:16],12'd0}; input_r <= {frame[15:0],12'd0};
+            p0_l <= $signed({frame[31:16],12'd0}) * 18'sd60287;
+            p0_r <= $signed({frame[15:0],12'd0}) * 18'sd60287;
+            p1_l <= previous_l * -18'sd11511; p1_r <= previous_r * -18'sd11511;
+            p2_l <= history_l * 18'sd82296; p2_r <= history_r * 18'sd82296;
+            previous_l <= deemphasis ? {frame[31:16],12'd0} : 28'd0;
+            previous_r <= deemphasis ? {frame[15:0],12'd0} : 28'd0;
+        end
+        if (valid[0]) begin
+            filtered_l <= use_filter ? filter_clip(sum_l) : input_l;
+            filtered_r <= use_filter ? filter_clip(sum_r) : input_r;
+            history_l <= use_filter ? filter_clip(sum_l) : 28'd0;
+            history_r <= use_filter ? filter_clip(sum_r) : 28'd0;
+        end
+        if (valid[1]) begin
+            volume_l <= filtered_l * $signed({1'b0,gain_l});
+            volume_r <= filtered_r * $signed({1'b0,gain_r});
+        end
+        if (valid[2]) begin
+            audio_l <= muted ? 16'sd0 : volume_clip(volume_l);
+            audio_r <= muted ? 16'sd0 : volume_clip(volume_r);
+        end
+    end
+end
 endmodule
