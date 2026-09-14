@@ -250,6 +250,7 @@ ap040_tg68k_compat #(
 	.clk(clk),
 	.nreset(~reset),
 	.clkena_in(clkena),
+	.tick_in(1'b1), // Sample interrupts every clock, including bus waits.
 
 	// Cacheability follows the real 68040 model: everything is a cache
 	// candidate, gated by the CACR enables and the MMU cache-inhibit

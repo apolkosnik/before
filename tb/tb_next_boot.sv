@@ -1320,6 +1320,7 @@ initial begin
 	check(seen_vec_lo,  "reset SP fetched from ROM address 0");
 	check(seen_vec_pc,  "reset PC fetched from ROM address 4");
 	check(seen_entry,   "PC reached reset vector target 0x0100001E");
+	check(dut.cpu.tick_in === 1'b1, "CPU interrupt sampling tick is connected");
 	check(seen_scr1,    "ROM read SCR1");
 	check(scr1_ok,      "SCR1 returned machine id 0x00012052");
 	check(seen_scr2_wr, "ROM wrote SCR2");
