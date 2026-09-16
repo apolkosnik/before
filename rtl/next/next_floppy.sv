@@ -249,6 +249,11 @@ assign rdata = {`FLP_READ(a_even), `FLP_READ(a_odd)};
 // sector buffer, shared with the DMA channel and the SD card
 //----------------------------------------------------------------------------
 
+// Keep every reference to sbuf on the clocked port below.  A single
+// combinational read of any element defeats RAM inference for the whole
+// array, which then costs about two thousand ALMs in flip-flops and a
+// 512-way read multiplexer.
+(* ramstyle = "M10K" *)
 reg  [7:0] sbuf [0:1023];
 reg  [7:0] sbuf_q;
 reg        sd_rd_act;
@@ -304,6 +309,24 @@ always @(posedge clk) begin
 	if (fmt_zero_we) sbuf[zero_pos] <= 8'h00;
 	else if (s_we) sbuf[s_addr] <= s_wd;
 	sbuf_q <= sbuf[s_addr];
+end
+
+// FORMAT compares the four-byte C/H/R/N descriptor it has just consumed.
+// Latch those bytes as the channel writes them rather than reading them
+// back out of sbuf: floppy_format_sector() uses exactly these four, and
+// the comparison runs before E_FMT_ZERO rewrites the buffer.  An ordinary
+// sector transfer also passes through addresses 0 to 3, which is harmless
+// because only the descriptor DMA immediately precedes a comparison.
+reg [31:0] fmt_chrn;
+always @(posedge clk) begin
+	if (!fmt_zero_we && s_we && s_addr[9:2] == 8'd0) begin
+		case (s_addr[1:0])
+			2'd0: fmt_chrn[31:24] <= s_wd;
+			2'd1: fmt_chrn[23:16] <= s_wd;
+			2'd2: fmt_chrn[15:8]  <= s_wd;
+			2'd3: fmt_chrn[7:0]   <= s_wd;
+		endcase
+	end
 end
 
 reg        dma_req_r, dma_wr_r;
@@ -595,9 +618,10 @@ always @(posedge clk) begin
 			if (dma_done) begin
 				dma_req_r <= 0;
 				if (format_mode) begin
-					if ((sbuf[0] != cyl_v[io_ds]) || (sbuf[1] != head_v[io_ds]) ||
-					    (sbuf[2] != sector_v[io_ds]) ||
-					    (sbuf[3] != {5'd0, blocksize_v[io_ds]})) begin
+					if ((fmt_chrn[31:24] != cyl_v[io_ds]) ||
+					    (fmt_chrn[23:16] != head_v[io_ds]) ||
+					    (fmt_chrn[15:8]  != sector_v[io_ds]) ||
+					    (fmt_chrn[7:0]   != {5'd0, blocksize_v[io_ds]})) begin
 						// floppy_format_sector() stops on a malformed
 						// descriptor without adding a controller status error.
 						sec_left <= 0;
