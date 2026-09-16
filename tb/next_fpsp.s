@@ -1,4 +1,4 @@
-; Probe the actual FPSP handlers in the NeXT Mach 3.3 RELEASE_M68K kernel.
+; Probe actual FPSP handlers in NeXT Mach 3.3 or Improv Mach 2.0 mk-94.
 ; Externally supplied sdmach is loaded at $04000000, not included here.
         ifd     USERMODE
 RUNSP   equ     $d000
@@ -12,9 +12,15 @@ RUNSP   equ     $e000
         endr
 start:
         move.w  #$2700,sr
+        ifd     IMPROV
+        move.l  #$04080118,($2c).w ; old non-Turbo unimp_hd
+        move.l  #$04080350,($dc).w ; old unsupported-data handler
+        move.b  #1,($04098770).l
+        else
         move.l  #$04008946,($2c).w ; F-line glue -> fpsp_unimp
         move.l  #$0400895c,($dc).w ; unsupported data -> fpsp_unsupp
         move.b  #1,($040b6348).l   ; 68040 glue selector
+        endif
         move.l  #$80008000,d0
         movec   d0,cacr
         moveq   #0,d0
@@ -25,6 +31,12 @@ start:
         move.w  #0,sr
         endif
 
+        ifd     IMPROV_TRACE_ONLY
+        bra     probe_one
+        endif
+        ifd     IMPROV_PACKED_ONLY
+        bra     probe_packed
+        endif
         move.w  #1,($f100).l
         fmove.l d0,fp0
         fsin.x  fp0
@@ -54,6 +66,7 @@ start:
         cmpa.l  #RUNSP,sp
         bne     fail
 
+probe_one:
         move.w  #12,($f100).l
         moveq   #1,d0
         fmove.l d0,fp0
@@ -64,6 +77,11 @@ start:
         cmpa.l  #RUNSP,sp
         bne     fail
 
+        ifd     IMPROV_TRACE_ONLY
+        bra     done
+        endif
+
+probe_packed:
         move.w  #2,($f100).l
         moveq   #1,d0
         fmove.l d0,fp0
@@ -79,6 +97,15 @@ start:
         bne     fail
         tst.l   ($3008).w
         bne     fail
+
+        ifd     IMPROV
+        ifnd    CHECK_IMPROV_PACKED
+        ; The frame-revision regression ends here for the old kernel.
+        ; BUSY-frame execution is implemented, but the exact old kernel
+        ; still prepares an incorrect nonzero packed operand. Keep opt-in.
+        bra     done
+        endif
+        endif
 
         move.w  #3,($f100).l
         lea     ($3000).w,a0
@@ -116,8 +143,23 @@ start:
         cmpa.l  #RUNSP,sp
         bne     fail
 
-        ; Known separate gap: FRESTORE does not yet execute a normalized
-        ; pending dyadic instruction.  Keep an opt-in failing reproducer.
+        ifnd    IMPROV
+        ; Exercise normalized ET15 from the unchanged NeXT FPSP without
+        ; its FP1 scratch-register bug masking the restore result.
+        move.w  #13,($f100).l
+        fmove.l #1,fp4
+        fadd.p  ($3000).w,fp4    ; 1.0 + 0.1; FP4 survives decbin
+        fmove.d fp4,($3050).w
+        cmpi.l  #$3ff19999,($3050).w
+        bne     fail
+        cmpi.l  #$9999999a,($3054).w
+        bne     fail
+        cmpa.l  #RUNSP,sp
+        bne     fail
+        endif
+
+        ; Separate operand-preparation issue in the exact kernel: restored
+        ; FPTEMP is not the expected 1.0. Keep an opt-in replay reproducer.
         ifd     CHECK_REPLAY
         move.w  #6,($f100).l
         fadd.p  ($3000).w,fp1    ; 1.0 + 0.1, dyadic packed operand
@@ -130,6 +172,7 @@ start:
         bne     fail
         endif
 
+done:
         move.w  #$600d,($f102).l
         bra.s   *
 fail:

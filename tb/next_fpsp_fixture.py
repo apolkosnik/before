@@ -11,12 +11,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kernel", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--profile", choices=("next33", "improv"), default="next33")
     args = parser.parse_args()
     data = args.kernel.read_bytes()
     # The assembly harness uses entry points in this specific release only.
-    expected = "f1c68dcb7e99e71c7ada5b1ca733b238b90ed337e8fb9512161e2a7120090ddb"
+    expected = {
+        "next33": "f1c68dcb7e99e71c7ada5b1ca733b238b90ed337e8fb9512161e2a7120090ddb",
+        "improv": "bbfcbb6a92851a45b1c37ea8804945bc3ce6d4b6989cc375619b030cda5bdb16",
+    }[args.profile]
     if hashlib.sha256(data).hexdigest() != expected:
-        parser.error("requires the NeXT Mach 3.3 RELEASE_M68K sdmach used in the panic audit")
+        parser.error(f"kernel hash does not match the exact {args.profile} fixture")
     memory = bytearray(0x100000)
     offset = 28
     for _ in range(struct.unpack_from(">I", data, 16)[0]):

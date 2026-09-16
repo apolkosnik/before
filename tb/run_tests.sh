@@ -29,6 +29,11 @@ WORK=build
 mkdir -p "$WORK"
 
 VFLAGS="--binary --timing -j 4 -O3 -Wno-fatal"
+DIAG_FLAGS=""
+if [ "${EXCEPTION_DIAG:-0}" = 1 ]; then
+	DIAG_FLAGS="-DNEXT_EXCEPTION_DIAG=1"
+	VFLAGS="$VFLAGS $DIAG_FLAGS"
+fi
 
 CPUSRC="$CPU/ap040_tg68k_compat.v $CPU/ap040_core.v $CPU/ap040_bus16_adapter.v \
         $CPU/ap040_bus_timeout.v $CPU/ap040_regfile.v $CPU/ap040_alu.v \
@@ -42,7 +47,7 @@ NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_snd_in.sv $RTL/next_audio_adc.sv $RTL/next_rs.sv \
          $RTL/next_floppy.sv $RTL/next_printer.sv \
          $RTL/next_ddram.sv $RTL/next_ddram_arb.sv \
-         $RTL/next_enet_bridge.sv $RTL/dpram.v"
+         $RTL/next_enet_bridge.sv $RTL/next_exception_mailbox.sv $RTL/next_exception_trigger.sv $RTL/dpram.v"
 
 echo "== converting boot ROM =="
 python3 rom2hex.py "$ROM" "$WORK/rom.hex"
@@ -90,7 +95,8 @@ python3 check_osd.py || exit 1
 
 echo "== linting the emu top =="
 fail=0
-verilator --lint-only -Wno-fatal -I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC \
+verilator --lint-only -Wno-fatal $DIAG_FLAGS \
+	-I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC \
 	> "$WORK/vl_emu_lint.log" 2>&1 || true
 if grep -E "^%Error" "$WORK/vl_emu_lint.log" \
      | grep -vE "MODMISSING|Exiting due to" | grep -q .; then
@@ -137,7 +143,7 @@ run tb_recording "$WORK/vl_tb_next_recording/tb_next_recording"
 run tb_recording_abort "$WORK/vl_tb_next_recording/tb_next_recording" +abortonly
 
 if [ "${1:-}" = "post" ]; then
-	echo "--- full power-on system test (about 5 minutes) ---"
+	echo "--- full power-on system test (about 30 minutes, host-dependent) ---"
 	# The memory model is the machine's full 64 MB, and the ROM clears
 	# all of it before the tests: the success marker lands near 900
 	# million cycles, so a 500 million budget times out on a POST that

@@ -221,6 +221,14 @@ wire [10:0] brx_len;
 wire  [7:0] brx_data;
 wire [47:0] enet_mac;
 
+`ifdef NEXT_EXCEPTION_DIAG
+localparam DEBUG_EXCEPTIONS = 2;
+`else
+localparam DEBUG_EXCEPTIONS = 0;
+`endif
+wire dbg_exception_valid;
+wire [511:0] dbg_exception;
+
 // CLK_HZ sets the machine's microsecond tick at 50 clocks: with the
 // 32 MHz system clock this is a virtual microsecond (the machine runs
 // at 64 percent of real time, uniformly), which satisfies the boot
@@ -231,7 +239,8 @@ next_system #(
 	.CLK_HZ(50000000),
 	.CPU_PACE_NUM(2),
 	.CPU_PACE_DEN(2),
-	.CLK_REAL_HZ(28000000)    // the real clk_sys, so the clock keeps time
+	.CLK_REAL_HZ(28000000),   // the real clk_sys, so the clock keeps time
+	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
 ) system
 (
 	.clk(clk_sys),
@@ -318,7 +327,9 @@ next_system #(
 
 	.dbg_pc(),
 	.dbg_halted(),
-	.dbg_ipl()
+	.dbg_ipl(),
+	.dbg_exception_valid(dbg_exception_valid),
+	.dbg_exception(dbg_exception)
 );
 
 //////////////////////////////   DRIVE LIGHTS   /////////////////////////////
@@ -363,6 +374,34 @@ wire        eb_req, eb_we, eb_ack;
 wire [28:0] eb_addr;
 wire [63:0] eb_wdata, eb_rdata;
 
+wire mb_req, mb_we, mb_ack;
+wire [28:0] mb_addr;
+wire [63:0] mb_wdata, mb_rdata;
+generate if (DEBUG_EXCEPTIONS) begin : g_exception_diag
+	wire capture_valid;
+	wire [511:0] capture_data;
+	next_exception_trigger exception_trigger (
+		.clk(clk_sys), .reset(reset),
+		.event_valid(dbg_exception_valid), .event_data(dbg_exception),
+		.capture_valid(capture_valid), .capture_data(capture_data)
+	);
+	next_exception_mailbox #(.INPUT_HELD(1)) exception_mailbox (
+		.clk(clk_sys), .reset(reset),
+		.event_valid(capture_valid), .event_data(capture_data),
+		.b_req(eb_req), .b_we(eb_we), .b_addr(eb_addr),
+		.b_wdata(eb_wdata), .b_rdata(eb_rdata), .b_ack(eb_ack),
+		.m_req(mb_req), .m_we(mb_we), .m_addr(mb_addr),
+		.m_wdata(mb_wdata), .m_rdata(mb_rdata), .m_ack(mb_ack)
+	);
+end else begin : g_no_exception_diag
+	assign mb_req = eb_req;
+	assign mb_we = eb_we;
+	assign mb_addr = eb_addr;
+	assign mb_wdata = eb_wdata;
+	assign eb_rdata = mb_rdata;
+	assign eb_ack = mb_ack;
+end endgenerate
+
 next_ddram ddram
 (
 	.clk(clk_sys),
@@ -402,12 +441,12 @@ next_ddram_arb ddram_arb
 	.a_dout(ga_dout),
 	.a_dout_ready(ga_dout_ready),
 
-	.b_req(eb_req),
-	.b_we(eb_we),
-	.b_addr(eb_addr),
-	.b_wdata(eb_wdata),
-	.b_rdata(eb_rdata),
-	.b_ack(eb_ack),
+	.b_req(mb_req),
+	.b_we(mb_we),
+	.b_addr(mb_addr),
+	.b_wdata(mb_wdata),
+	.b_rdata(mb_rdata),
+	.b_ack(mb_ack),
 
 	.DDRAM_BUSY(DDRAM_BUSY),
 	.DDRAM_BURSTCNT(DDRAM_BURSTCNT),

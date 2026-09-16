@@ -45,7 +45,8 @@ module next_system #(
 	// physical clock rate, for the battery backed time of day
 	parameter CLK_REAL_HZ = CLK_HZ,
 	parameter ROM_INIT_EN = 0,
-	parameter ROM_INIT    = "rom.hex"
+	parameter ROM_INIT    = "rom.hex",
+	parameter DEBUG_EXCEPTIONS = 0
 )
 (
 	input         clk,            // system clock: CPU, devices, RAM
@@ -149,7 +150,9 @@ module next_system #(
 	// debug
 	output [31:0] dbg_pc,
 	output        dbg_halted,
-	output  [2:0] dbg_ipl
+	output  [2:0] dbg_ipl,
+	output        dbg_exception_valid,
+	output [511:0] dbg_exception
 );
 
 //----------------------------------------------------------------------------
@@ -244,7 +247,10 @@ assign dbg_ipl = ipl_level;
 ap040_tg68k_compat #(
 	.AP040_HAS_MMU(1),
 	.AP040_HAS_FPU(1),
-	.AP040_ENABLE_CACHE(1)
+	// Match Previous's non-Turbo 040: old Mach expects 44-byte FPU frames.
+	.AP040_FPU_REVISION(8'h40),
+	.AP040_ENABLE_CACHE(1),
+	.AP040_DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
 ) cpu
 (
 	.clk(clk),
@@ -308,7 +314,9 @@ ap040_tg68k_compat #(
 	.debug_fault(),
 	.debug_halted(dbg_halted),
 	.debug_status(debug_status),
-	.debug_status2()
+	.debug_status2(),
+	.debug_exception_valid(dbg_exception_valid),
+	.debug_exception(dbg_exception)
 );
 
 // devices also see the RESET instruction

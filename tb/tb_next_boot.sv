@@ -42,6 +42,13 @@ wire [31:0] dbg_pc;
 wire        dbg_halted;
 wire  [2:0] dbg_ipl;
 reg  [10:0] ps2 = 0;
+`ifdef NEXT_EXCEPTION_DIAG
+localparam DEBUG_EXCEPTIONS = 2;
+`else
+localparam DEBUG_EXCEPTIONS = 0;
+`endif
+wire dbg_exception_valid;
+wire [511:0] dbg_exception;
 
 // exactly the FPGA parameterization: virtual microsecond of 50 clocks,
 // no pacing (the physical simulation clock rate is immaterial, the
@@ -51,7 +58,8 @@ next_system #(
 	.CPU_PACE_NUM(2),
 	.CPU_PACE_DEN(2),
 	.ROM_INIT_EN(1),
-	.ROM_INIT("build/rom.hex")
+	.ROM_INIT("build/rom.hex"),
+	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
 ) dut
 (
 	.clk(clk),
@@ -105,7 +113,9 @@ next_system #(
 
 	.dbg_pc(dbg_pc),
 	.dbg_halted(dbg_halted),
-	.dbg_ipl(dbg_ipl)
+	.dbg_ipl(dbg_ipl),
+	.dbg_exception_valid(dbg_exception_valid),
+	.dbg_exception(dbg_exception)
 );
 
 //----------------------------------------------------------------------------
@@ -145,6 +155,34 @@ wire        eb_req, eb_we, eb_ack;
 wire [28:0] eb_addr;
 wire [63:0] eb_wdata, eb_rdata;
 
+wire mb_req, mb_we, mb_ack;
+wire [28:0] mb_addr;
+wire [63:0] mb_wdata, mb_rdata;
+generate if (DEBUG_EXCEPTIONS) begin : g_exception_diag
+	wire capture_valid;
+	wire [511:0] capture_data;
+	next_exception_trigger exception_trigger (
+		.clk(clk), .reset(reset),
+		.event_valid(dbg_exception_valid), .event_data(dbg_exception),
+		.capture_valid(capture_valid), .capture_data(capture_data)
+	);
+	next_exception_mailbox #(.INPUT_HELD(1)) exception_mailbox (
+		.clk(clk), .reset(reset),
+		.event_valid(capture_valid), .event_data(capture_data),
+		.b_req(eb_req), .b_we(eb_we), .b_addr(eb_addr),
+		.b_wdata(eb_wdata), .b_rdata(eb_rdata), .b_ack(eb_ack),
+		.m_req(mb_req), .m_we(mb_we), .m_addr(mb_addr),
+		.m_wdata(mb_wdata), .m_rdata(mb_rdata), .m_ack(mb_ack)
+	);
+end else begin : g_no_exception_diag
+	assign mb_req = eb_req;
+	assign mb_we = eb_we;
+	assign mb_addr = eb_addr;
+	assign mb_wdata = eb_wdata;
+	assign eb_rdata = mb_rdata;
+	assign eb_ack = mb_ack;
+end endgenerate
+
 wire        dr_busy, dr_dout_ready, dr_rd, dr_we;
 wire [28:0] dr_addr;
 wire [63:0] dr_dout, dr_din;
@@ -167,8 +205,8 @@ next_ddram_arb ddram_arb
 	.a_rd(ga_rd), .a_we(ga_we), .a_addr(ga_addr), .a_din(ga_din),
 	.a_be(ga_be), .a_burst(ga_burst), .a_busy(ga_busy),
 	.a_dout(ga_dout), .a_dout_ready(ga_dout_ready),
-	.b_req(eb_req), .b_we(eb_we), .b_addr(eb_addr),
-	.b_wdata(eb_wdata), .b_rdata(eb_rdata), .b_ack(eb_ack),
+	.b_req(mb_req), .b_we(mb_we), .b_addr(mb_addr),
+	.b_wdata(mb_wdata), .b_rdata(mb_rdata), .b_ack(mb_ack),
 	.DDRAM_BUSY(dr_busy), .DDRAM_BURSTCNT(dr_burst), .DDRAM_ADDR(dr_addr),
 	.DDRAM_DOUT(dr_dout), .DDRAM_DOUT_READY(dr_dout_ready),
 	.DDRAM_RD(dr_rd), .DDRAM_DIN(dr_din), .DDRAM_BE(dr_be), .DDRAM_WE(dr_we)
@@ -215,10 +253,11 @@ localparam [28:0] W_VRAM = 29'h0680_0000;   // byte 0x34000000
 localparam [28:0] W_MBOX = 29'h03FE_0000;   // byte 0x1FF00000
 
 reg [63:0] vram64 [0:262143];
-reg [63:0] mbox   [0:2047];
+reg [63:0] mbox   [0:8191]; // full 64 KB HPS mailbox, including diagnostics
+integer diag_writes = 0;
 integer    mb_i;
 initial begin
-	for (mb_i = 0; mb_i < 2048; mb_i = mb_i + 1)
+	for (mb_i = 0; mb_i < 8192; mb_i = mb_i + 1)
 		mbox[mb_i] = {32'hDEADBEEF, mb_i[15:0], 16'hFACE};
 	for (mb_i = 0; mb_i < 262144; mb_i = mb_i + 1) vram64[mb_i] = 64'd0;
 end
@@ -227,7 +266,7 @@ integer mbox_reads = 0, mbox_writes = 0, stray_ddr = 0;
 
 wire in_ram  = (dr_addr[28:23] == W_RAM[28:23]);
 wire in_vram = (dr_addr[28:18] == W_VRAM[28:18]);
-wire in_mbox = (dr_addr[28:11] == W_MBOX[28:11]);
+wire in_mbox = (dr_addr[28:13] == W_MBOX[28:13]);
 
 function [31:0] bsw; input [31:0] x; bsw = {x[7:0], x[15:8], x[23:16], x[31:24]}; endfunction
 
@@ -269,8 +308,10 @@ always @(posedge clk) begin
 				end
 				else if (in_vram) vram64[dr_addr[17:0]] <= dr_din;
 				else if (in_mbox) begin
-					mbox[dr_addr[10:0]] <= dr_din;
-					mbox_writes = mbox_writes + 1;
+					mbox[dr_addr[12:0]] <= dr_din;
+					if (dr_addr >= W_MBOX + 29'h0a00 && dr_addr < W_MBOX + 29'h0a0a)
+						diag_writes = diag_writes + 1;
+					else mbox_writes = mbox_writes + 1;
 				end
 				else stray_ddr = stray_ddr + 1;
 			end
@@ -289,7 +330,7 @@ always @(posedge clk) begin
 				           ? {bsw(ram_mem[{d3_addr[22:0], 1'b1}]),
 				              bsw(ram_mem[{d3_addr[22:0], 1'b0}])} :
 				           (d3_addr[28:18] == W_VRAM[28:18]) ? vram64[d3_addr[17:0]] :
-				           (d3_addr[28:11] == W_MBOX[28:11]) ? mbox[d3_addr[10:0]] :
+				           (d3_addr[28:13] == W_MBOX[28:13]) ? mbox[d3_addr[12:0]] :
 				                                               64'hBADD_BADD_BADD_BADD;
 				d3_dv   <= 1;
 				d3_addr <= d3_addr + 1'd1;
@@ -1328,6 +1369,11 @@ initial begin
 
 	$display("mailbox: %0d reads, %0d writes, %0d frames pushed at the guest",
 	         mbox_reads, mbox_writes, injected);
+	if (DEBUG_EXCEPTIONS) begin
+		check(mbox['ha00] == 64'h4e58544449414731, "diagnostic mailbox initialized");
+		check(mbox['ha01] == 0 && diag_writes == 3,
+		      "ROM boot leaves unhandled-trap latch armed");
+	end
 	if (!net_enable) begin
 		// The bridge may invalidate the mailbox once so the host daemon
 		// sees no magic, but it must never READ it: reading is how a

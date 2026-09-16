@@ -22,6 +22,27 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_printer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_ddram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_ddram_arb.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_enet_bridge.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_exception_mailbox.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_exception_trigger.sv
+# The exception instrumentation is opt-in and off by default.  It costs most
+# of the remaining ALM headroom and overrides the project's SPEED technique
+# and seed, so a normal RBF must not carry it.  Build a diagnostic bitstream
+# with the whole flow under the variable, so every stage sees the same
+# assignments:
+#
+#   NEXT_EXCEPTION_DIAG=1 quartus_sh --flow compile NeXT
+#
+# The two modules above stay listed unconditionally: with the macro clear
+# NeXT.sv's generate takes its pass-through branch and never instantiates
+# them, so they cost nothing and the lint still covers them.
+if {[info exists ::env(NEXT_EXCEPTION_DIAG)]
+    && $::env(NEXT_EXCEPTION_DIAG) eq "1"} {
+	set_global_assignment -name VERILOG_MACRO "NEXT_EXCEPTION_DIAG=1"
+	set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
+	# Preserve the full diagnostic design while reducing synthesized logic area.
+	set_global_assignment -name OPTIMIZATION_TECHNIQUE AREA
+	set_global_assignment -name SEED 2
+}
 set_global_assignment -name QIP_FILE rtl/pll.qip
 set_global_assignment -name SDC_FILE NeXT.sdc
 set_global_assignment -name SYSTEMVERILOG_FILE NeXT.sv
