@@ -31,7 +31,7 @@ reg         we = 0;
 reg   [1:0] be = 0;
 reg  [15:0] wdata = 0;
 wire [15:0] rdata;
-wire        int_keymouse;
+wire        int_keymouse, int_power;
 
 next_kms_snd #(.CLK_HZ(1000000)) dut
 (
@@ -45,6 +45,7 @@ next_kms_snd #(.CLK_HZ(1000000)) dut
 	.m_dout(32'd0), .m_ack(1'b0), .m_err(1'b0),
 	.int_snd_ovrun(), .int_snd_out_dma(),
 	.int_keymouse(int_keymouse),
+	.int_power(int_power),
 	.sndin_active(), .sndin_clear(), .sndin_request(1'b0), .sndin_overrun(1'b0),
 	.audio_l(), .audio_r()
 );
@@ -147,6 +148,14 @@ initial begin
 	kms_cmd(8'hC6, 32'hFFFFFFF2);
 	key(1, 0, 8'h1C);            // 'a' down
 	check(!int_keymouse, "event dropped while keyboard not polled");
+	key(1, 0, 8'h09);            // F10 does not require keyboard polling
+	check(int_power && !int_keymouse, "F10 asserts separate power request while unpolled");
+	key(1, 0, 8'h09);            // repeated make, not a toggle
+	check(int_power && !int_keymouse, "F10 repeat keeps power asserted without KMS event");
+	key(1, 1, 8'h71); key(0, 1, 8'h71); // forward Delete is never power
+	check(int_power && !int_keymouse, "Delete cannot release held F10 or post a KMS event");
+	key(0, 0, 8'h09);
+	check(!int_power && !int_keymouse, "F10 release clears power while unpolled");
 
 	// poll the keyboard (device address 0 in the first mask nibble)
 	kms_cmd(8'hC6, 32'h0FFFFFF2);
@@ -161,6 +170,24 @@ initial begin
 	key(0, 0, 8'h1C);            // 'a' up
 	rd_km_data(d);
 	check(d == 32'h1000_80B9, "key up event carries the up bit");
+
+	key(1, 0, 8'h61); rd_km_data(d);
+	check(d == 32'h1000_8003, "ISO extra backslash maps to NeXT backslash");
+	key(0, 0, 8'h61); rd_km_data(d);
+	check(d == 32'h1000_8083, "ISO extra backslash release");
+	key(1, 0, 8'h0F); rd_km_data(d);
+	check(d == 32'h1000_8027, "keypad equals is distinct from main equals");
+	key(0, 0, 8'h0F); rd_km_data(d);
+	check(d == 32'h1000_80A7, "keypad equals release");
+	key(1, 0, 8'h66); rd_km_data(d);
+	check(d == 32'h1000_801B && !int_power, "Backspace remains NeXT Delete, not power");
+	key(0, 0, 8'h66); rd_km_data(d);
+	key(1, 1, 8'h71); key(0, 1, 8'h71);
+	check(!int_keymouse && !int_power, "forward Delete deliberately remains unassigned");
+	key(1, 0, 8'h09);
+	check(int_power && !int_keymouse, "F10 is not delivered as an ordinary polled key");
+	key(0, 0, 8'h09);
+	check(!int_power && !int_keymouse, "polled F10 release has no KMS event");
 
 	// The arrow keys arrive as extended scancodes, and share their
 	// second byte with the keypad digits: 0x75 is kp 8 without the
@@ -198,6 +225,48 @@ initial begin
 	check(d == 32'h1000_8242, "shifted key: mod byte 0x02, keycode 0x42");
 	key(0, 0, 8'h12);            // shift up
 	rd_km_data(d);
+
+	// Independent Control state, in both release orders.
+	key(1, 0, 8'h14); rd_km_data(d);
+	key(1, 1, 8'h14); rd_km_data(d);
+	key(0, 0, 8'h14); rd_km_data(d);
+	check(d == 32'h1000_8180, "left CTRL release preserves held right CTRL");
+	key(1, 0, 8'h1C); rd_km_data(d);
+	check(d == 32'h1000_8139, "following key retains held right CTRL");
+	key(0, 1, 8'h14); rd_km_data(d);
+	check(d == 32'h1000_8080, "last CTRL release clears control");
+	key(1, 1, 8'h14); rd_km_data(d);
+	key(1, 0, 8'h14); rd_km_data(d);
+	key(0, 1, 8'h14); rd_km_data(d);
+	check(d == 32'h1000_8180, "right CTRL release preserves held left CTRL");
+	key(0, 0, 8'h14); rd_km_data(d);
+	check(d == 32'h1000_8080, "both Control keys now released");
+
+	// Caps Lock sends the new modifier immediately, without a keycode.
+	key(1, 0, 8'h58);
+	check(int_keymouse, "Caps Lock make posts an immediate modifier event");
+	rd_km_data(d);
+	check(d == 32'h1000_8200, "Caps Lock make carries newly enabled shift lock");
+	key(1, 0, 8'h58); rd_km_data(d);
+	check(d == 32'h1000_8200, "Caps Lock repeat does not toggle the lock");
+	key(0, 0, 8'h58); rd_km_data(d);
+	check(d == 32'h1000_8280, "Caps Lock release keeps shift lock active");
+	key(1, 0, 8'h1C); rd_km_data(d);
+	check(d == 32'h1000_8239, "shift lock is present on ordinary keys");
+	key(1, 0, 8'h12); rd_km_data(d); // physical shift stays down
+	key(1, 0, 8'h58); rd_km_data(d);
+	check(d == 32'h1000_8200, "turning Caps Lock off preserves physical left Shift");
+	key(0, 0, 8'h58); rd_km_data(d);
+	key(0, 0, 8'h12); rd_km_data(d);
+	check(d == 32'h1000_8080, "Shift clears after Caps Lock off and physical release");
+	key(1, 0, 8'h58); rd_km_data(d); // lock on again
+	key(0, 0, 8'h58); rd_km_data(d);
+	key(1, 0, 8'h58);
+	check(int_keymouse, "Caps Lock off posts an immediate modifier event");
+	rd_km_data(d);
+	check(d == 32'h1000_8000, "Caps Lock off event contains the new clear modifier");
+	key(0, 0, 8'h58); rd_km_data(d);
+	check(d == 32'h1000_8080, "Caps Lock release after lock off");
 
 	// overrun: two events without a read
 	key(1, 0, 8'h32);
@@ -255,6 +324,25 @@ initial begin
 	rd_km_data(d);
 	check(d[7:1] == 7'h41,
 	      "mouse right clamps to 0x3F: x field (0x40-0x3F)|0x40 = 0x41");
+
+	// KMS reset clears modifier tracking, not the separate held power key.
+	key(1, 1, 8'h14); rd_km_data(d);
+	key(1, 0, 8'h58); rd_km_data(d);
+	key(1, 0, 8'h09);
+	kms_cmd(8'hFF, 32'hFFFFFFFF);
+	@(negedge clk); // observe reset state after the write clock has settled
+	check(int_power && !int_keymouse, "KMS reset leaves held power request asserted");
+	check(dut.mods == 0 && dut.ctrl_down == 0 && !dut.capslock && !dut.caps_down,
+	      "KMS reset clears all modifier tracking");
+	key(0, 0, 8'h09);
+	check(!int_power, "F10 release still works after KMS reset");
+	key(1, 0, 8'h09);
+	@(negedge clk); reset = 1;
+	repeat (4) @(negedge clk);
+	check(!int_power, "device reset clears a held power request");
+	reset = 0;
+	key(0, 0, 8'h09);
+	check(!int_power, "release after device reset cannot reassert power");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

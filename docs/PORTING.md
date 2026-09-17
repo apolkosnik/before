@@ -127,7 +127,9 @@ passed path, about 5 minutes):
 ## Roadmap to a booting system
 
 1. (done) KMS keyboard input: PS/2 events post NeXT keycode events
-   through the KMS data path with INT_KEYMOUSE.
+   through the KMS data path with INT_KEYMOUSE. F10 uses the separate
+   INT_POWER bit 2 (IPL 3), including when keyboard polling is disabled;
+   Delete is deliberately unassigned. See the keyboard mapping in README.
 2. (done) SCSI: ESP (53C90) + DMA channel + disk image from the
    MiSTer SD card (hps_io block access) in next_scsi.sv.
 3. (in progress) Boot NeXTSTEP from the SCSI disk: the OSD "Boot

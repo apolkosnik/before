@@ -180,18 +180,12 @@ reg [15:0] blockcounter;
 // rounded up; the head/sector fallback geometry of SCSI_GuessGeometry)
 reg [23:0] geo_cyl_v [0:SCSI_UNITS-1];
 wire [23:0] geo_cyl = geo_cyl_v[t_unit];
-reg  [5:0] mnt_pend = 0;
-reg [31:0] mnt_size [0:SCSI_UNITS-1];
-reg  [2:0] g_slot = 0;
-// the lowest slot still waiting for the geometry divider
-wire [2:0] g_pick = mnt_pend[0] ? 3'd0 : mnt_pend[1] ? 3'd1 :
-                    mnt_pend[2] ? 3'd2 : mnt_pend[3] ? 3'd3 :
-                    mnt_pend[4] ? 3'd4 : 3'd5;
-reg [31:0] g_num = 0;
-reg [31:0] g_rem = 0;
-reg [23:0] g_quot = 0;
-reg  [5:0] g_step = 0;
-reg        g_run = 0;
+// ceil(blocks/128), retaining the former divider's 24-bit quotient wrap.
+// blocks is img_size[40:9]; bit 40 lies above that stored quotient, and
+// partial 512-byte blocks (bits 8:0) do not contribute to the geometry.
+// All slots named by a mount pulse share img_size, so one incrementer
+// serves every slot without a divider, pending queue or remount race.
+wire [23:0] mount_cyl = img_size[39:16] + {23'd0, |img_size[15:9]};
 
 //----------------------------------------------------------------------------
 // DMA channel (CHANNEL_SCSI)
@@ -312,8 +306,8 @@ reg        sd_read_owned;
 assign sd_lba = sd_lba_r;
 
 //----------------------------------------------------------------------------
-// disk image mount and geometry (cylinders = blocks/128, rounded up,
-// by shift-subtract division).  Outside the reset: the mount pulse
+// disk image mount and geometry (cylinders = blocks/128, rounded up).
+// Outside the reset: the mount pulse
 // fires once at OSD time, usually before the user resets the machine
 // into the new configuration.
 //----------------------------------------------------------------------------
@@ -324,40 +318,7 @@ always @(posedge clk) begin
 			disk_present_v[mk] <= (img_size != 0);
 			disk_ro_v[mk] <= img_readonly;
 			img_blocks_v[mk] <= img_size[40:9];
-			mnt_size[mk] <= img_size[40:9];
-			mnt_pend[mk] <= 1;
-		end
-	end
-
-	// one geometry divider, run for each mounted slot in turn: two
-	// mounts arriving close together must not share a division
-	if (!g_run && mnt_pend != 0) begin
-		g_slot <= g_pick;
-		g_num  <= mnt_size[g_pick];
-		mnt_pend[g_pick] <= 0;
-		g_rem <= 0;
-		g_quot <= 0;
-		g_step <= 6'd32;
-		g_run <= 1;
-	end
-	else if (g_run) begin : geom
-		reg [31:0] top;
-		top = {g_rem[30:0], g_num[31]};
-		if (g_step != 0) begin
-			g_num <= {g_num[30:0], 1'b0};
-			if (top >= 32'd128) begin
-				g_rem <= top - 32'd128;
-				g_quot <= {g_quot[22:0], 1'b1};
-			end
-			else begin
-				g_rem <= top;
-				g_quot <= {g_quot[22:0], 1'b0};
-			end
-			g_step <= g_step - 1'd1;
-		end
-		else begin
-			geo_cyl_v[g_slot] <= (g_rem != 0) ? g_quot + 24'd1 : g_quot;
-			g_run <= 0;
+			geo_cyl_v[mk] <= mount_cyl;
 		end
 	end
 end

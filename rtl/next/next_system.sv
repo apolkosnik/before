@@ -210,7 +210,7 @@ wire [29:0] sn_m_addr;
 wire  [3:0] sn_m_be;
 wire [31:0] sn_m_din;
 wire        sn_m_ack, sn_m_err;
-wire        int_snd_ovrun, int_snd_out_dma, int_keymouse;
+wire        int_snd_ovrun, int_snd_out_dma, int_keymouse, int_power;
 
 // Codec input DMA uses the same RAM arbiter and CPU cache snoop path.
 wire        si_m_req, si_m_we, si_m_ack, si_m_err;
@@ -895,6 +895,7 @@ next_kms_snd #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) kms_snd
 	.sndin_active(sndin_active), .sndin_clear(sndin_clear),
 	.sndin_request(sndin_request), .sndin_overrun(sndin_overrun),
 	.int_keymouse(int_keymouse),
+	.int_power(int_power),
 	.audio_l(audio_l),
 	.audio_r(audio_r)
 );
@@ -1061,13 +1062,14 @@ next_bmap bmap
 );
 
 // interrupt controller
-reg soft1_d, soft2_d, scsi_d, flp_d;
+reg soft1_d, soft2_d, scsi_d, flp_d, power_d;
 reg entx_d, enrx_d, entxd_d, enrxd_d, disk_d, diskd_d, sndo_d, sndd_d, km_d;
 reg scsid_d;
 reg pr_d, prd_d, sndi_d;
 always @(posedge clk) begin
 	soft1_d <= softint1;
 	soft2_d <= softint2;
+	power_d <= dev_reset ? 1'b0 : int_power;
 	scsi_d  <= esp_int_scsi;
 	flp_d   <= int_floppy;
 	scsid_d <= int_scsi_dma;
@@ -1088,6 +1090,7 @@ end
 wire [31:0] int_set =
 	(32'd1  & {31'd0,  softint1 & ~soft1_d}) |
 	({31'd0, softint2 & ~soft2_d} << 1) |
+	({31'd0, int_power & ~power_d} << 2) |
 	({31'd0, int_keymouse & ~km_d} << 3) |
 	({31'd0, vid_int_set} << 5) |
 	({31'd0, int_floppy & ~flp_d} << 7) |
@@ -1109,6 +1112,7 @@ wire [31:0] int_set =
 wire [31:0] int_clr =
 	({31'd0, ~softint1 & soft1_d}) |
 	({31'd0, ~softint2 & soft2_d} << 1) |
+	({31'd0, ~int_power & power_d} << 2) |
 	({31'd0, ~int_keymouse & km_d} << 3) |
 	({31'd0, vid_int_clr} << 5) |
 	({31'd0, ~int_floppy & flp_d} << 7) |

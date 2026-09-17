@@ -33,7 +33,7 @@ next_kms_snd #(.CLK_HZ(1000000)) control(
  .addr(addr[3:0]),.we(we),.be(be),.wdata(wd),.rdata(krd),
  .m_req(),.m_we(),.m_addr(),.m_be(),.m_din(),.m_dout(32'd0),.m_ack(1'b0),.m_err(1'b0),
  .sndin_active(active),.sndin_clear(clear_status),.sndin_request(request_status),.sndin_overrun(overrun),
- .int_snd_ovrun(ovirq),.int_snd_out_dma(),.int_keymouse(),.audio_l(),.audio_r());
+ .int_snd_ovrun(ovirq),.int_snd_out_dma(),.int_keymouse(),.int_power(),.audio_l(),.audio_r());
 reg [31:0] ram[0:4095];
 integer writes=0,delay_count=0;
 always @(posedge clk) begin

@@ -42,6 +42,13 @@ module tb_next_fpsp #(parameter [7:0] FPU_REVISION = 8'h41);
     reg [15:0] stack_fill = 0;
     reg [7:0] old_state = 0;
     reg [31:0] old_pc = 0;
+    // Architectural A6 includes the delayed integer-register write. Reading
+    // only bank_a would report a stale value while that write is pending.
+    wire [31:0] trace_a6 = (dut.core.regfile.pend_we &&
+                           dut.core.regfile.pend_waddr == 4'd14)
+                          ? dut.core.regfile.pend_wdata
+                          : (dut.core.regfile.rf_written[14]
+                             ? dut.core.regfile.bank_a[14] : 32'd0);
     always @(posedge clk) begin
         cycle <= cycle + 1;
         old_state <= dut.core.state;
@@ -61,8 +68,8 @@ module tb_next_fpsp #(parameter [7:0] FPU_REVISION = 8'h41);
         // Values are snapshots on entry to each instruction, not retire events.
         if ($test$plusargs("operands") && nreset && old_pc != dut.core.pc_i)
             $display("OPERANDS stage=%0d pc=%08x d0=%08x a6=%08x FP0=%x/%04x/%016x FP1=%x/%04x/%016x",
-                     stage, dut.core.pc_i, dut.core.regfile.dreg[0],
-                     dut.core.regfile.areg[6],
+                     stage, dut.core.pc_i, dut.core.regfile.dbg_d0,
+                     trace_a6,
                      dut.core.g_fpu.fpu.fr_s[0], dut.core.g_fpu.fpu.fr_e[0],
                      dut.core.g_fpu.fpu.fr_m[0], dut.core.g_fpu.fpu.fr_s[1],
                      dut.core.g_fpu.fpu.fr_e[1], dut.core.g_fpu.fpu.fr_m[1]);
@@ -103,7 +110,7 @@ module tb_next_fpsp #(parameter [7:0] FPU_REVISION = 8'h41);
                         end
                         if (addr == 32'hf102) begin
                             $display("D1=%08x FP0=%x/%04x/%016x ISP=%08x",
-                                     dut.core.regfile.dreg[1], dut.core.g_fpu.fpu.fr_s[0],
+                                     dut.core.regfile.dbg_d1, dut.core.g_fpu.fpu.fr_s[0],
                                      dut.core.g_fpu.fpu.fr_e[0], dut.core.g_fpu.fpu.fr_m[0],
                                      dut.core.regfile.isp);
                             $display("FP1=%x/%04x/%016x", dut.core.g_fpu.fpu.fr_s[1],

@@ -78,6 +78,7 @@ module next_kms_snd #(
 	output        int_snd_ovrun,   // INT_SOUND_OVRUN level
 	output        int_snd_out_dma, // channel complete level
 	output        int_keymouse,    // INT_KEYMOUSE level
+	output reg    int_power,       // F10 held: separate INT_POWER, not a KMS event
 
 	// Codec input DMA lives in next_snd_in; share the KMS control/status.
 	output reg    sndin_active,
@@ -112,6 +113,8 @@ reg  [3:0] km_address;           // stored pre-masked with 0x0E
 reg [31:0] km_dev_msk;
 reg  [6:0] mods;
 reg        capslock;
+reg  [1:0] ctrl_down;           // retain each Control key independently
+reg        caps_down;          // ignore typematic repeats when toggling Caps Lock
 
 assign int_keymouse = st_km[7];  // KBD_INT
 
@@ -266,7 +269,8 @@ endtask
 
 //----------------------------------------------------------------------------
 // PS/2 set-2 to NeXT keycode translation (Keymap_GetKeyFromScancode in
-// Previous src/keymap.c, keys reachable from a PC keyboard)
+// Previous src/gui-sdl/sdlkeymap.c, non-ADB scancode map).
+// Deliberate exception: only F10 requests power; forward Delete is ignored.
 //----------------------------------------------------------------------------
 
 function automatic [6:0] next_key;
@@ -303,6 +307,7 @@ function automatic [6:0] next_key;
 			8'h54: next_key = 7'h05;   // left bracket
 			8'h5B: next_key = 7'h04;   // right bracket
 			8'h5D: next_key = 7'h03;   // backslash
+			8'h61: next_key = 7'h03;   // ISO extra backslash
 			8'h1C: next_key = 7'h39;   // a
 			8'h1B: next_key = 7'h3a;   // s
 			8'h23: next_key = 7'h3b;   // d
@@ -328,6 +333,7 @@ function automatic [6:0] next_key;
 			8'h29: next_key = 7'h38;   // space
 			8'h0E: next_key = 7'h26;   // backquote
 			8'h77: next_key = 7'h26;   // num lock -> backquote
+			8'h0F: next_key = 7'h27;   // keypad equals
 			8'h6C: next_key = 7'h21;   // kp 7
 			8'h75: next_key = 7'h22;   // kp 8
 			8'h7D: next_key = 7'h23;   // kp 9
@@ -346,6 +352,7 @@ function automatic [6:0] next_key;
 			8'h06: next_key = 7'h19;   // F2 -> brightness up
 			8'h03: next_key = 7'h02;   // F5 -> sound down
 			8'h0B: next_key = 7'h1a;   // F6 -> sound up
+			8'h09: next_key = 7'h58;   // F10 -> separate power request
 			default: ;
 		endcase
 		else case (c)
@@ -519,7 +526,12 @@ always @(posedge clk) begin
 		km_dev_msk <= 0;
 		mods <= 0;
 		capslock <= 0;
-		ps2_toggle_d <= 0;
+		ctrl_down <= 0;
+		caps_down <= 0;
+		int_power <= 0;
+		// Consume the current host strobe during reset, rather than replaying
+		// a stale held F10/key event when the device comes out of reset.
+		ps2_toggle_d <= ps2_key[10];
 		ps2_mouse_tgl_d <= 0;
 		sndout_active <= 0;
         sndout_mode <= 0; repeat_phase <= 0; repeat_frame <= 0;
@@ -574,16 +586,32 @@ always @(posedge clk) begin
 		if (ps2_event) begin : kbd_ev
 			reg [6:0] mb, nmods;
 			reg [6:0] kc;
+			reg [1:0] nctrl;
+			reg ncaps, caps_event;
 			mb = mod_bit(ps2_ext, ps2_code);
 			nmods = ps2_make ? (mods | mb) : (mods & ~mb);
+			nctrl = ctrl_down;
+			if (ps2_code == 8'h14) begin
+				nctrl[ps2_ext] = ps2_make;
+				nmods[0] = |nctrl;
+			end
+			ctrl_down <= nctrl;
 			mods <= nmods;
-			if (!ps2_ext && ps2_code == 8'h58 && ps2_make)
-				capslock <= ~capslock;      // caps lock adds left shift
+			caps_event = !ps2_ext && ps2_code == 8'h58;
+			ncaps = capslock;
+			if (caps_event) begin
+				if (ps2_make && !caps_down) ncaps = ~capslock;
+				caps_down <= ps2_make;
+			end
+			capslock <= ncaps;
 			kc = next_key(ps2_ext, ps2_code);
-			if ((kc != 0 || mb != 0) && kbd_enabled) begin
+			// Previous's non-turbo RTC power request goes directly to the
+			// interrupt controller, independently of keyboard polling.
+			if (kc == 7'h58) int_power <= ps2_make;
+			else if ((kc != 0 || mb != 0 || caps_event) && kbd_enabled) begin
 				// kms_keydown()/kms_keyup()
 				km_data <= {4'b0001, km_address, 8'd0,
-				            1'b1, nmods | (capslock ? 7'h02 : 7'h00),
+				            1'b1, nmods | (ncaps ? 7'h02 : 7'h00),
 				            !ps2_make, kc};
 				kms_interrupt;
 			end
@@ -756,7 +784,8 @@ always @(posedge clk) begin
         if (kms_reset_command) begin
             st_snd <= 0; st_km <= 0; st_tx <= 0; st_cmd <= 0;
             kms_data <= 0; km_data <= 0; km_address <= 0; km_dev_msk <= 0;
-            mods <= 0; capslock <= 0;
+            mods <= 0; capslock <= 0; ctrl_down <= 0; caps_down <= 0;
+            // A KMS command reset does not release the separate power key.
             sndout_active <= 0; sndin_active <= 0; sndin_clear <= 1;
             snd_underrun <= 0; sndout_mode <= 0; poll <= 0;
         end

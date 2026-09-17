@@ -31,7 +31,7 @@ next_kms_snd #(.CLK_HZ(1000000),.CLK_REAL_HZ(1000000)) dut(
  .sel_kms(sel_kms),.sel_csr(sel_csr),.sel_ptr(sel_ptr),.sel_sptr(1'b0),.sel_ini(1'b0),
  .addr(addr),.we(we),.be(be),.wdata(wdata),.rdata(rdata),
  .m_req(req),.m_we(),.m_addr(mem_addr),.m_be(),.m_din(),.m_dout(mem_data),
- .m_ack(ack|manual_ack),.m_err(memory_error),.int_snd_ovrun(),.int_snd_out_dma(irq),.int_keymouse(),
+ .m_ack(ack|manual_ack),.m_err(memory_error),.int_snd_ovrun(),.int_snd_out_dma(irq),.int_keymouse(),.int_power(),
  .sndin_active(active_in),.sndin_clear(),.sndin_request(1'b0),.sndin_overrun(1'b0),
  .audio_l(left),.audio_r(right));
 always @(posedge clk) begin

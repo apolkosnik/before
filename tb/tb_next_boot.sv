@@ -725,6 +725,18 @@ task type_key;
 	end
 endtask
 
+// Short events for the interrupt-wiring test; no ROM UI pacing is needed.
+task power_key_event;
+	input make;
+	input ext;
+	input [7:0] code;
+	begin
+		@(negedge clk);
+		ps2 = {~ps2[10], make, ext, code};
+		repeat (8) @(negedge clk);
+	end
+endtask
+
 task type_shift_key;
 	input [7:0] code;
 	begin
@@ -1329,6 +1341,46 @@ initial begin
 		         dut.scr.nvram[24], dut.scr.nvram[25], dut.scr.nvram[26]);
 	end
 	reset = 0;
+
+	if ($test$plusargs("powerkey")) begin
+		// Exercise the real KMS -> next_system edge detection -> interrupt
+		// controller path. Only the mask is forced, to isolate IPL encoding
+		// from any firmware writes; neither request nor status is forced.
+		repeat (8) @(negedge clk);
+		force dut.intc.mask = 32'd0;
+		power_key_event(1, 0, 8'h09);
+		check(dut.intc.stat[2], "F10 sets INT_POWER bit 2 through system wiring");
+		check(!dut.intc.stat[3], "F10 does not set INT_KEYMOUSE");
+		check(dbg_ipl == 0, "masked power request does not raise IPL");
+		force dut.intc.mask = 32'h00000004;
+		repeat (2) @(negedge clk);
+		check(dbg_ipl == 3, "unmasked power request raises IPL 3");
+		power_key_event(1, 1, 8'h71);
+		power_key_event(0, 1, 8'h71);
+		check(dut.intc.stat[2] && dbg_ipl == 3,
+		      "Delete make/break cannot release F10 power request");
+		power_key_event(0, 0, 8'h09);
+		check(!dut.intc.stat[2] && dbg_ipl == 0,
+		      "F10 release clears INT_POWER and IPL");
+		power_key_event(1, 1, 8'h71);
+		power_key_event(0, 1, 8'h71);
+		check(!dut.intc.stat[2] && !dut.intc.stat[3] && dbg_ipl == 0,
+		      "Delete alone is neither power nor a keyboard event");
+		power_key_event(1, 0, 8'h09);
+		check(dut.intc.stat[2], "power request can be asserted again");
+		reset = 1;
+		repeat (8) @(negedge clk);
+		check(!dut.intc.stat[2], "device reset clears INT_POWER");
+		reset = 0;
+		repeat (8) @(negedge clk);
+		check(!dut.intc.stat[2], "reset release does not create a phantom power press");
+		power_key_event(0, 0, 8'h09);
+		check(!dut.intc.stat[2], "stale F10 release after reset remains inactive");
+		release dut.intc.mask;
+		if (errors == 0) $display("ALL PASS");
+		else            $display("%0d FAILURES", errors);
+		$finish;
+	end
 
 	// the medium arrives once the machine is running, the way the OSD
 	// delivers it: a mount pulse during reset is simply not seen

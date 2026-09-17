@@ -47,7 +47,7 @@ next_kms_snd #(.CLK_HZ(1000000)) dut
 		.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
 		.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(m_err),
 	.int_snd_ovrun(int_snd_ovrun), .int_snd_out_dma(int_snd_out_dma),
-	.int_keymouse(),
+	.int_keymouse(), .int_power(),
 	.sndin_active(), .sndin_clear(), .sndin_request(1'b0), .sndin_overrun(1'b0),
 	.audio_l(audio_l), .audio_r(audio_r)
 );

@@ -1749,7 +1749,7 @@ initial begin
 	img_mounted2 = 1;
 	@(posedge clk);
 	img_mounted2 = 0;
-	repeat (400) @(posedge clk);       // let the geometry divider run
+	repeat (400) @(posedge clk);       // allow mount metadata to settle
 
 	for (i = 0; i < 16384; i = i + 1) ram[i] = 32'hDEADBEEF;
 	esp_wr8(6'h04, 8'h01);             // select bus id 1

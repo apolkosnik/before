@@ -69,6 +69,7 @@ vbuild tb_next_esp       tb_next_esp.sv $RTL/next_scsi.sv
 vbuild tb_next_floppy    tb_next_floppy.sv $RTL/next_floppy.sv
 vbuild tb_next_flpdma    tb_next_flpdma.sv $RTL/next_floppy.sv $RTL/next_scsi.sv
 vbuild tb_next_scsi      tb_next_scsi.sv $RTL/next_scsi.sv
+vbuild tb_next_scsi_geometry tb_next_scsi_geometry.sv $RTL/next_scsi.sv
 vbuild tb_next_enet      tb_next_enet.sv $RTL/next_enet_dma.sv
 vbuild tb_next_bridge    tb_next_bridge.sv $RTL/next_enet_dma.sv $RTL/next_enet_bridge.sv
 vbuild tb_next_ddram_arb tb_next_ddram_arb.sv $RTL/next_ddram_arb.sv
@@ -120,6 +121,7 @@ run tb_bmap      "$WORK/vl_tb_next_bmap/tb_next_bmap"
 run tb_scc       "$WORK/vl_tb_next_scc/tb_next_scc"
 run tb_esp       "$WORK/vl_tb_next_esp/tb_next_esp"
 run tb_scsi      "$WORK/vl_tb_next_scsi/tb_next_scsi"
+run tb_scsi_geometry "$WORK/vl_tb_next_scsi_geometry/tb_next_scsi_geometry"
 run tb_floppy    "$WORK/vl_tb_next_floppy/tb_next_floppy"
 run tb_flpdma    "$WORK/vl_tb_next_flpdma/tb_next_flpdma"
 run tb_enet      "$WORK/vl_tb_next_enet/tb_next_enet"
@@ -137,6 +139,7 @@ run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"
 run tb_video     "$WORK/vl_tb_next_video/tb_next_video"
 run tb_boot      "$WORK/vl_tb_next_boot/tb_next_boot"
+run tb_powerkey  "$WORK/vl_tb_next_boot/tb_next_boot" +powerkey
 run tb_boot_mounts "$WORK/vl_tb_next_boot/tb_next_boot" +mountpolicy
 run tb_boot_noet "$WORK/vl_tb_next_boot/tb_next_boot" +netoff
 run tb_recording "$WORK/vl_tb_next_recording/tb_next_recording"

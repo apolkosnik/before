@@ -26,6 +26,30 @@ quartus_sh --flow compile NeXT     # Quartus 17.0.x, DE10-Nano / MiSTer
 
 Output: `output_files/NeXT.rbf`.
 
+## Keyboard
+
+The keyboard follows Previous's default non-ADB scancode mapping, with one
+intentional exception: **Delete is not a power button**.
+
+| PC key | NeXT function |
+| --- | --- |
+| F10 | Power request (press/release on the separate `INT_POWER` interrupt) |
+| Delete | Unassigned |
+| Backspace | Delete |
+| Windows / GUI | Command (left/right) |
+| Alt | Alt (left/right) |
+| Caps Lock | Shift lock |
+| F1 / Page Down, F2 / Page Up | Brightness down, up |
+| F5 / End, F6 / Home | Volume down, up |
+| ISO extra backslash | Backslash |
+| Keypad = | Keypad equals |
+
+Both Control keys share the NeXT Control modifier; releasing one does not
+clear it while the other remains held. Caps Lock immediately updates the
+guest modifier state. F10 requests guest shutdown, not physical MiSTer
+power-off. The core recognizes keypad `=` at PS/2 set-2 `0x0F`, but
+MiSTer Main leaves USB `KEY_KPEQUAL` unmapped; no Main change is included.
+
 ## Boot device
 
 The ROM picks its boot device from the battery-backed NVRAM boot command.
